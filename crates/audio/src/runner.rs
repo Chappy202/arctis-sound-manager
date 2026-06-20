@@ -1,6 +1,16 @@
 use crate::error::AudioError;
 use std::process::Command;
 
+/// Opaque handle to an owned child process group. The real runner stores the OS pid/pgid;
+/// the mock stores a synthetic id. Killing happens through `CommandRunner::kill_owned`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildToken {
+    /// Process group id (== child pid for a fresh group); 0 for mock.
+    pub pgid: i32,
+    /// Human/debug label, e.g. the conf path.
+    pub label: String,
+}
+
 /// Captured result of a subprocess invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CmdOutput {
@@ -17,6 +27,21 @@ pub trait CommandRunner {
     /// Spawn a long-lived child WITHOUT waiting for it to exit; the child is
     /// detached/orphaned for v1 — full child ownership is a later (engine) concern.
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<(), AudioError>;
+
+    /// Spawn a child in its OWN process group and return a token the caller stores.
+    ///
+    /// Real impl: `Command::new(program).args(args).process_group(0).spawn()`;
+    /// token.pgid = child pid.
+    ///
+    /// The `Child` handle is dropped after recording the pid — liveness is tracked
+    /// by the engine's `ChildOwner` and termination is by pgid via `kill_owned`.
+    fn spawn_owned(&mut self, program: &str, args: &[&str]) -> Result<ChildToken, AudioError>;
+
+    /// Terminate the process group named by the token: `libc::kill(-pgid, SIGTERM)`.
+    ///
+    /// Idempotent: a token for an already-dead group returns Ok.
+    /// The mock records the call in `killed`.
+    fn kill_owned(&mut self, token: &ChildToken) -> Result<(), AudioError>;
 }
 
 /// Real runner over `std::process::Command`.
@@ -51,15 +76,58 @@ impl CommandRunner for RealRunner {
         // _child dropped here — child process continues running independently.
         Ok(())
     }
+
+    fn spawn_owned(&mut self, program: &str, args: &[&str]) -> Result<ChildToken, AudioError> {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new(program)
+            .args(args)
+            // Place the child in its own process group (pgid == child pid).
+            .process_group(0)
+            .spawn()
+            .map_err(|e| AudioError::Spawn {
+                program: program.to_string(),
+                source_msg: e.to_string(),
+            })?;
+        let pgid = child.id() as i32;
+        let label = {
+            let mut parts = vec![program.to_string()];
+            parts.extend(args.iter().map(|a| a.to_string()));
+            parts.join(" ")
+        };
+        // Drop the Child — liveness is tracked by pgid in ChildOwner.
+        // The process continues running; we kill via `kill(-pgid, SIGTERM)`.
+        drop(child);
+        Ok(ChildToken { pgid, label })
+    }
+
+    fn kill_owned(&mut self, token: &ChildToken) -> Result<(), AudioError> {
+        // SAFETY: libc::kill is safe to call with a valid signal number.
+        // ESRCH (-3) means the process group is already gone — treat as success.
+        let ret = unsafe { libc::kill(-token.pgid, libc::SIGTERM) };
+        if ret != 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != libc::ESRCH {
+                return Err(AudioError::Spawn {
+                    program: format!("kill(-{}, SIGTERM)", token.pgid),
+                    source_msg: format!("errno {errno}"),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// In-memory runner for tests: records every argv, replays queued outputs.
 /// Mirrors `MockTransport` (G1).
 #[derive(Default)]
 pub struct MockRunner {
-    /// Each recorded call is `[program, arg0, arg1, …]`.
+    /// Each recorded call is `[program, arg0, arg1, …]` (from `run` and `spawn_detached`).
     pub calls: Vec<Vec<String>>,
     queued: std::collections::VecDeque<CmdOutput>,
+    /// Records every `spawn_owned` call as `[program, arg0, arg1, …]`.
+    pub spawned: Vec<Vec<String>>,
+    /// Records every token passed to `kill_owned`.
+    pub killed: Vec<ChildToken>,
 }
 
 impl MockRunner {
@@ -105,6 +173,20 @@ impl CommandRunner for MockRunner {
         self.calls.push(call);
         Ok(())
     }
+
+    fn spawn_owned(&mut self, program: &str, args: &[&str]) -> Result<ChildToken, AudioError> {
+        let mut call = Vec::with_capacity(args.len() + 1);
+        call.push(program.to_string());
+        call.extend(args.iter().map(|a| a.to_string()));
+        let label = call.join(" ");
+        self.spawned.push(call);
+        Ok(ChildToken { pgid: 0, label })
+    }
+
+    fn kill_owned(&mut self, token: &ChildToken) -> Result<(), AudioError> {
+        self.killed.push(token.clone());
+        Ok(())
+    }
 }
 
 /// Forward `CommandRunner` through a mutable reference so one runner can be
@@ -115,6 +197,12 @@ impl<R: CommandRunner + ?Sized> CommandRunner for &mut R {
     }
     fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<(), AudioError> {
         (**self).spawn_detached(program, args)
+    }
+    fn spawn_owned(&mut self, program: &str, args: &[&str]) -> Result<ChildToken, AudioError> {
+        (**self).spawn_owned(program, args)
+    }
+    fn kill_owned(&mut self, token: &ChildToken) -> Result<(), AudioError> {
+        (**self).kill_owned(token)
     }
 }
 
@@ -154,5 +242,41 @@ mod tests {
             assert_eq!(out.stdout, "ok");
         }
         assert_eq!(r.calls[0], vec!["pw-cli", "ls", "Node"]);
+    }
+
+    #[test]
+    fn mock_spawn_owned_records_and_returns_token() {
+        let mut r = MockRunner::new();
+        let token = r
+            .spawn_owned("pipewire", &["-c", "/tmp/x.conf"])
+            .expect("mock spawn_owned never errors");
+        assert_eq!(token.pgid, 0, "mock always returns pgid 0");
+        assert_eq!(r.spawned[0], vec!["pipewire", "-c", "/tmp/x.conf"]);
+    }
+
+    #[test]
+    fn mock_kill_owned_records() {
+        let mut r = MockRunner::new();
+        let token = r
+            .spawn_owned("pipewire", &["-c", "/tmp/x.conf"])
+            .expect("spawn_owned");
+        r.kill_owned(&token)
+            .expect("kill_owned never errors in mock");
+        assert_eq!(r.killed.len(), 1);
+        assert_eq!(r.killed[0], token);
+    }
+
+    #[test]
+    fn mut_ref_runner_forwards_spawn_owned_and_kill_owned() {
+        let mut r = MockRunner::new();
+        let token = {
+            let by_ref = &mut r;
+            by_ref
+                .spawn_owned("pipewire", &["-c", "/tmp/y.conf"])
+                .expect("forwards spawn_owned")
+        };
+        r.kill_owned(&token).expect("forwards kill_owned");
+        assert_eq!(r.spawned.len(), 1);
+        assert_eq!(r.killed.len(), 1);
     }
 }

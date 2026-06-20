@@ -23,4 +23,4 @@ pub use routing::{
     clear_stream_target_argv, move_stream_argv, node_rules_fragment, parse_stream_id,
     wireplumber_fragment_path, AppMatch, RouteRule, Router,
 };
-pub use runner::{CmdOutput, CommandRunner, MockRunner, RealRunner};
+pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};

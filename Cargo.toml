@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/device", "crates/audio", "crates/cli", "crates/config"]
+members = ["crates/domain", "crates/device", "crates/audio", "crates/cli", "crates/config", "crates/engine"]
 
 [workspace.package]
 edition = "2021"
@@ -17,5 +17,6 @@ arctis-domain = { path = "crates/domain" }
 arctis-device = { path = "crates/device" }
 arctis-audio = { path = "crates/audio" }
 arctis-config = { path = "crates/config" }
+arctis-engine = { path = "crates/engine" }
 serde_json = "1"
 libc = "0.2"

@@ -1,0 +1,13 @@
+[package]
+name = "arctis-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arctis-domain  = { workspace = true }
+arctis-device  = { workspace = true }
+arctis-audio   = { workspace = true }
+arctis-config  = { workspace = true }
+thiserror = "1"
+serde = { workspace = true }
+serde_json = "1"

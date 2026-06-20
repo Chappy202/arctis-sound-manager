@@ -57,6 +57,7 @@ name = "arctis-audio"
 version = "0.1.0"
 dependencies = [
  "arctis-domain",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
@@ -101,6 +102,19 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "arctis-engine"
+version = "0.1.0"
+dependencies = [
+ "arctis-audio",
+ "arctis-config",
+ "arctis-device",
+ "arctis-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
