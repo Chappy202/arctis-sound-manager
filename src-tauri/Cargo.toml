@@ -1,8 +1,8 @@
 [package]
 name = "arctis-sound-manager-ui"
 version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+license.workspace = true
 
 [lib]
 name = "arctis_sound_manager_ui_lib"
@@ -16,6 +16,6 @@ tauri = { version = "2", features = [] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread"] }
+tokio = { workspace = true }
 arctis-client = { workspace = true }
 arctis-engine = { workspace = true }
