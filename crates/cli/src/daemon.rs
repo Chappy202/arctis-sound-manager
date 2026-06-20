@@ -39,6 +39,16 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SetChannelOutput { channel, device } => {
+            match engine.set_channel_output(&channel, device) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::ProfileNew { name } => match engine.new_profile(&name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::Reload => match engine.reconcile() {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
@@ -378,6 +388,99 @@ mod tests {
             result.is_err(),
             "I/O error must propagate out of serve_connection"
         );
+    }
+
+    // ── New verb dispatch tests (TDD) ────────────────────────────────────────
+
+    #[test]
+    fn handle_set_channel_output_updates_state() {
+        let _env_lock = std::sync::Mutex::new(());
+        let tmp = std::env::temp_dir().join(format!("asm9_sco_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // set_channel_output calls ChannelManager::set_output:
+        // queues ls for present-check, then spawn if absent.
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, &ls, "");
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelOutput {
+                channel: "game".into(),
+                device: Some("alsa_output.speakers".into()),
+            },
+        );
+        assert!(resp.ok, "expected ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game.output_device,
+            Some("alsa_output.speakers".into()),
+            "state must reflect new output_device"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_output_unknown_channel_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelOutput {
+                channel: "nonexistent".into(),
+                device: None,
+            },
+        );
+        assert!(!resp.ok, "unknown channel must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_profile_new_creates_and_returns_state() {
+        let tmp = std::env::temp_dir().join(format!("asm9_pn_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileNew {
+                name: "competitive".into(),
+            },
+        );
+        assert!(resp.ok, "expected ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.active_profile, "competitive");
+        assert!(
+            state.profiles.contains(&"competitive".to_string()),
+            "new profile must appear in profile list"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_new_duplicate_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileNew {
+                name: "default".into(), // already exists
+            },
+        );
+        assert!(!resp.ok, "duplicate name must return ok:false");
+        assert!(resp.error.is_some());
     }
 
     // ── Integration test: shutdown breaks accept loop ─────────────────────────

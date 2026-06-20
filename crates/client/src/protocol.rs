@@ -27,6 +27,15 @@ pub enum Request {
         app_binary: String,
         target_sink: String,
     },
+    /// Set the output device for a single channel. `device: None` resets to default.
+    SetChannelOutput {
+        channel: String,
+        device: Option<String>,
+    },
+    /// Create a new profile by cloning the currently active one.
+    ProfileNew {
+        name: String,
+    },
     Reload,
     Shutdown,
 }
@@ -200,6 +209,86 @@ mod tests {
     fn request_shutdown_round_trips() {
         let req = Request::Shutdown;
         let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── New verb round-trip tests (TDD: these must fail until verbs are added) ──
+
+    #[test]
+    fn parse_set_channel_output_with_device() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"set-channel-output","channel":"game","device":"alsa_output.speakers"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelOutput {
+                channel: "game".into(),
+                device: Some("alsa_output.speakers".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_set_channel_output_no_device() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"set-channel-output","channel":"chat","device":null}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelOutput {
+                channel: "chat".into(),
+                device: None,
+            }
+        );
+    }
+
+    #[test]
+    fn request_set_channel_output_with_device_round_trips() {
+        let req = Request::SetChannelOutput {
+            channel: "game".into(),
+            device: Some("alsa_output.speakers".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("set-channel-output"),
+            "cmd tag must be kebab-case"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_set_channel_output_none_device_round_trips() {
+        let req = Request::SetChannelOutput {
+            channel: "media".into(),
+            device: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn parse_profile_new() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-new","name":"competitive"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileNew {
+                name: "competitive".into()
+            }
+        );
+    }
+
+    #[test]
+    fn request_profile_new_round_trips() {
+        let req = Request::ProfileNew {
+            name: "competitive".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("profile-new"), "cmd tag must be kebab-case");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }
