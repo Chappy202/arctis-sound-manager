@@ -11,12 +11,50 @@ pub struct DeviceDescriptor {
     pub report_length: usize,
     pub capabilities: Vec<Capability>,
     pub status: StatusSpec,
+    /// Declarative write commands, keyed by control name. Default empty so
+    /// existing read-only descriptors parse unchanged.
+    #[serde(default)]
+    pub commands: std::collections::BTreeMap<String, CommandSpec>,
+    /// The documented save/commit opcode bytes (after report id), e.g. [0x09].
+    /// Sent as its own single report when a command has `save = true`.
+    #[serde(default)]
+    pub save_command: Option<Vec<u8>>,
+}
+
+/// A single declarative write command: which opcode bytes to send and how to
+/// encode the user-supplied value into the final wire byte.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandSpec {
+    /// Bytes appended after the report id, BEFORE the encoded value byte.
+    /// e.g. [0x39] for sidetone -> wire = [report_id, 0x39, <value>].
+    pub opcode: Vec<u8>,
+    /// The Capability that must be present in `capabilities` for this command
+    /// to be enabled. A command whose capability is absent is NOT callable.
+    pub capability: Capability,
+    /// How to turn the user's requested value into the single wire value byte.
+    pub encoding: ValueEncoding,
+    /// When true, append a SECOND discrete write of the documented save opcode
+    /// after the command write. SAFETY: this is the one allowed extra write and
+    /// it is ALWAYS exactly the descriptor's `save_command` bytes — never a burst.
+    #[serde(default)]
+    pub save: bool,
+}
+
+/// Value encoding for a command's single value byte. Mirrors the read `Parser`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ValueEncoding {
+    /// Clamp the integer to [min, max] and send it directly as one byte.
+    IntRange { min: u8, max: u8 },
+    /// Map a named choice to a fixed byte. Used for enums like ANC mode.
+    Enum { entries: Vec<EnumEntry> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusSpec {
     /// Bytes appended after the report id to request a status frame.
     pub request: Vec<u8>,
+    #[serde(default)]
     pub fields: Vec<StatusField>,
 }
 
@@ -51,6 +89,55 @@ pub fn parse_descriptor(src: &str) -> Result<DeviceDescriptor, toml::de::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_a_command_entry_with_int_range_and_save() {
+        let src = r#"
+            name = "T"
+            vendor_id = 0x1038
+            product_ids = [0x12e5]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = ["sidetone"]
+            save_command = [0x09]
+
+            [status]
+            request = [0xb0]
+
+            [commands.sidetone]
+            opcode = [0x39]
+            capability = "sidetone"
+            save = true
+            encoding = { type = "int_range", min = 0, max = 3 }
+        "#;
+        let d = parse_descriptor(src).expect("should parse");
+        let c = d.commands.get("sidetone").expect("sidetone command");
+        assert_eq!(c.opcode, vec![0x39]);
+        assert_eq!(c.capability, Capability::Sidetone);
+        assert!(c.save);
+        assert_eq!(c.encoding, ValueEncoding::IntRange { min: 0, max: 3 });
+        assert_eq!(d.save_command, Some(vec![0x09]));
+    }
+
+    #[test]
+    fn existing_read_only_descriptor_parses_with_empty_commands() {
+        // The minimal descriptor (no [commands]) must still parse; commands empty.
+        let src = r#"
+            name = "T"
+            vendor_id = 0x1038
+            product_ids = [0x12e5]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = []
+            [status]
+            request = [0xb0]
+        "#;
+        let d = parse_descriptor(src).expect("should parse");
+        assert!(d.commands.is_empty());
+        assert_eq!(d.save_command, None);
+    }
 
     #[test]
     fn parses_a_minimal_descriptor() {

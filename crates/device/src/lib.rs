@@ -8,7 +8,8 @@ pub mod transport;
 
 pub use codec::{decode_frame, read_status};
 pub use descriptor::{
-    parse_descriptor, DeviceDescriptor, EnumEntry, Parser, StatusField, StatusSpec,
+    parse_descriptor, CommandSpec, DeviceDescriptor, EnumEntry, Parser, StatusField, StatusSpec,
+    ValueEncoding,
 };
 pub use hidraw::{discover, HidrawTransport};
 pub use mock::MockTransport;

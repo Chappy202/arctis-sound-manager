@@ -46,3 +46,54 @@ name = "chat_mix"
 match_prefix = [0x07, 0x45]
 offset = 3
 parser = { type = "int" }
+
+# Documented save/commit opcode (HeadsetControl sendCommandWithSave).
+save_command = [0x09]
+
+# ── WRITE COMMANDS ─────────────────────────────────────────────────────────
+# Each is a SINGLE opcode. No bursts. No OLED. Capability-gated.
+# HeadsetControl-corroborated for THIS model (lib/devices/..nova_pro_wireless.hpp):
+
+[commands.sidetone]                 # { 0x06, 0x39, 0..3 } + save
+opcode = [0x39]
+capability = "sidetone"
+save = true
+encoding = { type = "int_range", min = 0, max = 3 }
+
+[commands.mic_led]                  # { 0x06, 0xbf, 1..10 } + save  (LED strength)
+opcode = [0xbf]
+capability = "mic_led"
+save = true
+encoding = { type = "int_range", min = 1, max = 10 }
+
+[commands.inactive_time]            # { 0x06, 0xc1, 0..6 } + save   (auto-off level)
+opcode = [0xc1]
+capability = "inactive_time"
+save = true
+encoding = { type = "int_range", min = 0, max = 6 }
+
+# Cross-check against the validated READ path ([0x07,0xbd] -> anc_mode):
+[commands.anc]                      # { 0x06, 0xbd, 0=off|1=transparency|2=on }
+opcode = [0xbd]
+capability = "anc"
+save = true
+encoding = { type = "enum", entries = [
+    { value = 0, label = "off" },
+    { value = 1, label = "transparency" },
+    { value = 2, label = "on" },
+] }
+
+# HIGHER RISK — NOT corroborated by HeadsetControl for this model. Authored but
+# their capability must NOT be added to `capabilities` until their OWNER-RUN gate
+# (Tasks 7d/7e) passes. Keep them here for the encoder; the gate flips them on.
+[commands.transparency_level]       # { 0x06, 0xb9, 1..10 }
+opcode = [0xb9]
+capability = "anc"                  # reuses anc capability; still gated by Task 7d
+save = true
+encoding = { type = "int_range", min = 1, max = 10 }
+
+[commands.mic_volume]               # { 0x06, 0x37, 1..10 }  -- ships OFF (Task 7f)
+opcode = [0x37]
+capability = "mic_volume"
+save = true
+encoding = { type = "int_range", min = 1, max = 10 }
