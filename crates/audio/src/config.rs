@@ -81,9 +81,6 @@ pub struct ChainSpec {
     /// The playback node.name; EQ sink uses "<name>.output", the mic
     /// source uses the bare "<name>" (the source IS the playback side).
     pub playback_node_name: String,
-    /// Extra space in `node.name    =` alignment in playback.props.
-    /// EQ sink uses true (aligns with `node.passive`); mic source uses false.
-    pub playback_node_name_extra_space: bool,
 }
 
 // ─── Identity + routing for one virtual EQ sink ─────────────────────────────
@@ -192,13 +189,8 @@ pub fn render_chain_conf(spec: &ChainSpec, nodes: &[FilterNode]) -> Result<Strin
 
     // ── playback.props ───────────────────────────────────────────────────────
     let mut playback_inner = String::new();
-    let node_name_pad = if spec.playback_node_name_extra_space {
-        "    "
-    } else {
-        "   "
-    };
     playback_inner.push_str(&format!(
-        "                node.name{node_name_pad}= \"{}\"\n",
+        "                node.name   = \"{}\"\n",
         spec.playback_node_name
     ));
     if spec.playback_passive {
@@ -318,7 +310,6 @@ pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String,
         playback_passive: true,
         playback_target: spec.playback_target.clone(),
         playback_node_name: format!("{}.output", spec.node_name),
-        playback_node_name_extra_space: true,
     };
 
     render_chain_conf(&chain_spec, &nodes)
@@ -387,7 +378,6 @@ mod tests {
             playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
-            playback_node_name_extra_space: false,
         }
     }
 
