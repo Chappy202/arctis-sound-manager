@@ -1,5 +1,22 @@
 <script lang="ts">
   import { engineState, loadError } from "../stores.js";
+  import { deviceSet } from "../ipc.js";
+  import {
+    parseAncMode,
+    ancModeToValue,
+    ANC_MODES,
+    ANC_MODE_LABELS,
+    parseSidetoneLevel,
+    sidetoneLevelLabel,
+    SIDETONE_OPTIONS,
+    parseAutoOffLevel,
+    autoOffLabel,
+    AUTO_OFF_OPTIONS,
+    parse1to10,
+    enabledControls,
+    isGateError,
+    type AncMode,
+  } from "../deviceControls.js";
 
   // ---------------------------------------------------------------------------
   // View-model: map raw EngineState → typed display rows
@@ -79,6 +96,114 @@
   const deviceFields = $derived($engineState?.device_fields ?? {});
   const fieldRows = $derived(mapDeviceFields(deviceFields));
   const hasDaemon = $derived($engineState !== null && $loadError === null);
+
+  // Enabled controls derived from available device fields
+  const controls = $derived(enabledControls(deviceFields));
+
+  // Current values from device state
+  const currentAncMode = $derived(
+    "anc_mode" in deviceFields ? parseAncMode(deviceFields.anc_mode) : ("off" as AncMode)
+  );
+  const currentSidetone = $derived(
+    "sidetone" in deviceFields ? parseSidetoneLevel(deviceFields.sidetone) : 0
+  );
+  const currentAutoOff = $derived(
+    "inactive_time" in deviceFields ? parseAutoOffLevel(deviceFields.inactive_time) : 0
+  );
+  const currentMicLed = $derived(
+    "mic_led" in deviceFields ? parse1to10(deviceFields.mic_led) : 5
+  );
+  const currentTransparencyLevel = $derived(
+    "transparency_level" in deviceFields ? parse1to10(deviceFields.transparency_level) : 5
+  );
+  const currentMicVolume = $derived(
+    "mic_volume" in deviceFields ? parse1to10(deviceFields.mic_volume) : 5
+  );
+
+  // Battery display
+  const batteryValue = $derived(deviceFields.battery ?? deviceFields.battery_level ?? null);
+  const isCharging = $derived(
+    deviceFields.battery_charging === "true" || deviceFields.battery_charging === "1"
+  );
+
+  // ---------------------------------------------------------------------------
+  // Control state: pending errors per control + global gate banner state
+  // ---------------------------------------------------------------------------
+
+  /** Per-control error messages (null = no error). */
+  let controlErrors = $state<Record<string, string | null>>({
+    anc: null,
+    sidetone: null,
+    inactive_time: null,
+    mic_led: null,
+    transparency_level: null,
+    mic_volume: null,
+  });
+
+  /** True when ANY write attempt hit the gate (for the banner). */
+  let gateHit = $state(false);
+
+  /** True when a write is in-flight for a given control. */
+  let pending = $state<Record<string, boolean>>({
+    anc: false,
+    sidetone: false,
+    inactive_time: false,
+    mic_led: false,
+    transparency_level: false,
+    mic_volume: false,
+  });
+
+  /** Clear the gate banner. */
+  function dismissGate() {
+    gateHit = false;
+  }
+
+  /** Generic device-write handler — surfaces the gate error honestly, never fakes success. */
+  async function sendControl(control: string, value: number): Promise<void> {
+    pending = { ...pending, [control]: true };
+    controlErrors = { ...controlErrors, [control]: null };
+    try {
+      await deviceSet(control, value);
+      // On success, EngineState update will arrive via the state-changed event;
+      // the control will snap to the new value automatically.
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      controlErrors = { ...controlErrors, [control]: msg };
+      if (isGateError(msg)) {
+        gateHit = true;
+      }
+    } finally {
+      pending = { ...pending, [control]: false };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Control event handlers
+  // ---------------------------------------------------------------------------
+
+  function onAncChange(mode: AncMode) {
+    sendControl("anc", ancModeToValue(mode));
+  }
+
+  function onSidetoneChange(value: number) {
+    sendControl("sidetone", value);
+  }
+
+  function onMicLedChange(e: Event) {
+    sendControl("mic_led", Number((e.target as HTMLInputElement).value));
+  }
+
+  function onAutoOffChange(e: Event) {
+    sendControl("inactive_time", Number((e.target as HTMLSelectElement).value));
+  }
+
+  function onTransparencyLevelChange(e: Event) {
+    sendControl("transparency_level", Number((e.target as HTMLInputElement).value));
+  }
+
+  function onMicVolumeChange(e: Event) {
+    sendControl("mic_volume", Number((e.target as HTMLInputElement).value));
+  }
 </script>
 
 <div class="device-page">
@@ -108,21 +233,17 @@
           Connect your headset to the base station and ensure the base station
           is powered on.
         </span>
-        <span class="state-note">
-          Real-time device data (battery, ANC, sidetone) will appear here once
-          the hardware polling layer is wired in a future plan.
-        </span>
       </div>
     </div>
 
-    <!-- Dimmed placeholder controls — keep layout, show "coming soon" context -->
-    <div class="controls-grid controls-grid--dimmed" aria-hidden="true">
+    <!-- Dimmed placeholder controls — keep layout visible, show disabled state -->
+    <div class="controls-layout controls-layout--dimmed" aria-hidden="true">
       {#each placeholderCards as card}
         <div class="device-card device-card--disabled">
           <div class="card-header">
             <span class="card-icon">{card.icon}</span>
             <h2 class="card-title">{card.label}</h2>
-            <span class="pill pill--coming">SOON</span>
+            <span class="pill pill--coming">NO DEVICE</span>
           </div>
           <div class="card-body">
             {#each card.rows as row}
@@ -136,43 +257,364 @@
       {/each}
     </div>
 
-  <!-- Device present — render real fields -->
+  <!-- Device present — render live status + controls -->
   {:else if hasDaemon && devicePresent}
-    {#if fieldRows.length === 0}
-      <div class="state-card" role="status">
-        <div class="state-body">
-          <span class="state-title">Device Connected</span>
-          <span class="state-desc">No device fields reported yet.</span>
+
+    <!-- Gate banner: shown whenever a write was rejected by the daemon allowlist -->
+    {#if gateHit}
+      <div class="gate-banner" role="alert" aria-live="assertive">
+        <span class="gate-banner__icon" aria-hidden="true">⚠</span>
+        <div class="gate-banner__body">
+          <strong class="gate-banner__title">Device controls pending validation</strong>
+          <span class="gate-banner__desc">
+            Write access to this headset has not yet been enabled by the owner.
+            Controls are displayed for preview only — changes will not be sent to hardware
+            until each control passes its OWNER-RUN safety gate.
+          </span>
         </div>
+        <button class="gate-banner__dismiss" onclick={dismissGate} aria-label="Dismiss">✕</button>
       </div>
-    {:else}
+    {/if}
+
+    <div class="controls-layout">
+
+      <!-- ─── BATTERY card ─────────────────────────────────────────────────── -->
       <div class="device-card device-card--live">
         <div class="card-header">
-          <span class="card-icon" aria-hidden="true">◉</span>
-          <h2 class="card-title">Device Status</h2>
-          <span class="pill pill--connected" role="status">CONNECTED</span>
+          <span class="card-icon" aria-hidden="true">▮</span>
+          <h2 class="card-title">BATTERY</h2>
+          {#if batteryValue !== null}
+            <span
+              class="pill"
+              style:color={batteryColor(batteryValue)
+                ? `var(${batteryColor(batteryValue)})`
+                : "var(--ss-text-secondary)"}
+              style:background={batteryColor(batteryValue)
+                ? `color-mix(in srgb, var(${batteryColor(batteryValue)}) 12%, transparent)`
+                : "rgba(255,255,255,0.06)"}
+            >
+              {#if isCharging}⚡ CHARGING{:else}CONNECTED{/if}
+            </span>
+          {:else}
+            <span class="pill pill--connected">CONNECTED</span>
+          {/if}
         </div>
         <div class="card-body">
-          {#each fieldRows as row (row.key)}
+          {#if batteryValue !== null}
             <div class="field-row">
-              <span class="field-label">{row.label}</span>
-              {#if row.kind === "battery"}
+              <span class="field-label">BATTERY LEVEL</span>
+              <div class="battery-display">
+                <div class="battery-bar">
+                  <div
+                    class="battery-fill"
+                    style:width="{Math.min(Math.max(parseFloat(batteryValue) || 0, 0), 100)}%"
+                    style:background={batteryColor(batteryValue)
+                      ? `var(${batteryColor(batteryValue)})`
+                      : "var(--ss-text-secondary)"}
+                    class:battery-fill--pulse={isCharging}
+                  ></div>
+                </div>
                 <span
                   class="field-value field-value--readout"
-                  style:color={batteryColor(row.value)
-                    ? `var(${batteryColor(row.value)})`
+                  style:color={batteryColor(batteryValue)
+                    ? `var(${batteryColor(batteryValue)})`
                     : "var(--ss-text-primary)"}
                 >
-                  {row.value}%
+                  {batteryValue}%
                 </span>
-              {:else}
-                <span class="field-value field-value--readout">{row.value}</span>
-              {/if}
+              </div>
             </div>
+          {/if}
+          {#each fieldRows.filter(r => r.kind !== "battery") as row (row.key)}
+            {#if ["firmware", "model", "serial", "battery_charging"].includes(row.key)}
+              <div class="field-row">
+                <span class="field-label">{row.label.toUpperCase()}</span>
+                <span class="field-value field-value--readout">{row.value}</span>
+              </div>
+            {/if}
           {/each}
         </div>
       </div>
-    {/if}
+
+      <!-- ─── ANC card ──────────────────────────────────────────────────────── -->
+      {#if controls.has("anc")}
+        <div class="device-card device-card--live">
+          <div class="card-header">
+            <span class="card-icon" aria-hidden="true">◈</span>
+            <h2 class="card-title">ANC</h2>
+            <span class="pill pill--live">
+              {ANC_MODE_LABELS[currentAncMode].toUpperCase()}
+            </span>
+          </div>
+          <div class="card-body">
+            <!-- ANC mode segmented control -->
+            <div class="control-row">
+              <span class="field-label">MODE</span>
+              <div class="segmented" role="group" aria-label="ANC Mode">
+                {#each ANC_MODES as mode}
+                  <button
+                    class="seg-btn"
+                    class:seg-btn--active={currentAncMode === mode}
+                    disabled={pending.anc || !devicePresent}
+                    onclick={() => onAncChange(mode)}
+                    aria-pressed={currentAncMode === mode}
+                    aria-label="ANC {ANC_MODE_LABELS[mode]}"
+                  >
+                    {ANC_MODE_LABELS[mode]}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            {#if controlErrors.anc}
+              <div class="control-error" role="alert">
+                <span class="control-error__icon">✕</span>
+                <span class="control-error__msg">{controlErrors.anc}</span>
+              </div>
+            {/if}
+
+            <!-- Transparency level — only when anc=transparency AND field available -->
+            {#if controls.has("transparency_level")}
+              <div class="control-row control-row--sub">
+                <span class="field-label">TRANSPARENCY LEVEL</span>
+                <div class="slider-group">
+                  <input
+                    type="range"
+                    class="ss-slider"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value={currentTransparencyLevel}
+                    disabled={pending.transparency_level || !devicePresent || currentAncMode !== "transparency"}
+                    onchange={onTransparencyLevelChange}
+                    aria-label="Transparency level {currentTransparencyLevel} of 10"
+                  />
+                  <span class="slider-readout">{currentTransparencyLevel}</span>
+                </div>
+              </div>
+              {#if controlErrors.transparency_level}
+                <div class="control-error" role="alert">
+                  <span class="control-error__icon">✕</span>
+                  <span class="control-error__msg">{controlErrors.transparency_level}</span>
+                </div>
+              {/if}
+            {/if}
+          </div>
+        </div>
+      {/if}
+
+      <!-- ─── SIDETONE card ─────────────────────────────────────────────────── -->
+      {#if controls.has("sidetone")}
+        <div class="device-card device-card--live">
+          <div class="card-header">
+            <span class="card-icon" aria-hidden="true">⏺</span>
+            <h2 class="card-title">SIDETONE</h2>
+            <span class="pill pill--live">
+              {sidetoneLevelLabel(currentSidetone).toUpperCase()}
+            </span>
+          </div>
+          <div class="card-body">
+            <div class="control-row">
+              <span class="field-label">LEVEL</span>
+              <div class="segmented" role="group" aria-label="Sidetone level">
+                {#each SIDETONE_OPTIONS as opt}
+                  <button
+                    class="seg-btn"
+                    class:seg-btn--active={currentSidetone === opt.value}
+                    disabled={pending.sidetone || !devicePresent}
+                    onclick={() => onSidetoneChange(opt.value)}
+                    aria-pressed={currentSidetone === opt.value}
+                    aria-label="Sidetone {opt.label}"
+                  >
+                    {opt.label}
+                  </button>
+                {/each}
+              </div>
+            </div>
+            {#if controlErrors.sidetone}
+              <div class="control-error" role="alert">
+                <span class="control-error__icon">✕</span>
+                <span class="control-error__msg">{controlErrors.sidetone}</span>
+              </div>
+            {/if}
+            <div class="field-row">
+              <span class="field-label field-label--hint">
+                Hear your own voice in the headset mic
+              </span>
+            </div>
+          </div>
+        </div>
+      {/if}
+
+      <!-- ─── MIC card ──────────────────────────────────────────────────────── -->
+      <div class="device-card device-card--live">
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">◉</span>
+          <h2 class="card-title">MIC</h2>
+        </div>
+        <div class="card-body">
+          {#if controls.has("mic_led")}
+            <div class="control-row">
+              <span class="field-label">MIC LED</span>
+              <div class="slider-group">
+                <input
+                  type="range"
+                  class="ss-slider"
+                  min="1"
+                  max="10"
+                  step="1"
+                  value={currentMicLed}
+                  disabled={pending.mic_led || !devicePresent}
+                  onchange={onMicLedChange}
+                  aria-label="Mic LED brightness {currentMicLed} of 10"
+                />
+                <span class="slider-readout">{currentMicLed}</span>
+              </div>
+            </div>
+            {#if controlErrors.mic_led}
+              <div class="control-error" role="alert">
+                <span class="control-error__icon">✕</span>
+                <span class="control-error__msg">{controlErrors.mic_led}</span>
+              </div>
+            {/if}
+          {/if}
+
+          {#if controls.has("mic_volume")}
+            <div class="control-row">
+              <span class="field-label">MIC VOLUME</span>
+              <div class="slider-group">
+                <input
+                  type="range"
+                  class="ss-slider"
+                  min="1"
+                  max="10"
+                  step="1"
+                  value={currentMicVolume}
+                  disabled={pending.mic_volume || !devicePresent}
+                  onchange={onMicVolumeChange}
+                  aria-label="Mic volume {currentMicVolume} of 10"
+                />
+                <span class="slider-readout">{currentMicVolume}</span>
+              </div>
+            </div>
+            {#if controlErrors.mic_volume}
+              <div class="control-error" role="alert">
+                <span class="control-error__icon">✕</span>
+                <span class="control-error__msg">{controlErrors.mic_volume}</span>
+              </div>
+            {/if}
+          {/if}
+
+          <!-- Read-only mic fields from device state -->
+          {#each fieldRows.filter(r => ["mic_muted", "mic_gain"].includes(r.key)) as row (row.key)}
+            <div class="field-row">
+              <span class="field-label">{row.label.toUpperCase()}</span>
+              <span class="field-value field-value--readout">{row.value}</span>
+            </div>
+          {/each}
+
+          {#if !controls.has("mic_led") && !controls.has("mic_volume") && fieldRows.filter(r => ["mic_muted","mic_gain"].includes(r.key)).length === 0}
+            <div class="field-row">
+              <span class="field-label">STATUS</span>
+              <span class="field-value">—</span>
+            </div>
+          {/if}
+        </div>
+      </div>
+
+      <!-- ─── POWER card ────────────────────────────────────────────────────── -->
+      {#if controls.has("inactive_time")}
+        <div class="device-card device-card--live">
+          <div class="card-header">
+            <span class="card-icon" aria-hidden="true">⏻</span>
+            <h2 class="card-title">POWER</h2>
+            <span class="pill pill--live">
+              {autoOffLabel(currentAutoOff).toUpperCase()}
+            </span>
+          </div>
+          <div class="card-body">
+            <div class="control-row">
+              <span class="field-label">AUTO-OFF</span>
+              <select
+                class="ss-select"
+                value={currentAutoOff}
+                disabled={pending.inactive_time || !devicePresent}
+                onchange={onAutoOffChange}
+                aria-label="Auto-off timeout"
+              >
+                {#each AUTO_OFF_OPTIONS as opt}
+                  <option value={opt.value}>{opt.label}</option>
+                {/each}
+              </select>
+            </div>
+            {#if controlErrors.inactive_time}
+              <div class="control-error" role="alert">
+                <span class="control-error__icon">✕</span>
+                <span class="control-error__msg">{controlErrors.inactive_time}</span>
+              </div>
+            {/if}
+            <div class="field-row">
+              <span class="field-label field-label--hint">
+                Auto-power-off when idle
+              </span>
+            </div>
+          </div>
+        </div>
+      {/if}
+
+      <!-- ─── FIRMWARE / INFO card ──────────────────────────────────────────── -->
+      {#if fieldRows.some(r => ["firmware", "model", "serial"].includes(r.key))}
+        <div class="device-card device-card--live">
+          <div class="card-header">
+            <span class="card-icon" aria-hidden="true">ℹ</span>
+            <h2 class="card-title">FIRMWARE</h2>
+          </div>
+          <div class="card-body">
+            {#each fieldRows.filter(r => ["firmware", "model", "serial"].includes(r.key)) as row (row.key)}
+              <div class="field-row">
+                <span class="field-label">{row.label.toUpperCase()}</span>
+                <span class="field-value field-value--readout">{row.value}</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <!-- Remaining fields not in any card above -->
+      {#if fieldRows.filter(r =>
+        !["battery", "battery_level", "battery_charging",
+          "firmware", "model", "serial",
+          "anc_mode", "anc_enabled",
+          "sidetone",
+          "mic_muted", "mic_gain",
+          "mic_led", "mic_volume",
+          "transparency_level", "inactive_time"
+        ].includes(r.key)).length > 0}
+        <div class="device-card device-card--live">
+          <div class="card-header">
+            <span class="card-icon" aria-hidden="true">◉</span>
+            <h2 class="card-title">STATUS</h2>
+            <span class="pill pill--connected">CONNECTED</span>
+          </div>
+          <div class="card-body">
+            {#each fieldRows.filter(r =>
+              !["battery", "battery_level", "battery_charging",
+                "firmware", "model", "serial",
+                "anc_mode", "anc_enabled",
+                "sidetone",
+                "mic_muted", "mic_gain",
+                "mic_led", "mic_volume",
+                "transparency_level", "inactive_time"
+              ].includes(r.key)) as row (row.key)}
+              <div class="field-row">
+                <span class="field-label">{row.label.toUpperCase()}</span>
+                <span class="field-value field-value--readout">{row.value}</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+    </div><!-- /controls-layout -->
 
   <!-- Loading / null state -->
   {:else}
@@ -188,13 +630,12 @@
 
 <script lang="ts" module>
   // Placeholder card definitions (used when no device is present)
-  // Kept in module context so they're available before the instance script,
-  // and so they're a stable constant (no reactive re-creation).
   const placeholderCards = [
     { icon: "▮", label: "BATTERY",  rows: ["Level", "Charging"] },
     { icon: "◈", label: "ANC",      rows: ["Mode", "Transparency", "Intensity"] },
-    { icon: "⏺", label: "MIC",      rows: ["Sidetone", "Mic Gain", "Mute"] },
-    { icon: "⏻", label: "POWER",    rows: ["Auto-off", "Standby Timeout"] },
+    { icon: "⏺", label: "SIDETONE", rows: ["Level"] },
+    { icon: "◉", label: "MIC",      rows: ["Mic LED", "Mic Volume"] },
+    { icon: "⏻", label: "POWER",    rows: ["Auto-off"] },
     { icon: "ℹ", label: "FIRMWARE", rows: ["Version", "Model", "Serial"] },
   ] as const;
 </script>
@@ -234,6 +675,66 @@
     font-size: var(--ss-type-caption-size);
     color: var(--ss-text-tertiary);
     margin: 0;
+  }
+
+  /* =========================================================================
+   * Gate banner
+   * ========================================================================= */
+  .gate-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--ss-space-3);
+    padding: var(--ss-space-4) var(--ss-space-5);
+    background: color-mix(in srgb, var(--ss-warning) 8%, var(--ss-surface-2));
+    border: var(--ss-border-width) solid color-mix(in srgb, var(--ss-warning) 30%, transparent);
+    border-radius: var(--ss-radius-md);
+    box-shadow: var(--ss-e1);
+  }
+
+  .gate-banner__icon {
+    font-size: 16px;
+    color: var(--ss-warning);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .gate-banner__body {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-1);
+    flex: 1;
+  }
+
+  .gate-banner__title {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-label-size);
+    font-weight: var(--ss-type-label-weight);
+    letter-spacing: var(--ss-type-label-letter-spacing);
+    color: var(--ss-warning);
+    text-transform: uppercase;
+  }
+
+  .gate-banner__desc {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-secondary);
+    line-height: 1.45;
+  }
+
+  .gate-banner__dismiss {
+    background: none;
+    border: none;
+    color: var(--ss-text-tertiary);
+    font-size: 14px;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    flex-shrink: 0;
+    transition: color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .gate-banner__dismiss:hover {
+    color: var(--ss-text-primary);
   }
 
   /* =========================================================================
@@ -309,29 +810,17 @@
     line-height: var(--ss-type-body-line-height);
   }
 
-  .state-note {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-caption-size);
-    color: var(--ss-text-tertiary);
-    line-height: var(--ss-type-caption-line-height);
-    padding: var(--ss-space-2) var(--ss-space-3);
-    background: var(--ss-bg-base);
-    border-left: 2px solid var(--ss-border-strong);
-    border-radius: 0 var(--ss-radius-xs) var(--ss-radius-xs) 0;
-    margin-top: var(--ss-space-1);
-  }
-
   /* =========================================================================
-   * Controls grid (placeholder + live)
+   * Controls layout
    * ========================================================================= */
-  .controls-grid {
+  .controls-layout {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: var(--ss-space-4);
   }
 
-  .controls-grid--dimmed {
-    opacity: 0.5;
+  .controls-layout--dimmed {
+    opacity: 0.4;
     pointer-events: none;
     user-select: none;
   }
@@ -404,6 +893,11 @@
     background: rgba(255, 255, 255, 0.06);
   }
 
+  .pill--live {
+    color: var(--ss-accent);
+    background: var(--ss-accent-soft);
+  }
+
   /* =========================================================================
    * Field rows
    * ========================================================================= */
@@ -419,6 +913,7 @@
     padding: var(--ss-space-2) var(--ss-space-4);
     border-bottom: var(--ss-border-width) solid var(--ss-border);
     min-height: var(--ss-control-h);
+    gap: var(--ss-space-3);
   }
 
   .field-row:last-child {
@@ -436,6 +931,15 @@
     letter-spacing: var(--ss-type-label-letter-spacing);
     text-transform: uppercase;
     color: var(--ss-text-secondary);
+    flex-shrink: 0;
+  }
+
+  .field-label--hint {
+    font-size: var(--ss-type-caption-size);
+    font-weight: 400;
+    text-transform: none;
+    color: var(--ss-text-tertiary);
+    letter-spacing: 0;
   }
 
   .field-value {
@@ -450,5 +954,263 @@
     font-weight: var(--ss-type-readout-weight);
     font-variant-numeric: tabular-nums;
     line-height: var(--ss-type-readout-line-height);
+  }
+
+  /* =========================================================================
+   * Battery display
+   * ========================================================================= */
+  .battery-display {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-3);
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .battery-bar {
+    width: 80px;
+    height: 6px;
+    background: var(--ss-surface-input);
+    border-radius: var(--ss-radius-pill);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .battery-fill {
+    height: 100%;
+    border-radius: var(--ss-radius-pill);
+    transition: width var(--ss-dur-base) var(--ss-ease-out);
+  }
+
+  .battery-fill--pulse {
+    animation: battery-pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes battery-pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.5; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .battery-fill--pulse {
+      animation: none;
+    }
+  }
+
+  /* =========================================================================
+   * Control rows (interactive)
+   * ========================================================================= */
+  .control-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: var(--ss-space-3) var(--ss-space-4);
+    border-bottom: var(--ss-border-width) solid var(--ss-border);
+    gap: var(--ss-space-3);
+    min-height: var(--ss-control-h);
+  }
+
+  .control-row--sub {
+    background: color-mix(in srgb, var(--ss-surface-2) 40%, transparent);
+  }
+
+  /* =========================================================================
+   * Segmented control
+   * ========================================================================= */
+  .segmented {
+    display: flex;
+    background: var(--ss-surface-input);
+    border-radius: var(--ss-radius-sm);
+    padding: 2px;
+    gap: 2px;
+  }
+
+  .seg-btn {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-micro-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-secondary);
+    background: transparent;
+    border: none;
+    border-radius: calc(var(--ss-radius-sm) - 1px);
+    padding: 4px var(--ss-space-3);
+    cursor: pointer;
+    transition:
+      background var(--ss-dur-base) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard);
+    min-height: var(--ss-control-h-sm);
+    white-space: nowrap;
+  }
+
+  .seg-btn:hover:not(:disabled) {
+    color: var(--ss-text-primary);
+    background: color-mix(in srgb, var(--ss-surface-input-alt) 60%, transparent);
+  }
+
+  .seg-btn--active {
+    background: var(--ss-accent) !important;
+    color: var(--ss-text-bright) !important;
+  }
+
+  .seg-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .seg-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 1px;
+  }
+
+  /* =========================================================================
+   * Slider
+   * ========================================================================= */
+  .slider-group {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-3);
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .ss-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 4px;
+    border-radius: var(--ss-radius-pill);
+    background: var(--ss-surface-input);
+    cursor: pointer;
+    width: 120px;
+    flex-shrink: 0;
+    outline: none;
+    transition: background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .ss-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--ss-radius-pill);
+    background: var(--ss-text-bright);
+    box-shadow: var(--ss-e1);
+    cursor: pointer;
+    transition:
+      box-shadow var(--ss-dur-fast) var(--ss-ease-standard),
+      transform var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .ss-slider::-moz-range-thumb {
+    width: 16px;
+    height: 16px;
+    border-radius: var(--ss-radius-pill);
+    background: var(--ss-text-bright);
+    box-shadow: var(--ss-e1);
+    cursor: pointer;
+    border: none;
+    transition:
+      box-shadow var(--ss-dur-fast) var(--ss-ease-standard),
+      transform var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .ss-slider:hover:not(:disabled)::-webkit-slider-thumb {
+    box-shadow: 0 0 0 3px var(--ss-accent-border), var(--ss-e1);
+    transform: scale(1.1);
+  }
+
+  .ss-slider:hover:not(:disabled)::-moz-range-thumb {
+    box-shadow: 0 0 0 3px var(--ss-accent-border), var(--ss-e1);
+    transform: scale(1.1);
+  }
+
+  .ss-slider:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .ss-slider:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .slider-readout {
+    font-family: var(--ss-font-mono);
+    font-size: var(--ss-type-readout-size);
+    font-weight: var(--ss-type-readout-weight);
+    font-variant-numeric: tabular-nums;
+    color: var(--ss-text-primary);
+    min-width: 20px;
+    text-align: right;
+  }
+
+  /* =========================================================================
+   * Select / dropdown
+   * ========================================================================= */
+  .ss-select {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-body-size);
+    color: var(--ss-text-primary);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    height: var(--ss-field-h);
+    padding: 0 var(--ss-space-4) 0 var(--ss-space-3);
+    cursor: pointer;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    min-width: 120px;
+    /* Custom caret */
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%237A7C80'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    transition:
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      background-color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .ss-select:hover:not(:disabled) {
+    border-color: var(--ss-border-strong);
+    background-color: var(--ss-surface-input-alt);
+  }
+
+  .ss-select:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 1px;
+    border-color: var(--ss-accent-border);
+  }
+
+  .ss-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* =========================================================================
+   * Inline control error
+   * ========================================================================= */
+  .control-error {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--ss-space-2);
+    padding: var(--ss-space-2) var(--ss-space-4);
+    background: color-mix(in srgb, var(--ss-danger) 8%, transparent);
+    border-top: var(--ss-border-width) solid color-mix(in srgb, var(--ss-danger) 20%, transparent);
+  }
+
+  .control-error__icon {
+    font-size: 11px;
+    color: var(--ss-danger);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .control-error__msg {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    line-height: 1.4;
+    word-break: break-word;
   }
 </style>

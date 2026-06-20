@@ -62,6 +62,11 @@ enum Command {
         #[arg(long, default_value_t = true)]
         foreground: bool,
     },
+    /// Headset hardware control (live reads; gated writes).
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -157,6 +162,45 @@ enum ProfileAction {
     New { name: String },
 }
 
+#[derive(Subcommand, Debug)]
+enum DeviceAction {
+    /// Read and print live device status (battery, ANC, mic, dial). Read-only.
+    Status,
+    /// Set sidetone level 0..3.
+    Sidetone {
+        #[arg(allow_negative_numbers = true)]
+        level: i64,
+    },
+    /// Set mic LED brightness 1..10.
+    MicLed {
+        #[arg(allow_negative_numbers = true)]
+        level: i64,
+    },
+    /// Set ANC mode: off | transparency | on.
+    Anc { mode: String },
+    /// Set auto-off level 0..6 (0=never, 1=1min, 2=5min, 3=10min, 4=15min, 5=30min, 6=60min).
+    AutoOff {
+        #[arg(allow_negative_numbers = true)]
+        level: i64,
+    },
+    /// Set transparency level 1..10.
+    Transparency {
+        #[arg(allow_negative_numbers = true)]
+        level: i64,
+    },
+    /// Set mic volume 1..10.
+    MicVolume {
+        #[arg(allow_negative_numbers = true)]
+        level: i64,
+    },
+    /// Set a raw control by name and integer value (generic escape hatch).
+    Set {
+        control: String,
+        #[arg(allow_negative_numbers = true)]
+        value: i64,
+    },
+}
+
 const SINK_NAME: &str = "arctis_eq";
 const SINK_DESC: &str = "Arctis EQ Sink";
 
@@ -166,6 +210,154 @@ fn band_kind(s: &str) -> Result<BandKind, String> {
         "lowshelf" => Ok(BandKind::LowShelf),
         "highshelf" => Ok(BandKind::HighShelf),
         other => Err(format!("unknown band kind: {other}")),
+    }
+}
+
+/// Parse an ANC mode string ("off" | "transparency" | "on") to its wire integer.
+fn parse_anc_mode(mode: &str) -> Result<i64, String> {
+    match mode {
+        "off" => Ok(0),
+        "transparency" => Ok(1),
+        "on" => Ok(2),
+        other => Err(format!(
+            "unknown ANC mode '{other}' (use: off | transparency | on)"
+        )),
+    }
+}
+
+/// Send a DeviceSet request to the daemon and print the result.
+/// On daemon error (gate refused, etc.) the daemon's error message is surfaced
+/// clearly — it is NOT treated as a crash.
+fn device_set_via_daemon(control: &str, value: i64) -> ExitCode {
+    if !daemon::socket_path().exists() {
+        eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+        eprintln!(
+            "note: device writes require the daemon (single worker enforces HID serialisation)"
+        );
+        return ExitCode::FAILURE;
+    }
+    let req = daemon::Request::DeviceSet {
+        control: control.to_string(),
+        value,
+    };
+    match daemon::send_request(&req) {
+        Ok(resp) if resp.ok => {
+            println!("ok: {control} set to {value}");
+            // If state came back, print device fields for confirmation.
+            if let Some(state) = resp.state {
+                if state.device_present {
+                    for (k, v) in &state.device_fields {
+                        println!("  {k}: {v}");
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(resp) => {
+            // Surface the daemon's gate/validation error verbatim.
+            let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error communicating with daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch_device(action: DeviceAction) -> ExitCode {
+    match action {
+        DeviceAction::Status => {
+            // Try the daemon first (preferred — uses the live DeviceWorker).
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::GetState) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            if !state.device_present {
+                                println!("device: not connected");
+                            } else {
+                                println!("device: connected");
+                                for (k, v) in &state.device_fields {
+                                    println!("  {k}: {v}");
+                                }
+                            }
+                            return ExitCode::SUCCESS;
+                        }
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {
+                        // Daemon failed — fall through to direct read.
+                    }
+                }
+            }
+            // Fall back: direct one-shot read via discover + read_status.
+            let registry = match Registry::builtin() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let (id, iface) = match discover(&registry) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    println!("device: not connected");
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let desc = registry.find(id).expect("discover returned a matched id");
+            let mut transport = match HidrawTransport::open(id, iface) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error opening {id}: {e}");
+                    eprintln!("hint: a udev rule granting hidraw access may be required.");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match read_status(&mut transport, desc) {
+                Ok(device_state) => {
+                    println!("device: {} ({id})", desc.name);
+                    for (k, v) in &device_state.fields {
+                        let rendered = match v {
+                            StatusValue::Percentage(p) => format!("{p}%"),
+                            StatusValue::Bool(b) => b.to_string(),
+                            StatusValue::Enum(s) => s.clone(),
+                            StatusValue::Int(i) => i.to_string(),
+                        };
+                        println!("  {k}: {rendered}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error reading device status: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        DeviceAction::Sidetone { level } => device_set_via_daemon("sidetone", level),
+        DeviceAction::MicLed { level } => device_set_via_daemon("mic_led", level),
+        DeviceAction::Anc { mode } => {
+            let value = match parse_anc_mode(&mode) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            device_set_via_daemon("anc", value)
+        }
+        DeviceAction::AutoOff { level } => device_set_via_daemon("inactive_time", level),
+        DeviceAction::Transparency { level } => device_set_via_daemon("transparency_level", level),
+        DeviceAction::MicVolume { level } => device_set_via_daemon("mic_volume", level),
+        DeviceAction::Set { control, value } => device_set_via_daemon(&control, value),
     }
 }
 
@@ -444,6 +636,7 @@ fn main() -> ExitCode {
                 }
             },
         },
+        Command::Device { action } => dispatch_device(action),
         Command::Profile { action } => dispatch_profile(action),
         Command::Apply => dispatch_apply(),
         Command::Daemon { foreground: _ } => {
@@ -872,5 +1065,175 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── device subcommand parsing tests ─────────────────────────────────────
+
+    #[test]
+    fn device_status_parses() {
+        let cmd = parse(&["device", "status"]).expect("device status should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Device {
+                action: super::DeviceAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn device_sidetone_parses() {
+        let cmd = parse(&["device", "sidetone", "2"]).expect("device sidetone should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Sidetone { level },
+            } => assert_eq!(level, 2),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_sidetone_zero_parses() {
+        let cmd = parse(&["device", "sidetone", "0"]).expect("device sidetone 0 should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Sidetone { level },
+            } => assert_eq!(level, 0),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_mic_led_parses() {
+        let cmd = parse(&["device", "mic-led", "10"]).expect("device mic-led should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::MicLed { level },
+            } => assert_eq!(level, 10),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_anc_off_parses() {
+        let cmd = parse(&["device", "anc", "off"]).expect("device anc off should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Anc { mode },
+            } => assert_eq!(mode, "off"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_anc_transparency_parses() {
+        let cmd = parse(&["device", "anc", "transparency"])
+            .expect("device anc transparency should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Anc { mode },
+            } => assert_eq!(mode, "transparency"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_anc_on_parses() {
+        let cmd = parse(&["device", "anc", "on"]).expect("device anc on should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Anc { mode },
+            } => assert_eq!(mode, "on"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_auto_off_parses() {
+        let cmd = parse(&["device", "auto-off", "3"]).expect("device auto-off should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::AutoOff { level },
+            } => assert_eq!(level, 3),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_transparency_parses() {
+        let cmd =
+            parse(&["device", "transparency", "5"]).expect("device transparency should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Transparency { level },
+            } => assert_eq!(level, 5),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_mic_volume_parses() {
+        let cmd = parse(&["device", "mic-volume", "7"]).expect("device mic-volume should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::MicVolume { level },
+            } => assert_eq!(level, 7),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_set_generic_parses() {
+        let cmd = parse(&["device", "set", "sidetone", "1"]).expect("device set should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Set { control, value },
+            } => {
+                assert_eq!(control, "sidetone");
+                assert_eq!(value, 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_set_negative_value_parses() {
+        let cmd =
+            parse(&["device", "set", "mic_volume", "-1"]).expect("device set -1 should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::Set { control, value },
+            } => {
+                assert_eq!(control, "mic_volume");
+                assert_eq!(value, -1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── parse_anc_mode unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn anc_mode_off_maps_to_zero() {
+        assert_eq!(super::parse_anc_mode("off"), Ok(0));
+    }
+
+    #[test]
+    fn anc_mode_transparency_maps_to_one() {
+        assert_eq!(super::parse_anc_mode("transparency"), Ok(1));
+    }
+
+    #[test]
+    fn anc_mode_on_maps_to_two() {
+        assert_eq!(super::parse_anc_mode("on"), Ok(2));
+    }
+
+    #[test]
+    fn anc_mode_unknown_errors() {
+        assert!(super::parse_anc_mode("invalid").is_err());
+        let e = super::parse_anc_mode("active").unwrap_err();
+        assert!(
+            e.contains("off | transparency | on"),
+            "error should hint at valid values: {e}"
+        );
     }
 }
