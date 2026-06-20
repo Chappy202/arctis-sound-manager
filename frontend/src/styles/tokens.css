@@ -50,6 +50,7 @@
   --ss-success:             #41A930;         /* ok / connected / charging */
   --ss-warning:             #FFBE00;         /* low battery / caution */
   --ss-danger:              #E5484D;         /* error / disconnect / destructive */
+  --ss-danger-soft:         rgba(229, 72, 77, 0.10); /* 10% danger tint for badge backgrounds */
   --ss-muted:               #A5A7AA;         /* muted channel inactive state */
 
   /* =========================================================================

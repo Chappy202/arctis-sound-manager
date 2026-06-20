@@ -332,7 +332,7 @@
     color: var(--ss-danger);
     margin: 0;
     padding: var(--ss-space-2) var(--ss-space-3);
-    background: rgba(229, 72, 77, 0.1);
+    background: var(--ss-danger-soft);
     border-radius: var(--ss-radius-xs);
     border: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
   }

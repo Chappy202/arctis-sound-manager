@@ -185,7 +185,7 @@
               }}
             />
             <button
-              class="new-profile-confirm btn-secondary"
+              class="new-profile-confirm"
               onclick={createProfile}
               disabled={!newProfileName.trim()}
               aria-label="Create profile"

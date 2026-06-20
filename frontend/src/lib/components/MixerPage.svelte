@@ -228,7 +228,7 @@
     align-items: center;
     height: 18px;
     padding: 0 var(--ss-space-2);
-    background: rgba(229, 72, 77, 0.12);
+    background: var(--ss-danger-soft);
     border: var(--ss-border-width) solid rgba(229, 72, 77, 0.35);
     border-radius: var(--ss-radius-pill);
     font-family: var(--ss-font-ui);

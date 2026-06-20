@@ -1,6 +1,7 @@
 <script lang="ts">
   import AppShell from './lib/components/AppShell.svelte';
   import MixerPage from './lib/components/MixerPage.svelte';
+  import EqPage from './lib/components/EqPage.svelte';
   import { currentPage } from './lib/stores/page.js';
 </script>
 
@@ -8,11 +9,7 @@
   {#if $currentPage === 'mixer'}
     <MixerPage />
   {:else if $currentPage === 'eq'}
-    <div class="placeholder-page">
-      <h1 class="page-title">EQ</h1>
-      <p class="page-desc">Parametric EQ canvas · Up to 10 bands · Presets</p>
-      <p class="page-hint">EQ page — coming in Task 6</p>
-    </div>
+    <EqPage />
   {:else if $currentPage === 'device'}
     <div class="placeholder-page">
       <h1 class="page-title">DEVICE</h1>
