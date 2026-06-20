@@ -12,7 +12,10 @@ pub mod runner;
 
 pub use backend::{AudioBackend, ConfHandle};
 pub use channels::{ChannelDef, ChannelManager, ChannelSetConfig};
-pub use config::{band_node_name, render_filter_chain_conf, SinkSpec};
+pub use config::{
+    band_node_name, render_chain_conf, render_filter_chain_conf, ChainChannels, ChainSpec,
+    FilterNode, NodeType, SinkSpec,
+};
 pub use eq::{
     BandKind, EqBand, EqModel, FREQ_MAX_HZ, FREQ_MIN_HZ, GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS,
     Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
