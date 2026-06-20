@@ -36,3 +36,15 @@ pub const MIC_VAD_RETRO_GRACE_MAX_MS: f32 = 200.0;
 /// Noise gate open threshold (linear 0..1).
 pub const MIC_GATE_THRESHOLD_MIN: f32 = 0.0;
 pub const MIC_GATE_THRESHOLD_MAX: f32 = 0.5;
+
+/// sc4m LADSPA compressor threshold (dB).
+pub const MIC_COMP_THRESHOLD_MIN_DB: f32 = -30.0;
+pub const MIC_COMP_THRESHOLD_MAX_DB: f32 = 0.0;
+
+/// sc4m LADSPA compressor ratio (1:n).
+pub const MIC_COMP_RATIO_MIN: f32 = 1.0;
+pub const MIC_COMP_RATIO_MAX: f32 = 20.0;
+
+/// sc4m LADSPA compressor makeup gain (dB).
+pub const MIC_COMP_MAKEUP_MIN_DB: f32 = 0.0;
+pub const MIC_COMP_MAKEUP_MAX_DB: f32 = 24.0;

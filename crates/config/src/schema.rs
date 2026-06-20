@@ -1,9 +1,10 @@
 use arctis_domain::eq_bounds::{
     EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
-    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
-    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
-    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
-    MIC_VAD_THRESHOLD_MIN,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -417,6 +418,36 @@ impl Config {
                     profile.name
                 )));
             }
+            if mic.compressor.enabled {
+                if !(MIC_COMP_THRESHOLD_MIN_DB..=MIC_COMP_THRESHOLD_MAX_DB)
+                    .contains(&mic.compressor.threshold_db)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor threshold_db {} dB out of range {}..={} in profile '{}'",
+                        mic.compressor.threshold_db,
+                        MIC_COMP_THRESHOLD_MIN_DB,
+                        MIC_COMP_THRESHOLD_MAX_DB,
+                        profile.name
+                    )));
+                }
+                if !(MIC_COMP_RATIO_MIN..=MIC_COMP_RATIO_MAX).contains(&mic.compressor.ratio) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor ratio {} out of range {}..={} in profile '{}'",
+                        mic.compressor.ratio, MIC_COMP_RATIO_MIN, MIC_COMP_RATIO_MAX, profile.name
+                    )));
+                }
+                if !(MIC_COMP_MAKEUP_MIN_DB..=MIC_COMP_MAKEUP_MAX_DB)
+                    .contains(&mic.compressor.makeup_db)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor makeup_db {} dB out of range {}..={} in profile '{}'",
+                        mic.compressor.makeup_db,
+                        MIC_COMP_MAKEUP_MIN_DB,
+                        MIC_COMP_MAKEUP_MAX_DB,
+                        profile.name
+                    )));
+                }
+            }
             // Mic EQ bands reuse the existing EQ bounds.
             if mic.eq_enabled {
                 for band in &mic.eq {
@@ -768,5 +799,123 @@ description = "Chat"
                 profile.name
             );
         }
+    }
+
+    // ── Compressor validation tests ───────────────────────────────────────────
+
+    fn make_enabled_compressor(threshold_db: f32, ratio: f32, makeup_db: f32) -> Config {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.compressor = MicCompressorStage {
+            enabled: true,
+            threshold_db,
+            ratio,
+            makeup_db,
+        };
+        cfg
+    }
+
+    /// Enabled compressor with ratio below minimum (0.0 < 1.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_ratio_below_min() {
+        let err = make_enabled_compressor(-18.0, 0.0, 4.0)
+            .validate()
+            .expect_err("ratio=0.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with threshold_db above maximum (100.0 > 0.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_threshold_above_max() {
+        let err = make_enabled_compressor(100.0, 2.0, 4.0)
+            .validate()
+            .expect_err("threshold_db=100.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with makeup_db above maximum (25.0 > 24.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_makeup_above_max() {
+        let err = make_enabled_compressor(-18.0, 2.0, 25.0)
+            .validate()
+            .expect_err("makeup_db=25.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with all params in range → accepted.
+    #[test]
+    fn validate_accepts_enabled_compressor_in_range() {
+        assert!(
+            make_enabled_compressor(-18.0, 2.0, 4.0).validate().is_ok(),
+            "in-range enabled compressor should pass validation"
+        );
+    }
+
+    /// Enabled compressor at exact boundary values → accepted.
+    #[test]
+    fn validate_accepts_enabled_compressor_at_boundaries() {
+        // threshold min=-30, ratio min=1, makeup min=0
+        assert!(
+            make_enabled_compressor(-30.0, 1.0, 0.0).validate().is_ok(),
+            "compressor at lower bounds should pass"
+        );
+        // threshold max=0, ratio max=20, makeup max=24
+        assert!(
+            make_enabled_compressor(0.0, 20.0, 24.0).validate().is_ok(),
+            "compressor at upper bounds should pass"
+        );
+    }
+
+    /// Disabled compressor with out-of-range params → accepted (disabled stages skipped).
+    #[test]
+    fn validate_ignores_disabled_compressor_out_of_range() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.compressor = MicCompressorStage {
+            enabled: false,
+            threshold_db: 100.0, // out of range
+            ratio: 0.0,          // out of range
+            makeup_db: 99.0,     // out of range
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "disabled compressor with out-of-range params should pass validation"
+        );
+    }
+
+    // ── VAD threshold boundary tests ──────────────────────────────────────────
+
+    /// VAD threshold at exact max (99.0) → accepted.
+    #[test]
+    fn validate_accepts_vad_threshold_at_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.0;
+        assert!(
+            cfg.validate().is_ok(),
+            "vad_threshold=99.0 (max) should be accepted"
+        );
+    }
+
+    /// VAD threshold just above max (99.01) → rejected.
+    #[test]
+    fn validate_rejects_vad_threshold_just_above_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.01;
+        let err = cfg
+            .validate()
+            .expect_err("vad_threshold=99.01 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
     }
 }
