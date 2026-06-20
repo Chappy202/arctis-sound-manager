@@ -24,7 +24,7 @@ export const FREQ_MIN = 20;
 export const FREQ_MAX = 20000;
 export const GAIN_MIN = -12;
 export const GAIN_MAX = 12;
-export const Q_MIN = 0.1;
+export const Q_MIN = 0.3;
 export const Q_MAX = 10;
 export const DEFAULT_SAMPLE_RATE = 48000;
 

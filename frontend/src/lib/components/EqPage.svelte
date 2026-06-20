@@ -13,8 +13,10 @@
    */
 
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
+  import { dragging } from "../stores/eqDragging.js";
   import EqCanvas from "./EqCanvas.svelte";
   import BandList from "./BandList.svelte";
   import { defaultBands, type Band } from "../eq.js";
@@ -34,13 +36,23 @@
   // Current channel's bands (derived from per-channel cache or defaults)
   let bands = $state<Band[]>([]);
 
+  // True when the engine has no real band data and we are showing flat defaults.
+  let showingDefaults = $state(false);
+
   function getOrInitBands(id: string): Band[] {
     if (!bandsByChannel[id]) {
-      // Number of bands = number of EqBandSnapshot entries the engine reported
-      // (or 10 as the default).
       const channel = $engineState?.channels.find((c) => c.id === id);
-      const count = channel?.eq_bands?.length ?? 10;
-      bandsByChannel[id] = defaultBands(Math.max(1, Math.min(count, 10)));
+      if (channel?.eq_bands?.length) {
+        // Map the engine's actual band parameters into the local Band[] shape.
+        bandsByChannel[id] = channel.eq_bands.map((b) => ({
+          kind: b.kind as Band["kind"],
+          freqHz: b.freq_hz,
+          q: b.q,
+          gainDb: b.gain_db,
+        }));
+      } else {
+        bandsByChannel[id] = defaultBands(10);
+      }
     }
     return bandsByChannel[id];
   }
@@ -49,6 +61,8 @@
     channelId = id;
     bands = getOrInitBands(id);
     selectedBandIndex = 0;
+    const channel = $engineState?.channels.find((c) => c.id === id);
+    showingDefaults = !(channel?.eq_bands?.length);
   }
 
   onMount(() => {
@@ -61,6 +75,7 @@
       // No state yet — use a placeholder; state-changed will trigger re-render
       channelId = stored ?? "game";
       bands = defaultBands(10);
+      showingDefaults = true;
       return;
     }
 
@@ -76,6 +91,30 @@
     if (!channelId && $engineState?.channels.length) {
       selectChannel($engineState.channels[0].id);
     }
+  });
+
+  // Reflect external state-changed updates into the local band cache.
+  // Guard: skip the refresh while a pointer drag is in progress to avoid
+  // clobbering values the user is actively editing on the canvas.
+  $effect(() => {
+    // Establish reactivity dependency on engineState.
+    const state = $engineState;
+    if (!channelId || !state) return;
+
+    const channel = state.channels.find((c) => c.id === channelId);
+    if (!channel?.eq_bands?.length) return;
+
+    // Do not overwrite bands mid-drag — the canvas owns them during a drag.
+    if (get(dragging)) return;
+
+    bandsByChannel[channelId] = channel.eq_bands.map((b) => ({
+      kind: b.kind as Band["kind"],
+      freqHz: b.freq_hz,
+      q: b.q,
+      gainDb: b.gain_db,
+    }));
+    bands = [...bandsByChannel[channelId]];
+    showingDefaults = false;
   });
 
   // ---------------------------------------------------------------------------
@@ -156,12 +195,14 @@
     {/if}
   </div>
 
-  <!-- ===== Defaults notice ===== -->
-  <div class="defaults-notice" role="note" aria-label="Band values notice">
-    <span class="notice-icon" aria-hidden="true">ℹ</span>
-    Showing default values — the engine does not yet report live band parameters.
-    Changes take effect immediately in audio but reset on page reload.
-  </div>
+  <!-- ===== Defaults notice — only when engine reports zero bands ===== -->
+  {#if showingDefaults}
+    <div class="defaults-notice" role="note" aria-label="Band values notice">
+      <span class="notice-icon" aria-hidden="true">ℹ</span>
+      Showing default values — the engine does not yet report live band parameters.
+      Changes take effect immediately in audio but reset on page reload.
+    </div>
+  {/if}
 
   <!-- ===== EQ Canvas (hero) ===== -->
   <div class="eq-canvas-card">

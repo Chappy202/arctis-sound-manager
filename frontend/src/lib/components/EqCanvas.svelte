@@ -10,7 +10,7 @@
    * Gesture model:
    *   - Drag a band dot left/right   → adjusts freqHz (log scale)
    *   - Drag a band dot up/down      → adjusts gainDb (linear ±12 dB)
-   *   - Scroll wheel on a dot        → adjusts Q (0.1–10, log-ish stepping)
+   *   - Scroll wheel on a dot        → adjusts Q (0.3–10, log-ish stepping)
    *   - Arrow keys on focused dot    → nudge gain (up/down) or freq (left/right)
    *   - Shift + arrow keys           → coarse nudge (5× step)
    *
@@ -40,6 +40,7 @@
     type Band,
   } from "../eq.js";
   import { setEqBand } from "../ipc.js";
+  import { dragging } from "../stores/eqDragging.js";
 
   // ---------------------------------------------------------------------------
   // Props
@@ -378,6 +379,7 @@
     dragStartY = py;
     dragStartFreq = bands[idx].freqHz;
     dragStartGain = bands[idx].gainDb;
+    dragging.set(true);
 
     activeIndex = idx;
     if (selectedBandIndex !== idx) {
@@ -432,6 +434,7 @@
 
     activeIndex = -1;
     dragIndex = -1;
+    dragging.set(false);
     showReadout = false;
     draw();
   }
@@ -439,6 +442,7 @@
   function onPointerCancel(e: PointerEvent) {
     dragIndex = -1;
     activeIndex = -1;
+    dragging.set(false);
     showReadout = false;
     draw();
   }
