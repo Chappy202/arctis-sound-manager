@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/domain"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.78"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+hidapi = { version = "2", default-features = false, features = ["linux-native"] }
+arctis-domain = { path = "crates/domain" }
