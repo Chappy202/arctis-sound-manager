@@ -156,6 +156,95 @@ pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<Strin
     Ok(digits)
 }
 
+use crate::runner::CommandRunner;
+use std::fs;
+
+/// Orchestrates per-app routing: a LIVE move via `pw-metadata` and a
+/// PERSISTENT WirePlumber `node.rules` fragment. Subprocess-only (G1/G3).
+pub struct Router<R: CommandRunner> {
+    runner: R,
+    rules: Vec<RouteRule>,
+}
+
+impl<R: CommandRunner> Router<R> {
+    pub fn new(runner: R) -> Self {
+        Self {
+            runner,
+            rules: Vec::new(),
+        }
+    }
+
+    pub fn with_rules(runner: R, rules: Vec<RouteRule>) -> Self {
+        Self { runner, rules }
+    }
+
+    #[cfg(test)]
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+
+    pub fn list(&self) -> &[RouteRule] {
+        &self.rules
+    }
+
+    fn check(
+        out: crate::runner::CmdOutput,
+        program: &str,
+    ) -> Result<crate::runner::CmdOutput, AudioError> {
+        if out.status == 0 {
+            Ok(out)
+        } else {
+            Err(AudioError::NonZeroExit {
+                program: program.to_string(),
+                status: out.status,
+                stderr: out.stderr,
+            })
+        }
+    }
+
+    /// Move a running app's stream to `target_sink` LIVE. Returns the id moved.
+    pub fn apply_live(&mut self, app: &AppMatch, target_sink: &str) -> Result<String, AudioError> {
+        let dump = self.runner.run("pw-dump", &[])?;
+        let dump = Self::check(dump, "pw-dump")?;
+        let id = parse_stream_id(&dump.stdout, app)?;
+        let argv = move_stream_argv(&id, target_sink)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-metadata", &args)?;
+        Self::check(out, "pw-metadata")?;
+        Ok(id)
+    }
+
+    /// Upsert a persistent rule by app binary (no duplicates).
+    pub fn set_rule(&mut self, rule: RouteRule) {
+        if let Some(existing) = self
+            .rules
+            .iter_mut()
+            .find(|r| r.app_binary == rule.app_binary)
+        {
+            existing.target_sink = rule.target_sink;
+        } else {
+            self.rules.push(rule);
+        }
+    }
+
+    /// Write the persistent WirePlumber fragment to disk (creates dirs).
+    pub fn write_persistent(&mut self) -> Result<PathBuf, AudioError> {
+        let path = wireplumber_fragment_path();
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
+                program: "mkdir wireplumber.conf.d".to_string(),
+                source_msg: e.to_string(),
+            })?;
+        }
+        let body = node_rules_fragment(&self.rules);
+        fs::write(&path, body).map_err(|e| AudioError::Spawn {
+            program: "write wireplumber fragment".to_string(),
+            source_msg: e.to_string(),
+        })?;
+        Ok(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +317,75 @@ mod tests {
         let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
         let err = parse_stream_id(dump, &AppMatch::Binary("nope".into())).unwrap_err();
         assert!(matches!(err, AudioError::Parse { .. }));
+    }
+
+    // --- Router tests ---
+
+    use crate::runner::MockRunner;
+
+    #[test]
+    fn apply_live_dumps_parses_then_moves_with_exact_argv() {
+        let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
+        let runner = MockRunner::new()
+            .with_output(0, dump, "") // pw-dump
+            .with_output(0, "", ""); // pw-metadata move
+        let mut router = Router::new(runner);
+        let id = router
+            .apply_live(&AppMatch::Binary("firefox".into()), "Arctis_Media")
+            .unwrap();
+        assert_eq!(id, "73");
+        let calls = &router.runner().calls;
+        assert_eq!(calls[0], vec!["pw-dump"]);
+        assert_eq!(
+            calls[1],
+            vec![
+                "pw-metadata",
+                "-n",
+                "default",
+                "73",
+                "target.object",
+                "Arctis_Media"
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_live_errors_when_app_absent() {
+        let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
+        let runner = MockRunner::new().with_output(0, dump, "");
+        let mut router = Router::new(runner);
+        let err = router
+            .apply_live(&AppMatch::Binary("nope".into()), "Arctis_Media")
+            .unwrap_err();
+        assert!(matches!(err, AudioError::Parse { .. }));
+        // Only pw-dump ran; no move attempted.
+        assert_eq!(router.runner().calls.len(), 1);
+    }
+
+    #[test]
+    fn set_rule_upserts_without_duplicating() {
+        let mut router = Router::new(MockRunner::new());
+        router.set_rule(RouteRule::new("firefox", "Arctis_Media"));
+        router.set_rule(RouteRule::new("firefox", "Arctis_Game")); // re-route same app
+        router.set_rule(RouteRule::new("Discord", "Arctis_Chat"));
+        assert_eq!(router.list().len(), 2);
+        assert_eq!(router.list()[0].target_sink, "Arctis_Game");
+    }
+
+    #[test]
+    fn write_persistent_writes_fragment_to_temp_home() {
+        // Point HOME at a temp dir so the test writes nowhere real.
+        let tmp = std::env::temp_dir().join(format!("asm_wp_test_{}", std::process::id()));
+        std::env::set_var("HOME", &tmp);
+        let mut router = Router::with_rules(
+            MockRunner::new(),
+            vec![RouteRule::new("firefox", "Arctis_Media")],
+        );
+        let path = router.write_persistent().unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("application.process.binary = \"firefox\""));
+        assert!(body.contains("target.object = \"Arctis_Media\""));
+        assert!(path.to_string_lossy().ends_with("90-asm-routing.conf"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
