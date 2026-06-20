@@ -51,7 +51,7 @@ enum EqAction {
         freq: f32,
         #[arg(long)]
         q: f32,
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         gain: f32,
         #[arg(long, default_value = "peaking")]
         kind: String,
@@ -74,31 +74,40 @@ fn band_kind(s: &str) -> Result<BandKind, String> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let registry = match Registry::builtin() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
 
     match cli.command {
-        Command::List => match discover(&registry) {
-            Ok(Some((id, iface))) => {
-                let name = registry.find(id).map(|d| d.name.as_str()).unwrap_or("?");
-                println!("found: {name} ({id}) on interface {iface}");
-                ExitCode::SUCCESS
+        Command::List => {
+            let registry = match Registry::builtin() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match discover(&registry) {
+                Ok(Some((id, iface))) => {
+                    let name = registry.find(id).map(|d| d.name.as_str()).unwrap_or("?");
+                    println!("found: {name} ({id}) on interface {iface}");
+                    ExitCode::SUCCESS
+                }
+                Ok(None) => {
+                    println!("no recognized SteelSeries device connected");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
             }
-            Ok(None) => {
-                println!("no recognized SteelSeries device connected");
-                ExitCode::SUCCESS
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::Probe => {
+            let registry = match Registry::builtin() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let (id, iface) = match discover(&registry) {
                 Ok(Some(v)) => v,
                 Ok(None) => {
@@ -277,7 +286,7 @@ mod tests {
 
     #[test]
     fn eq_set_defaults() {
-        // Use `--gain=-6` (= form) to avoid clap treating "-6" as an unknown flag.
+        // Use `--gain=-6` (= form) — still works alongside the space form.
         let cmd = parse(&[
             "eq",
             "set",
@@ -307,6 +316,21 @@ mod tests {
                 assert!((gain - (-6.0)).abs() < f32::EPSILON);
                 assert_eq!(kind, "peaking");
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_set_negative_gain_space_form() {
+        // `--gain -6` (space form) must parse now that allow_negative_numbers = true.
+        let cmd = parse(&[
+            "eq", "set", "--band", "3", "--freq", "1200", "--q", "1.0", "--gain", "-6",
+        ])
+        .expect("eq set --gain -6 (space form) should parse");
+        match cmd {
+            super::Command::Eq {
+                action: super::EqAction::Set { gain, .. },
+            } => assert!((gain - (-6.0)).abs() < f32::EPSILON),
             other => panic!("unexpected: {other:?}"),
         }
     }
