@@ -1,0 +1,125 @@
+/**
+ * global.css — Base/reset styles for Arctis Sound Manager
+ * Imports tokens.css and applies the dark base, box-sizing reset,
+ * focus-visible, and reduced-motion rules.
+ */
+@import './tokens.css';
+
+/* ============================================================================
+ * Box-sizing reset
+ * ============================================================================ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* ============================================================================
+ * Dark base
+ * ============================================================================ */
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  background: var(--ss-bg-root);
+  color: var(--ss-text-primary);
+  font-family: var(--ss-font-ui);
+  font-size: var(--ss-type-body-size);
+  font-weight: var(--ss-type-body-weight);
+  line-height: var(--ss-type-body-line-height);
+  min-width: var(--ss-window-min-w);
+  min-height: var(--ss-window-min-h);
+  overflow-x: hidden;
+}
+
+/* ============================================================================
+ * Typography defaults
+ * ============================================================================ */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: inherit;
+  line-height: inherit;
+}
+
+/* ============================================================================
+ * Focus-visible outline — accessibility requirement
+ * All interactive elements must show a visible focus ring.
+ * ============================================================================ */
+:focus-visible {
+  outline: 2px solid var(--ss-accent);
+  outline-offset: 2px;
+}
+
+/* Remove default focus style for mouse users */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ============================================================================
+ * Interactive element defaults
+ * ============================================================================ */
+button,
+[role="button"] {
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+button:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+a {
+  color: var(--ss-accent);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--ss-accent-hover);
+}
+
+/* ============================================================================
+ * Scrollbars — styled to match the dark theme
+ * ============================================================================ */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--ss-bg-root);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--ss-surface-3);
+  border-radius: var(--ss-radius-pill);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ss-surface-input);
+}
+
+/* ============================================================================
+ * Reduced motion — honor prefers-reduced-motion
+ * Disables pulses, glows, curve-morph easing; falls back to instant changes.
+ * Functional feedback (value updates) must not depend on animation.
+ * ============================================================================ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
