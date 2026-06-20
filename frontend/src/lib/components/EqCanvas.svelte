@@ -17,11 +17,11 @@
    * IPC: setEqBand is throttled (~50 ms trailing) during drag; a final call
    * fires on pointerup to ensure the last value is flushed.
    *
-   * NOTE: Band parameters (freq/q/gain) are initialised from defaults because
-   * the daemon's get-state response does not yet return per-band values inside
-   * ChannelSnapshot. Changes written via set-eq-band are live but will revert
-   * to defaults on page reload until the engine enhancement lands.
-   * See task-6-brief.md "Open Questions".
+   * Band initialisation: EqPage reads real eq_bands from get-state and passes
+   * them in via the `bands` prop. This component only receives pre-resolved
+   * Band[] values; it does not fall back to defaults — that logic lives in
+   * EqPage.getOrInitBands() (used only when the engine reports zero bands for
+   * a channel).
    */
 
   import { onMount, onDestroy } from "svelte";

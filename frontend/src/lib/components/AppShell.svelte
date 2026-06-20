@@ -41,6 +41,21 @@
   // - engineState !== null → daemon replied → connected (green)
   const connectionStatus = $derived(deriveConnectionStatus($loadError, $engineState));
   const connectionLabel = $derived(getConnectionLabel(connectionStatus));
+
+  // Device identity: only show name when device_present === true.
+  const devicePresent = $derived($engineState?.device_present === true);
+  const deviceName = $derived(
+    devicePresent && $engineState?.device_fields?.["model"]
+      ? $engineState.device_fields["model"]
+      : devicePresent
+        ? "Arctis Device"
+        : "Arctis Sound Manager",
+  );
+
+  // Battery: only show when a real battery value is present in device_fields.
+  const batteryValue = $derived(
+    devicePresent ? ($engineState?.device_fields?.["battery"] ?? null) : null,
+  );
 </script>
 
 <div class="app-shell">
@@ -76,7 +91,7 @@
     <!-- Top bar -->
     <header class="topbar">
       <div class="topbar-left">
-        <span class="device-name">Arctis Nova Pro Wireless</span>
+        <span class="device-name">{deviceName}</span>
         <span
           class="connection-dot {connectionStatus}"
           aria-label={connectionLabel}
@@ -85,10 +100,12 @@
         <span class="connection-label" aria-hidden="true">{connectionLabel}</span>
       </div>
       <div class="topbar-right">
-        <div class="battery-indicator" aria-label="Battery: —" title="Battery status">
-          <span class="battery-icon" aria-hidden="true">▮</span>
-          <span class="battery-value">—</span>
-        </div>
+        {#if batteryValue !== null}
+          <div class="battery-indicator" aria-label="Battery: {batteryValue}" title="Battery status">
+            <span class="battery-icon" aria-hidden="true">▮</span>
+            <span class="battery-value">{batteryValue}</span>
+          </div>
+        {/if}
         <ProfilesDropdown />
       </div>
     </header>

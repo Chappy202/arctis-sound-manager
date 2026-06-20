@@ -95,6 +95,21 @@ describe("buildSetChannelOutputArgs", () => {
 });
 
 // ---------------------------------------------------------------------------
+// setChannelOutput return type (documented expectation)
+// ---------------------------------------------------------------------------
+describe("setChannelOutput return type contract", () => {
+  it("buildSetChannelOutputArgs produces args suitable for an EngineState-returning invoke", () => {
+    // The Rust command now returns Result<EngineState, CommandError>.
+    // This test verifies the arg shape is still correct and does not regress.
+    const args = buildSetChannelOutputArgs("game", "SteelSeries Arctis Nova Pro");
+    expect(args.channel).toBe("game");
+    expect(args.device).toBe("SteelSeries Arctis Nova Pro");
+    // No extra keys (Tauri rejects unknown params in strict mode)
+    expect(Object.keys(args).sort()).toEqual(["channel", "device"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EngineState shape validation (type-level: exercised by TS compilation,
 // here we also do runtime shape checks against a mock snapshot)
 // ---------------------------------------------------------------------------

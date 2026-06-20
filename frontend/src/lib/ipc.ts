@@ -87,10 +87,11 @@ export const profileNew = (name: string): Promise<EngineState> =>
 
 /**
  * Set (or clear) the output device for a channel.
- * Returns void — the daemon will emit a state-changed event with the new state.
+ * Returns the updated EngineState so the caller can apply it to the store
+ * immediately for snappy feedback (no need to wait for the state-changed event).
  */
-export const setChannelOutput = (channel: string, device: string | null): Promise<void> =>
-  invoke<void>("set_channel_output", buildSetChannelOutputArgs(channel, device));
+export const setChannelOutput = (channel: string, device: string | null): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_output", buildSetChannelOutputArgs(channel, device));
 
 /** Update a parametric EQ band; returns updated EngineState. */
 export const setEqBand = (

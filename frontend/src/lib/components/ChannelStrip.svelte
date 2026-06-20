@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ChannelSnapshot } from "../ipc.js";
   import { setChannelOutput } from "../ipc.js";
+  import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
 
   interface Props {
@@ -55,7 +56,13 @@
     if (changing) return;
     changing = true;
     try {
-      await setChannelOutput(channel.id, value);
+      const newState = await setChannelOutput(channel.id, value);
+      // Apply the fresh state immediately for snappy feedback; the
+      // state-changed event from the daemon will arrive shortly and
+      // corroborate (or correct) this optimistic update.
+      if (newState) {
+        engineState.set(newState);
+      }
       onOutputChanged?.();
     } catch (err) {
       console.error("[ChannelStrip] setChannelOutput failed:", err);

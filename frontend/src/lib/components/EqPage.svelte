@@ -2,14 +2,12 @@
   /**
    * EqPage.svelte — Parametric EQ editing page for a selected channel.
    *
-   * KNOWN LIMITATION: The daemon's get-state response includes eq_bands as an
-   * array of EqBandSnapshot, but the engine does not yet persist and return the
-   * per-band parameters (freqHz / q / gainDb) set by the user. Therefore this
-   * page initialises with default flat bands at standard log-spaced center
-   * frequencies (0 dB, Q=1). Dragging the dots calls set-eq-band live and the
-   * changes take effect in the audio immediately, but will reset to defaults
-   * on page reload until the engine enhancement lands.
-   * See task-6-brief.md "Open Questions" for the resolution path.
+   * Band initialisation: per-band parameters (freqHz / q / gainDb) are read
+   * from the real eq_bands array in the daemon's get-state response and kept
+   * fresh via state-changed events. The fallback to flat default bands is only
+   * used when a channel reports zero eq_bands (e.g. device not present or
+   * engine returns an empty list), and a notice is shown to the user in that
+   * case via the `showingDefaults` flag.
    */
 
   import { onMount } from "svelte";

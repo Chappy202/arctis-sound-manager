@@ -84,19 +84,8 @@ pub async fn set_channel_output(
     channel: String,
     device: Option<String>,
     state: State<'_, Mutex<DaemonState>>,
-) -> Result<(), CommandError> {
-    let socket = state.lock().await.socket.clone();
-    let req = Request::SetChannelOutput { channel, device };
-    let resp = tauri::async_runtime::spawn_blocking(move || send_request_to(&socket, &req))
-        .await
-        .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
-    if resp.ok {
-        Ok(())
-    } else {
-        Err(CommandError::Daemon(
-            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
-        ))
-    }
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetChannelOutput { channel, device }).await
 }
 
 #[tauri::command]
