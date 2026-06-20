@@ -106,21 +106,29 @@ mod tests {
     }
 
     /// MockOpener that always returns Ok(None) — device absent.
-    struct AbsentOpener;
+    /// Signals `tx` on every `open()` call so tests can wait deterministically.
+    struct AbsentOpener {
+        tx: std::sync::mpsc::Sender<()>,
+    }
 
     impl DeviceOpener for AbsentOpener {
         type T = MockTransport;
         fn open(&self) -> Result<Option<(DeviceController<Self::T>, Vec<String>)>, DeviceError> {
+            let _ = self.tx.send(());
             Ok(None)
         }
     }
 
     /// MockOpener that always returns Err(NotConnected).
-    struct ErrorOpener;
+    /// Signals `tx` on every `open()` call so tests can wait deterministically.
+    struct ErrorOpener {
+        tx: std::sync::mpsc::Sender<()>,
+    }
 
     impl DeviceOpener for ErrorOpener {
         type T = MockTransport;
         fn open(&self) -> Result<Option<(DeviceController<Self::T>, Vec<String>)>, DeviceError> {
+            let _ = self.tx.send(());
             Err(DeviceError::NotConnected)
         }
     }
@@ -192,12 +200,14 @@ mod tests {
         }));
         let stop = Arc::new(AtomicBool::new(false));
 
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+
         let shared_clone = Arc::clone(&shared);
         let stop_clone = Arc::clone(&stop);
 
         let handle = std::thread::spawn(move || {
             run_read_loop(
-                AbsentOpener,
+                AbsentOpener { tx: open_tx },
                 shared_clone,
                 None,
                 Duration::from_millis(1),
@@ -205,8 +215,12 @@ mod tests {
             );
         });
 
-        // Wait briefly for one loop iteration to complete
-        std::thread::sleep(Duration::from_millis(20));
+        // Wait until open() has been called at least once — proves the loop ran
+        // and set present=false. 3-second bound catches genuine hangs.
+        open_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("AbsentOpener::open() must be called within 3s");
+
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("worker thread must not panic");
 
@@ -222,12 +236,14 @@ mod tests {
         let shared = Arc::new(Mutex::new(crate::DeviceShared::default()));
         let stop = Arc::new(AtomicBool::new(false));
 
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+
         let shared_clone = Arc::clone(&shared);
         let stop_clone = Arc::clone(&stop);
 
         let handle = std::thread::spawn(move || {
             run_read_loop(
-                ErrorOpener,
+                ErrorOpener { tx: open_tx },
                 shared_clone,
                 None,
                 Duration::from_millis(1),
@@ -235,8 +251,12 @@ mod tests {
             );
         });
 
-        // Wait briefly — must not panic
-        std::thread::sleep(Duration::from_millis(20));
+        // Wait until open() has been called at least once — proves the loop ran
+        // and set present=false. 3-second bound catches genuine hangs.
+        open_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("ErrorOpener::open() must be called within 3s");
+
         stop.store(true, Ordering::Relaxed);
         handle
             .join()
