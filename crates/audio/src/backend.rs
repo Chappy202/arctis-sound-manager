@@ -2,13 +2,17 @@ use crate::config::{render_filter_chain_conf, SinkSpec};
 use crate::eq::{EqBand, EqModel};
 use crate::error::AudioError;
 use crate::props::set_band_props_argv;
-use crate::runner::{CmdOutput, CommandRunner};
+use crate::runner::{ChildToken, CmdOutput, CommandRunner};
 use std::path::PathBuf;
 
 /// Handle to the on-disk conf the dedicated `pipewire -c` instance reads.
+/// `child` is `Some` when this call actually spawned the instance; `None` when
+/// the sink was already present (idempotent create) or when no process was started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfHandle {
     pub conf_path: PathBuf,
+    /// Token for the owned `pipewire -c <conf>` child, if one was just spawned.
+    pub child: Option<ChildToken>,
 }
 
 pub struct AudioBackend<R: CommandRunner> {
@@ -55,10 +59,18 @@ impl<R: CommandRunner> AudioBackend<R> {
     }
 
     /// Create the sink idempotently (G3): if it already exists, reuse it.
+    ///
+    /// Returns a `ConfHandle` whose `child` is `Some(token)` when a new
+    /// `pipewire -c` instance was spawned, or `None` when the sink was already
+    /// present. The caller must track the token to ensure the process is reaped
+    /// on shutdown.
     pub fn create(&mut self, eq: &EqModel) -> Result<ConfHandle, AudioError> {
         let path = self.conf_path();
         if self.sink_exists()? {
-            return Ok(ConfHandle { conf_path: path });
+            return Ok(ConfHandle {
+                conf_path: path,
+                child: None,
+            });
         }
         let conf = render_filter_chain_conf(&self.spec, eq)?;
         std::fs::write(&path, conf).map_err(|e| AudioError::Spawn {
@@ -66,10 +78,13 @@ impl<R: CommandRunner> AudioBackend<R> {
             source_msg: e.to_string(),
         })?;
         let path_str = path.to_string_lossy().into_owned();
-        // spawn_detached: pipewire -c <conf> is a long-lived process; we must
-        // not wait for it to exit (that would block create forever).
-        self.runner.spawn_detached("pipewire", &["-c", &path_str])?;
-        Ok(ConfHandle { conf_path: path })
+        // spawn_owned: pipewire -c <conf> is a long-lived process whose pgid
+        // the engine tracks so shutdown can SIGTERM it (no orphan leak).
+        let token = self.runner.spawn_owned("pipewire", &["-c", &path_str])?;
+        Ok(ConfHandle {
+            conf_path: path,
+            child: Some(token),
+        })
     }
 
     /// Resolve the filter node id for live Props. Parses `pw-cli ls Node`.
@@ -198,29 +213,38 @@ id 58, type PipeWire:Interface:Node/3
     fn create_is_idempotent_when_sink_exists() {
         let runner = MockRunner::new().with_output(0, LS_WITH_SINK, "");
         let mut be = AudioBackend::new(runner, spec());
-        be.create(&EqModel::default_10band()).unwrap();
+        let handle = be.create(&EqModel::default_10band()).unwrap();
         // Only the `ls Node` existence check ran; no `pipewire -c` spawn.
         let calls = &be.runner().calls;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
+        // No child spawned when sink already exists.
+        assert!(handle.child.is_none(), "no child when sink already present");
+        assert!(be.runner().spawned.is_empty(), "no spawn_owned calls");
     }
 
     #[test]
     fn create_spawns_dedicated_instance_when_absent() {
-        let runner = MockRunner::new()
-            .with_output(
-                0,
-                "id 1, type PipeWire:Interface:Node/3\n    node.name = \"x\"\n",
-                "",
-            )
-            .with_output(0, "", ""); // pipewire -c
+        // pipewire -c now goes through spawn_owned (recorded in `spawned`, not `calls`).
+        let runner = MockRunner::new().with_output(
+            0,
+            "id 1, type PipeWire:Interface:Node/3\n    node.name = \"x\"\n",
+            "",
+        );
         let mut be = AudioBackend::new(runner, spec());
-        be.create(&EqModel::default_10band()).unwrap();
+        let handle = be.create(&EqModel::default_10band()).unwrap();
+        // Only the ls-Node existence check went through `run`.
         let calls = &be.runner().calls;
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
-        assert_eq!(calls[1][0], "pipewire");
-        assert_eq!(calls[1][1], "-c");
-        assert!(calls[1][2].ends_with("arctis_eq.conf"));
+        assert_eq!(calls.len(), 1, "only the ls check hits `run`");
+        // The pipewire spawn is in `spawned`.
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0][0], "pipewire");
+        assert_eq!(spawned[0][1], "-c");
+        assert!(spawned[0][2].ends_with("arctis_eq.conf"));
+        // The handle carries the child token.
+        assert!(handle.child.is_some(), "handle must carry the child token");
     }
 
     #[test]
@@ -284,7 +308,7 @@ id 58, type PipeWire:Interface:Node/3
     #[test]
     fn recreate_tears_down_then_creates_with_new_target() {
         // remove(): sink_exists ls (present) → find_node_id ls → destroy → pkill
-        // create(): sink_exists ls (now absent) → spawn pipewire -c
+        // create(): sink_exists ls (now absent) → spawn_owned pipewire -c
         let runner = MockRunner::new()
             .with_output(0, LS_WITH_SINK, "") // remove: sink_exists
             .with_output(0, LS_WITH_SINK, "") // remove: find_node_id
@@ -297,13 +321,21 @@ id 58, type PipeWire:Interface:Node/3
             playback_target: Some("alsa_output.speakers".into()),
         };
         let mut be = AudioBackend::new(runner, spec);
-        be.recreate(&EqModel::default_10band()).unwrap();
+        let handle = be.recreate(&EqModel::default_10band()).unwrap();
         let calls = &be.runner().calls;
         assert_eq!(calls[2], vec!["pw-cli", "destroy", "57"]);
-        // last call spawns a fresh dedicated instance
-        let last = calls.last().unwrap();
-        assert_eq!(last[0], "pipewire");
-        assert!(last[2].ends_with("arctis_eq.conf"));
+        // calls: ls, ls, destroy, pkill, ls-absent = 5 entries
+        assert_eq!(calls.len(), 5, "5 run calls: ls ls destroy pkill ls-absent");
+        // The fresh pipewire instance is in spawned (not calls).
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0][0], "pipewire");
+        assert!(spawned[0][2].ends_with("arctis_eq.conf"));
+        // Handle carries the new child token.
+        assert!(
+            handle.child.is_some(),
+            "recreate must surface the new child token"
+        );
     }
 
     #[test]

@@ -87,15 +87,16 @@ impl<R: CommandRunner> Engine<R> {
         let channel_set = convert::channel_set_from_profile(&profile);
         let route_rules = convert::route_rules_from_profile(&profile);
 
-        // Step 1: channels up
+        // Step 1: channels up — track any freshly-spawned pipewire instances
         {
             let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
             let flat_eq = EqModel::default_10band();
-            let _handles = mgr.up(&flat_eq)?;
-            // NOTE: ChannelManager::up uses spawn_detached (not spawn_owned) via AudioBackend::create,
-            // so child token tracking for reconcile's "new sinks" is best-effort at this layer.
-            // The ChildOwner tracks tokens from explicit spawn_owned calls, which are not currently
-            // exposed by ChannelManager::up. A future refactor could thread tokens through.
+            let pairs = mgr.up(&flat_eq)?;
+            for (_handle, token) in pairs {
+                if let Some(t) = token {
+                    self.children.track(t);
+                }
+            }
         }
 
         // Step 2: per-channel EQ apply
@@ -152,10 +153,6 @@ mod tests {
     // ─────────────────────────────────────────────
     // Helpers
     // ─────────────────────────────────────────────
-
-    fn default_config() -> Config {
-        Config::default_config()
-    }
 
     /// Config with 3 channels (game/chat/media), no EQ overrides, no output overrides, no routes.
     fn make_config_no_eq_no_routes() -> Config {
@@ -415,15 +412,15 @@ mod tests {
 
     #[test]
     fn reconcile_emits_expected_argv_sinks_absent() {
-        // Channels absent → spawn_detached fired for each sink creation.
-        // NOTE: MockRunner::spawn_detached records into `calls` but does NOT consume from `queued`.
-        // So phase 1 only consumes 3 queued outputs (one ls-Node per channel).
+        // Channels absent → spawn_owned fires for each sink creation.
+        // spawn_owned goes into `spawned` (NOT `calls`) and does NOT consume queued outputs.
+        // Phase 1 only consumes 3 queued outputs (one ls-Node per channel).
         // Phase 2: each channel: apply_all: ls (find_node_id) + 10 band sets = 11 each.
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
-            // Phase 1: 3 ls calls only (spawn_detached does not consume queued outputs)
+            // Phase 1: 3 ls calls only (spawn_owned does not consume queued outputs)
             .with_output(0, &ls_absent, "") // game ls (absent)
             .with_output(0, &ls_absent, "") // chat ls (absent)
             .with_output(0, &ls_absent, "") // media ls (absent)
@@ -468,56 +465,61 @@ mod tests {
 
         let calls = &engine.runner.calls;
 
-        // Phase 1: game: ls (absent) + spawn_detached (all in calls)
+        // Phase 1: only the 3 ls-Node existence checks (spawn_owned goes to `spawned`)
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"], "game up ls");
-        assert_eq!(calls[1][0], "pipewire", "game spawn");
-        assert!(calls[1][2].ends_with("Arctis_Game.conf"), "game conf path");
+        assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
+        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
 
-        // chat
-        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "chat up ls");
-        assert_eq!(calls[3][0], "pipewire", "chat spawn");
-        assert!(calls[3][2].ends_with("Arctis_Chat.conf"), "chat conf path");
-
-        // media
-        assert_eq!(calls[4], vec!["pw-cli", "ls", "Node"], "media up ls");
-        assert_eq!(calls[5][0], "pipewire", "media spawn");
-        assert!(
-            calls[5][2].ends_with("Arctis_Media.conf"),
-            "media conf path"
-        );
-
-        // Phase 2: apply game starts at index 6 (after 3 ls + 3 spawns)
+        // Phase 2: apply game starts at index 3 (right after phase1 ls calls)
         assert_eq!(
-            calls[6],
+            calls[3],
             vec!["pw-cli", "ls", "Node"],
             "game eq find_node_id"
         );
-        assert_eq!(calls[7][0], "pw-cli", "game band 0 program");
-        assert_eq!(calls[7][1], "s", "game band 0 sub-cmd");
-        assert_eq!(calls[7][3], "Props", "game band 0 Props");
+        assert_eq!(calls[4][0], "pw-cli", "game band 0 program");
+        assert_eq!(calls[4][1], "s", "game band 0 sub-cmd");
+        assert_eq!(calls[4][3], "Props", "game band 0 Props");
 
-        // apply_all chat: 6 (phase1 ls+spawn) + 1+10 (game apply) = 17
+        // apply_all chat: 3 (phase1 ls) + 1+10 (game apply) = 14
         assert_eq!(
-            calls[17],
+            calls[14],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // apply_all media: 17 + 1+10 = 28
+        // apply_all media: 14 + 1+10 = 25
         assert_eq!(
-            calls[28],
+            calls[25],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Total: 6 (phase1: 3 ls + 3 spawns) + 3*11 (apply) = 39
-        assert_eq!(calls.len(), 39, "expected 39 total calls");
-
-        // spawn_detached goes into `calls` (not `spawned`) per MockRunner impl
-        assert!(
-            engine.runner.spawned.is_empty(),
-            "spawn_detached uses calls not spawned"
+        // Total: 3 (phase1 ls) + 3*11 (apply) = 36
+        assert_eq!(
+            calls.len(),
+            36,
+            "expected 36 total run calls (no spawns in calls)"
         );
+
+        // spawn_owned goes into `spawned` — 3 pipewire -c invocations
+        let spawned = &engine.runner.spawned;
+        assert_eq!(spawned.len(), 3, "3 pipewire -c instances spawned_owned");
+        assert_eq!(spawned[0][0], "pipewire", "game spawn program");
+        assert!(
+            spawned[0][2].ends_with("Arctis_Game.conf"),
+            "game conf path"
+        );
+        assert!(
+            spawned[1][2].ends_with("Arctis_Chat.conf"),
+            "chat conf path"
+        );
+        assert!(
+            spawned[2][2].ends_with("Arctis_Media.conf"),
+            "media conf path"
+        );
+
+        // The engine tracked all 3 child tokens
+        assert_eq!(engine.children.len(), 3, "engine must track 3 child tokens");
     }
 
     #[test]
@@ -627,35 +629,78 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_kills_tracked_children() {
-        // Engine with manually-tracked children via children field (test via ChildOwner::track).
-        let runner = MockRunner::new();
-        let cfg = default_config();
+    fn reconcile_then_shutdown_kills_all_3_channel_instances() {
+        // Set up MockRunner so pw-cli ls Node reports ALL sinks ABSENT → reconcile
+        // spawns all 3 via spawn_owned. Then shutdown must kill all 3.
+        let ls_absent = ls_all_absent();
+        let ls_present = ls_all_present();
+
+        let runner = MockRunner::new()
+            // Phase 1: 3 ls checks (sinks absent, spawn_owned called per channel)
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "")
+            // Phase 2: apply_all game — find_node_id + 10 band sets
+            .with_output(0, &ls_present, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            // Phase 2: apply_all chat
+            .with_output(0, &ls_present, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            // Phase 2: apply_all media
+            .with_output(0, &ls_present, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "");
+
+        let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
+        engine.reconcile().expect("reconcile should succeed");
 
-        // Manually track a couple of fake tokens.
-        let t1 = engine
-            .runner
-            .spawn_owned("pipewire", &["-c", "/tmp/a.conf"])
-            .unwrap();
-        let t2 = engine
-            .runner
-            .spawn_owned("pipewire", &["-c", "/tmp/b.conf"])
-            .unwrap();
-        engine.children.track(t1);
-        engine.children.track(t2);
+        // 3 channels were absent → 3 spawn_owned calls → 3 tracked tokens.
+        assert_eq!(
+            engine.children.len(),
+            3,
+            "reconcile must track 3 channel pipewire instances"
+        );
+        assert_eq!(engine.runner.spawned.len(), 3, "3 spawn_owned calls");
 
+        // Shutdown must kill all 3 tracked instances.
         engine.shutdown().expect("shutdown should succeed");
 
         assert_eq!(
             engine.runner.killed.len(),
-            2,
-            "both tokens should be killed on shutdown"
+            3,
+            "shutdown must kill all 3 channel pipewire instances (no orphan leak)"
         );
         assert_eq!(
             engine.children.len(),
             0,
-            "children should be empty after shutdown"
+            "children list must be empty after shutdown"
         );
     }
 
@@ -686,7 +731,7 @@ mod tests {
         engine.reconcile().expect("first reconcile");
         engine.reconcile().expect("second reconcile");
 
-        // No spawn_owned ever (spawn_detached goes into calls, not spawned).
+        // No spawn_owned ever — sinks were already present.
         assert!(
             engine.runner.spawned.is_empty(),
             "no spawn_owned on idempotent reconcile"
