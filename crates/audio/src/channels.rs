@@ -101,6 +101,28 @@ impl<R: CommandRunner> ChannelManager<R> {
         Ok(handles)
     }
 
+    /// Change a channel's output device and ENFORCE it: update the stored
+    /// definition, then rebuild that channel's sink so its playback target is
+    /// actually rewired (fixes the old dead selector). `output_device = None`
+    /// returns the channel to following the default sink.
+    pub fn set_output(
+        &mut self,
+        channel_id: &str,
+        output_device: Option<String>,
+        eq: &EqModel,
+    ) -> Result<ConfHandle, AudioError> {
+        let ch = self
+            .config
+            .channels
+            .iter_mut()
+            .find(|c| c.id == channel_id)
+            .ok_or_else(|| AudioError::Invalid(format!("unknown channel: {channel_id}")))?;
+        ch.output_device = output_device;
+        let spec = ch.sink_spec();
+        let mut be = AudioBackend::new(&mut self.runner, spec);
+        be.recreate(eq)
+    }
+
     /// Remove every channel sink idempotently. Reuses `AudioBackend::remove`.
     pub fn down(&mut self) -> Result<(), AudioError> {
         for ch in &self.config.channels {
@@ -179,6 +201,44 @@ id 12\n    node.name = \"Arctis_Media\"\n";
             .calls
             .iter()
             .all(|c| c == &vec!["pw-cli", "ls", "Node"]));
+    }
+
+    #[test]
+    fn set_output_updates_def_and_rebuilds_channel() {
+        // remove() path (sink present) then create() path (absent), as in recreate.
+        let present_media = "id 12\n    node.name = \"Arctis_Media\"\n";
+        let runner = MockRunner::new()
+            .with_output(0, present_media, "") // remove: sink_exists (present)
+            .with_output(0, present_media, "") // remove: find_node_id
+            .with_output(0, "", "") // remove: destroy
+            .with_output(0, "", "") // remove: pkill
+            .with_output(0, "id 1\n    node.name = \"x\"\n", ""); // create: absent
+        let mut mgr = ChannelManager::new(runner, cfg());
+        mgr.set_output(
+            "media",
+            Some("alsa_output.speakers".into()),
+            &EqModel::default_10band(),
+        )
+        .unwrap();
+        // The stored def now carries the new device (enforced, not just stored).
+        assert_eq!(
+            mgr.find("media").unwrap().output_device.as_deref(),
+            Some("alsa_output.speakers")
+        );
+        // A fresh instance was spawned with the Media conf.
+        let last = mgr.runner().calls.last().unwrap();
+        assert_eq!(last[0], "pipewire");
+        assert!(last[2].ends_with("Arctis_Media.conf"));
+    }
+
+    #[test]
+    fn set_output_unknown_channel_errors() {
+        let runner = MockRunner::new();
+        let mut mgr = ChannelManager::new(runner, cfg());
+        let err = mgr
+            .set_output("nope", None, &EqModel::default_10band())
+            .unwrap_err();
+        assert!(matches!(err, AudioError::Invalid(_)));
     }
 
     #[test]
