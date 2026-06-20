@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/device", "crates/audio", "crates/cli", "crates/client", "crates/config", "crates/engine"]
+members = ["crates/domain", "crates/device", "crates/audio", "crates/cli", "crates/client", "crates/config", "crates/engine", "src-tauri"]
 
 [workspace.package]
 edition = "2021"
