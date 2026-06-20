@@ -480,7 +480,7 @@ impl<R: CommandRunner> Drop for Engine<R> {
 mod tests {
     use super::*;
     use arctis_audio::MockRunner;
-    use arctis_config::{ChannelConfig, Config, Profile, RouteConfig};
+    use arctis_config::{ChannelConfig, Config, MicChainConfig, Profile, RouteConfig};
 
     /// Global mutex to serialize tests that mutate process-wide env vars (HOME, ASM_CONFIG_HOME).
     /// Tests setting those variables MUST hold this lock for their entire lifetime.
@@ -521,6 +521,7 @@ mod tests {
                     },
                 ],
                 routes: vec![],
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -559,6 +560,7 @@ mod tests {
                     app_binary: "firefox".into(),
                     target_sink: "Arctis_Media".into(),
                 }],
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -945,6 +947,7 @@ mod tests {
                     app_binary: "firefox".into(),
                     target_sink: "Arctis_Media".into(),
                 }],
+                mic: MicChainConfig::default(),
             }],
         };
         let mut engine = Engine::new(runner, simple_cfg);
@@ -1202,6 +1205,7 @@ mod tests {
                 },
             ],
             routes: vec![],
+            mic: MicChainConfig::default(),
         });
 
         // Use a temp ASM_CONFIG_HOME so we don't touch real config.
@@ -1384,6 +1388,7 @@ mod tests {
                     },
                 ],
                 routes: vec![],
+                mic: MicChainConfig::default(),
             }],
         }
     }

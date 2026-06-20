@@ -60,7 +60,7 @@ pub fn route_rules_from_profile(p: &arctis_config::Profile) -> Vec<RouteRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arctis_config::{ChannelConfig, EqBandConfig, Profile, RouteConfig};
+    use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, Profile, RouteConfig};
 
     fn profile_default() -> Profile {
         Profile {
@@ -82,6 +82,7 @@ mod tests {
                 },
             ],
             routes: vec![],
+            mic: MicChainConfig::default(),
         }
     }
 

@@ -250,7 +250,7 @@ pub fn run_daemon() -> Result<(), EngineError> {
 mod tests {
     use super::*;
     use arctis_audio::MockRunner;
-    use arctis_config::{ChannelConfig, Profile};
+    use arctis_config::{ChannelConfig, MicChainConfig, Profile};
 
     /// Shared mutex to serialize all tests that mutate the process-global
     /// `ASM_CONFIG_HOME` env var. Without this, parallel test threads clobber
@@ -289,11 +289,13 @@ mod tests {
                     name: "default".into(),
                     channels: channels.clone(),
                     routes: vec![],
+                    mic: MicChainConfig::default(),
                 },
                 Profile {
                     name: "gaming".into(),
                     channels,
                     routes: vec![],
+                    mic: MicChainConfig::default(),
                 },
             ],
         }
