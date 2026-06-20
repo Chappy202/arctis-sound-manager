@@ -2,6 +2,7 @@
 //! live parametric-EQ control. Pure generators are unit-tested with no daemon;
 //! the daemon-touching path runs only under owner hardware tests (G8).
 pub mod backend;
+pub mod channels;
 pub mod config;
 pub mod eq;
 pub mod error;
@@ -9,6 +10,7 @@ pub mod props;
 pub mod runner;
 
 pub use backend::{AudioBackend, ConfHandle};
+pub use channels::{ChannelDef, ChannelManager, ChannelSetConfig};
 pub use config::{band_node_name, render_filter_chain_conf, SinkSpec};
 pub use eq::{
     BandKind, EqBand, EqModel, FREQ_MAX_HZ, FREQ_MIN_HZ, GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS,
