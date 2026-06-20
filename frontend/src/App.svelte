@@ -2,6 +2,7 @@
   import AppShell from './lib/components/AppShell.svelte';
   import MixerPage from './lib/components/MixerPage.svelte';
   import EqPage from './lib/components/EqPage.svelte';
+  import DevicePage from './lib/components/DevicePage.svelte';
   import { currentPage } from './lib/stores/page.js';
 </script>
 
@@ -11,11 +12,7 @@
   {:else if $currentPage === 'eq'}
     <EqPage />
   {:else if $currentPage === 'device'}
-    <div class="placeholder-page">
-      <h1 class="page-title">DEVICE</h1>
-      <p class="page-desc">Battery · ANC · Sidetone · Mic · Power · Firmware</p>
-      <p class="page-hint">Device page — coming in Task 7</p>
-    </div>
+    <DevicePage />
   {:else if $currentPage === 'spatial'}
     <div class="placeholder-page">
       <h1 class="page-title">SPATIAL</h1>
