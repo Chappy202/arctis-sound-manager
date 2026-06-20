@@ -119,7 +119,17 @@ pub fn encode_command(
         .ok_or_else(|| DeviceError::Unsupported(name.to_string()))?;
 
     let wire_value: u8 = match &spec.encoding {
-        ValueEncoding::IntRange { min, max } => value.clamp(i64::from(*min), i64::from(*max)) as u8,
+        ValueEncoding::IntRange { min, max } => {
+            let min = i64::from(*min);
+            let max = i64::from(*max);
+            if value < min || value > max {
+                return Err(DeviceError::InvalidValue {
+                    cmd: name.to_string(),
+                    detail: format!("{value} out of range [{min}, {max}]"),
+                });
+            }
+            value as u8
+        }
         ValueEncoding::Enum { entries } => {
             let v = u8::try_from(value).map_err(|_| DeviceError::InvalidValue {
                 cmd: name.to_string(),
@@ -169,13 +179,14 @@ pub fn write_command<T: Transport>(
     name: &str,
     value: i64,
 ) -> Result<(), DeviceError> {
+    // encode_command already validates the command name; the unwrap below can never fail.
     let report = encode_command(desc, name, value)?;
     transport.write_report(&report)?;
 
     let spec = desc
         .commands
         .get(name)
-        .ok_or_else(|| DeviceError::Unsupported(name.to_string()))?;
+        .expect("already validated by encode_command");
     if spec.save {
         if let Some(save_report) = encode_save(desc) {
             transport.write_report(&save_report)?;
@@ -451,11 +462,46 @@ mod tests {
     }
 
     #[test]
-    fn encode_command_int_range_clamps() {
+    fn encode_command_int_range_rejects_out_of_range() {
         let d = nova();
-        // sidetone max is 3; request 9 -> clamps to 3
-        let report = encode_command(&d, "sidetone", 9).expect("encode");
-        assert_eq!(report[2], 3, "value clamps to max");
+        // mic_volume range 1..10; request 11 (above max) -> error, no bytes sent
+        let err = encode_command(&d, "mic_volume", 11).unwrap_err();
+        assert!(
+            matches!(err, DeviceError::InvalidValue { .. }),
+            "above-max must return InvalidValue, got {err:?}"
+        );
+
+        // mic_volume range 1..10; request 0 (below min) -> error
+        let err = encode_command(&d, "mic_volume", 0).unwrap_err();
+        assert!(
+            matches!(err, DeviceError::InvalidValue { .. }),
+            "below-min must return InvalidValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_command_out_of_range_writes_no_bytes() {
+        let d = nova();
+        let mut t = MockTransport::new();
+        // mic_volume range 1..10; request 11 -> must error and write nothing
+        let err = write_command(&mut t, &d, "mic_volume", 11).unwrap_err();
+        assert!(matches!(err, DeviceError::InvalidValue { .. }));
+        assert!(
+            t.written.is_empty(),
+            "no bytes must be written for out-of-range value"
+        );
+    }
+
+    #[test]
+    fn encode_command_int_range_in_range_succeeds() {
+        let d = nova();
+        // sidetone max is 3; value 3 (at boundary) -> succeeds
+        let report = encode_command(&d, "sidetone", 3).expect("encode");
+        assert_eq!(report[2], 3, "max boundary value must be encoded as-is");
+
+        // sidetone min is 0; value 0 -> succeeds
+        let report = encode_command(&d, "sidetone", 0).expect("encode");
+        assert_eq!(report[2], 0, "min boundary value must be encoded as-is");
     }
 
     #[test]
