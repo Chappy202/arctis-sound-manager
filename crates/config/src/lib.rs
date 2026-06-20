@@ -1,5 +1,6 @@
 pub mod error;
 pub mod migrate;
+pub mod profile_ops;
 pub mod schema;
 pub mod store;
 
