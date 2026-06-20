@@ -19,5 +19,8 @@ pub use eq::{
 };
 pub use error::AudioError;
 pub use props::{band_props_json, set_band_props_argv};
-pub use routing::{node_rules_fragment, wireplumber_fragment_path, RouteRule};
+pub use routing::{
+    clear_stream_target_argv, move_stream_argv, node_rules_fragment, parse_stream_id,
+    wireplumber_fragment_path, AppMatch, RouteRule,
+};
 pub use runner::{CmdOutput, CommandRunner, MockRunner, RealRunner};

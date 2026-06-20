@@ -1,0 +1,26 @@
+[
+  {
+    "id": 73,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "application.name": "Firefox",
+        "application.process.binary": "firefox",
+        "media.class": "Stream/Output/Audio",
+        "node.name": "Firefox"
+      }
+    }
+  },
+  {
+    "id": 88,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "application.name": "Discord",
+        "application.process.binary": "Discord",
+        "media.class": "Stream/Output/Audio",
+        "node.name": "WEBRTC VoiceEngine"
+      }
+    }
+  }
+]
