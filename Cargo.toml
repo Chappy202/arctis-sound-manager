@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain"]
+members = ["crates/domain", "crates/device"]
 
 [workspace.package]
 edition = "2021"
@@ -14,3 +14,4 @@ thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 hidapi = { version = "2", default-features = false, features = ["linux-native"] }
 arctis-domain = { path = "crates/domain" }
+arctis-device = { path = "crates/device" }
