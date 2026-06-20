@@ -73,6 +73,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arctis-config"
+version = "0.1.0"
+dependencies = [
+ "arctis-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "arctis-device"
 version = "0.1.0"
 dependencies = [
