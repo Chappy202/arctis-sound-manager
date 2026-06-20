@@ -4,7 +4,7 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(() => ({
   plugins: [svelte()],
 
   // Tauri expects a fixed port, fail if that port is not available
@@ -32,7 +32,7 @@ export default defineConfig(async () => ({
       process.env.TAURI_ENV_PLATFORM == "windows" ? "chrome105" : "safari13",
     // don't minify for debug builds
     // Note: Vite 8 uses oxc/rolldown; esbuild is deprecated. Use "oxc" (default) or false.
-    minify: !process.env.TAURI_ENV_DEBUG ? "oxc" : false,
+    minify: (process.env.TAURI_ENV_DEBUG ? false : "oxc") as "oxc" | false,
     // produce sourcemaps for debug builds
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },

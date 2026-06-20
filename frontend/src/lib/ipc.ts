@@ -1,0 +1,119 @@
+/**
+ * ipc.ts — Typed wrappers around Tauri invoke/listen for Arctis Sound Manager.
+ *
+ * NOTE: Tauri v2 converts Rust snake_case *command parameter names* to camelCase
+ * when routing from JS → Rust. Struct fields serialised in the *response* keep
+ * their serde names (snake_case). See the command definitions in
+ * src-tauri/src/commands.rs for the canonical parameter names.
+ */
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+// ---------------------------------------------------------------------------
+// Types — mirror crates/engine/src/state.rs exactly (serde names = snake_case)
+// ---------------------------------------------------------------------------
+
+export interface EqBandSnapshot {
+  kind: string;
+  freq_hz: number;
+  q: number;
+  gain_db: number;
+}
+
+export interface ChannelSnapshot {
+  id: string;
+  node_name: string;
+  output_device: string | null;
+  /** Full per-band EQ state; empty = flat / no overrides. */
+  eq_bands: EqBandSnapshot[];
+}
+
+export interface EngineState {
+  active_profile: string;
+  profiles: string[];
+  channels: ChannelSnapshot[];
+  /** [app_binary, target_sink] pairs */
+  routes: [string, string][];
+  device_present: boolean;
+  device_fields: Record<string, string>;
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers — build invoke arg objects (testable without Tauri runtime)
+// ---------------------------------------------------------------------------
+
+/** Builds the camelCase arg object for the set_eq_band command. */
+export function buildSetEqBandArgs(
+  channel: string,
+  band: number,
+  kind: string,
+  freq_hz: number,
+  q: number,
+  gain_db: number,
+): { channel: string; band: number; kind: string; freqHz: number; q: number; gainDb: number } {
+  return { channel, band, kind, freqHz: freq_hz, q, gainDb: gain_db };
+}
+
+/** Builds the camelCase arg object for the set_route command. */
+export function buildSetRouteArgs(
+  app_binary: string,
+  target_sink: string,
+): { appBinary: string; targetSink: string } {
+  return { appBinary: app_binary, targetSink: target_sink };
+}
+
+/** Builds the camelCase arg object for set_channel_output. */
+export function buildSetChannelOutputArgs(
+  channel: string,
+  device: string | null,
+): { channel: string; device: string | null } {
+  return { channel, device };
+}
+
+// ---------------------------------------------------------------------------
+// IPC commands
+// ---------------------------------------------------------------------------
+
+/** Fetch the current full EngineState from the daemon. */
+export const getState = (): Promise<EngineState> => invoke<EngineState>("get_state");
+
+/** Switch the active profile and return the updated EngineState. */
+export const switchProfile = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("switch_profile", { name });
+
+/** Create a new profile with the given name; returns updated EngineState. */
+export const profileNew = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_new", { name });
+
+/**
+ * Set (or clear) the output device for a channel.
+ * Returns void — the daemon will emit a state-changed event with the new state.
+ */
+export const setChannelOutput = (channel: string, device: string | null): Promise<void> =>
+  invoke<void>("set_channel_output", buildSetChannelOutputArgs(channel, device));
+
+/** Update a parametric EQ band; returns updated EngineState. */
+export const setEqBand = (
+  channel: string,
+  band: number,
+  kind: string,
+  freq_hz: number,
+  q: number,
+  gain_db: number,
+): Promise<EngineState> =>
+  invoke<EngineState>("set_eq_band", buildSetEqBandArgs(channel, band, kind, freq_hz, q, gain_db));
+
+/** Route an app binary to a target sink; returns updated EngineState. */
+export const setRoute = (app_binary: string, target_sink: string): Promise<EngineState> =>
+  invoke<EngineState>("set_route", buildSetRouteArgs(app_binary, target_sink));
+
+// ---------------------------------------------------------------------------
+// Event subscriptions
+// ---------------------------------------------------------------------------
+
+/**
+ * Subscribe to live EngineState updates pushed by the daemon.
+ * Returns an unlisten function to clean up the subscription.
+ */
+export const onStateChanged = (cb: (s: EngineState) => void): Promise<UnlistenFn> =>
+  listen<EngineState>("state-changed", (e) => cb(e.payload));

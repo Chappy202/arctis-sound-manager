@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { currentPage, type Page } from '../stores/page.js';
+  import { onMount, type Snippet } from "svelte";
+  import { currentPage, type Page } from "../stores/page.js";
+  import { engineState, loadError, init, destroy } from "../stores.js";
+  import ProfilesDropdown from "./ProfilesDropdown.svelte";
+
+  interface Props {
+    children?: Snippet;
+  }
+
+  let { children }: Props = $props();
 
   type NavItem = {
     id: Page;
@@ -19,6 +28,30 @@
   function navigate(page: Page) {
     currentPage.set(page);
   }
+
+  onMount(() => {
+    init();
+    return destroy;
+  });
+
+  // Derive connection/device state from engine state
+  const devicePresent = $derived($engineState?.device_present ?? false);
+  const connectionStatus = $derived(
+    $loadError
+      ? "disconnected"
+      : $engineState === null
+        ? "connecting"
+        : devicePresent
+          ? "connected"
+          : "disconnected"
+  );
+  const connectionLabel = $derived(
+    connectionStatus === "connected"
+      ? "Connected"
+      : connectionStatus === "connecting"
+        ? "Connecting…"
+        : "Not connected"
+  );
 </script>
 
 <div class="app-shell">
@@ -55,24 +88,26 @@
     <header class="topbar">
       <div class="topbar-left">
         <span class="device-name">Arctis Nova Pro Wireless</span>
-        <span class="connection-dot connected" aria-label="Connected" title="Connected"></span>
+        <span
+          class="connection-dot {connectionStatus}"
+          aria-label={connectionLabel}
+          title={connectionLabel}
+        ></span>
+        <span class="connection-label" aria-hidden="true">{connectionLabel}</span>
       </div>
       <div class="topbar-right">
         <div class="battery-indicator" aria-label="Battery: —" title="Battery status">
           <span class="battery-icon" aria-hidden="true">▮</span>
           <span class="battery-value">—</span>
         </div>
-        <div class="profiles-dropdown" role="button" aria-label="Active profile: Default" aria-haspopup="listbox" tabindex="0">
-          <span class="profile-name">Default</span>
-          <span class="profile-caret" aria-hidden="true">▾</span>
-        </div>
+        <ProfilesDropdown />
       </div>
     </header>
 
     <!-- Content area -->
     <main class="content-area" id="main-content">
       <div class="content-inner">
-        <slot />
+        {@render children?.()}
       </div>
     </main>
   </div>
@@ -224,18 +259,18 @@
     height: 8px;
     border-radius: var(--ss-radius-pill);
     background: var(--ss-text-disabled);
+    flex-shrink: 0;
   }
 
   .connection-dot.connected {
     background: var(--ss-success);
   }
 
-  /* .disconnected and .connecting states added in Task 4 (device wiring) */
-  :global(.connection-dot.disconnected) {
+  .connection-dot.disconnected {
     background: var(--ss-danger);
   }
 
-  :global(.connection-dot.connecting) {
+  .connection-dot.connecting {
     background: var(--ss-warning);
     animation: pulse 1.5s ease-in-out infinite;
   }
@@ -243,6 +278,12 @@
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
+  }
+
+  .connection-label {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-tertiary);
   }
 
   .topbar-right {
@@ -268,39 +309,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .profiles-dropdown {
-    display: flex;
-    align-items: center;
-    gap: var(--ss-space-2);
-    height: var(--ss-field-h);
-    padding: 0 var(--ss-space-3);
-    background: var(--ss-surface-input);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    cursor: pointer;
-    transition:
-      background var(--ss-dur-fast) var(--ss-ease-standard),
-      border-color var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .profiles-dropdown:hover {
-    background: var(--ss-surface-2);
-    border-color: var(--ss-border-strong);
-  }
-
-  .profile-name {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-label-size);
-    font-weight: var(--ss-type-label-weight);
-    color: var(--ss-text-primary);
-    white-space: nowrap;
-  }
-
-  .profile-caret {
-    color: var(--ss-text-tertiary);
-    font-size: 12px;
-  }
-
   /* ===== Content area ===== */
   .content-area {
     flex: 1;
@@ -313,5 +321,11 @@
     margin: 0 auto;
     padding: var(--ss-page-padding);
     height: 100%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .connection-dot.connecting {
+      animation: none;
+    }
   }
 </style>

@@ -1,15 +1,12 @@
 <script lang="ts">
   import AppShell from './lib/components/AppShell.svelte';
+  import MixerPage from './lib/components/MixerPage.svelte';
   import { currentPage } from './lib/stores/page.js';
 </script>
 
 <AppShell>
   {#if $currentPage === 'mixer'}
-    <div class="placeholder-page">
-      <h1 class="page-title">MIXER</h1>
-      <p class="page-desc">Channel strips: Game · Chat · Media · Aux · Mic · Master</p>
-      <p class="page-hint">Mixer page — coming in Task 5</p>
-    </div>
+    <MixerPage />
   {:else if $currentPage === 'eq'}
     <div class="placeholder-page">
       <h1 class="page-title">EQ</h1>
