@@ -2,6 +2,7 @@
   import { onMount, type Snippet } from "svelte";
   import { currentPage, type Page } from "../stores/page.js";
   import { engineState, loadError, init, destroy } from "../stores.js";
+  import { deriveConnectionStatus, connectionLabel as getConnectionLabel } from "../connection.js";
   import ProfilesDropdown from "./ProfilesDropdown.svelte";
 
   interface Props {
@@ -34,24 +35,12 @@
     return destroy;
   });
 
-  // Derive connection/device state from engine state
-  const devicePresent = $derived($engineState?.device_present ?? false);
-  const connectionStatus = $derived(
-    $loadError
-      ? "disconnected"
-      : $engineState === null
-        ? "connecting"
-        : devicePresent
-          ? "connected"
-          : "disconnected"
-  );
-  const connectionLabel = $derived(
-    connectionStatus === "connected"
-      ? "Connected"
-      : connectionStatus === "connecting"
-        ? "Connecting…"
-        : "Not connected"
-  );
+  // Derive connection status from daemon reachability, NOT device presence.
+  // - loadError set → daemon unreachable → disconnected (red)
+  // - engineState === null and no error → waiting for first response → connecting (yellow)
+  // - engineState !== null → daemon replied → connected (green)
+  const connectionStatus = $derived(deriveConnectionStatus($loadError, $engineState));
+  const connectionLabel = $derived(getConnectionLabel(connectionStatus));
 </script>
 
 <div class="app-shell">
