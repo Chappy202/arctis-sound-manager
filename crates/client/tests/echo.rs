@@ -63,8 +63,12 @@ fn mic_status_request_carries_mic_snapshot() {
         !state.active_profile.is_empty(),
         "active_profile must be non-empty"
     );
-    // mic is always present in EngineState
-    let _mic = &state.mic; // confirming mic is accessible
+    // mic is always present in EngineState — assert the values match the fixture
+    let mic = state.mic;
+    assert!(
+        !mic.enabled,
+        "mic.enabled must match the response fixture (false)"
+    );
 
     server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

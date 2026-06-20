@@ -318,6 +318,18 @@ fn device_set_via_daemon(control: &str, value: i64) -> ExitCode {
     }
 }
 
+fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
+    use arctis_engine::StageName;
+    match kind {
+        StageName::Gain => "gain",
+        StageName::Highpass => "highpass",
+        StageName::Rnnoise => "rnnoise",
+        StageName::Compressor => "compressor",
+        StageName::Gate => "gate",
+        StageName::MicEq => "eq",
+    }
+}
+
 fn dispatch_mic(action: MicAction) -> ExitCode {
     if !daemon::socket_path().exists() {
         eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
@@ -365,11 +377,14 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
                         let avail_str = if stage.available {
                             String::new()
                         } else {
-                            format!(" (unavailable: {:?} plugin not found)", stage.kind)
+                            format!(
+                                " (unavailable: {} plugin not found)",
+                                stage_canonical(&stage.kind)
+                            )
                         };
                         println!(
-                            "  {:?}: {}{}",
-                            stage.kind,
+                            "  {}: {}{}",
+                            stage_canonical(&stage.kind),
                             if stage.enabled { "enabled" } else { "disabled" },
                             avail_str
                         );
