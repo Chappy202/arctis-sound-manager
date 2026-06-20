@@ -4,6 +4,7 @@
 pub mod config;
 pub mod eq;
 pub mod error;
+pub mod props;
 pub mod runner;
 
 pub use config::{band_node_name, render_filter_chain_conf, SinkSpec};
@@ -12,4 +13,5 @@ pub use eq::{
     Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
 };
 pub use error::AudioError;
+pub use props::{band_props_json, set_band_props_argv};
 pub use runner::{CmdOutput, CommandRunner, MockRunner, RealRunner};
