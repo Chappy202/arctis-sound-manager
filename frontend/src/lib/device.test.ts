@@ -221,3 +221,68 @@ describe("batteryColor", () => {
     expect(batteryColor("14.9")).toBe("--ss-danger");
   });
 });
+
+// ---------------------------------------------------------------------------
+// mapDeviceFields — live device fields (Task 8 extension)
+// ---------------------------------------------------------------------------
+
+describe("mapDeviceFields — live device fields", () => {
+  it("maps anc_mode field with correct label and default kind", () => {
+    const rows = mapDeviceFields({ anc_mode: "1" });
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row.key).toBe("anc_mode");
+    expect(row.label).toBe("ANC Mode");
+    expect(row.value).toBe("1");
+    expect(row.kind).toBe("default");
+  });
+
+  it("maps mic_led field with title-cased label", () => {
+    const rows = mapDeviceFields({ mic_led: "5" });
+    expect(rows[0].label).toBe("Mic Led");
+    expect(rows[0].value).toBe("5");
+    expect(rows[0].kind).toBe("default");
+  });
+
+  it("maps inactive_time field with title-cased label", () => {
+    const rows = mapDeviceFields({ inactive_time: "3" });
+    expect(rows[0].label).toBe("Inactive Time");
+    expect(rows[0].value).toBe("3");
+  });
+
+  it("maps transparency_level with title-cased label", () => {
+    const rows = mapDeviceFields({ transparency_level: "7" });
+    expect(rows[0].label).toBe("Transparency Level");
+    expect(rows[0].value).toBe("7");
+  });
+
+  it("maps mic_volume with title-cased label", () => {
+    const rows = mapDeviceFields({ mic_volume: "8" });
+    expect(rows[0].label).toBe("Mic Volume");
+    expect(rows[0].value).toBe("8");
+  });
+
+  it("handles a full live device snapshot", () => {
+    const snapshot = {
+      battery: "72",
+      anc_mode: "1",
+      sidetone: "2",
+      mic_muted: "false",
+      mic_led: "5",
+      inactive_time: "3",
+      firmware: "1.2.0",
+    };
+    const rows = mapDeviceFields(snapshot);
+    expect(rows).toHaveLength(7);
+
+    const ancRow = rows.find((r) => r.key === "anc_mode")!;
+    expect(ancRow.label).toBe("ANC Mode");
+    expect(ancRow.kind).toBe("default");
+
+    const micLedRow = rows.find((r) => r.key === "mic_led")!;
+    expect(micLedRow.value).toBe("5");
+
+    const inactiveRow = rows.find((r) => r.key === "inactive_time")!;
+    expect(inactiveRow.value).toBe("3");
+  });
+});
