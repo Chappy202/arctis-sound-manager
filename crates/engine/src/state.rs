@@ -1,6 +1,20 @@
 use arctis_audio::StageKind;
 use serde::{Deserialize, Serialize};
 
+/// Tunable mic DSP parameters. Used by `Engine::mic_set_param`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MicParam {
+    GainDb,
+    HighpassFreq,
+    VadThreshold,
+    VadGraceMs,
+    VadRetroGraceMs,
+    GateThreshold,
+    CompThresholdDb,
+    CompRatio,
+    CompMakeupDb,
+}
+
 /// Shared device state mutated by the DeviceWorker and read by engine::state().
 #[derive(Default, Clone)]
 pub struct DeviceShared {
@@ -144,10 +158,13 @@ pub enum Event {
         enabled: bool,
     },
     MicParamSet {
-        param: String,
+        param: MicParam,
         value: f32,
     },
     MicEqBandSet {
         band: usize,
+    },
+    MicHwMicSet {
+        hw_mic: Option<String>,
     },
 }

@@ -13,19 +13,7 @@ use arctis_domain::{
 };
 use std::sync::Arc;
 
-/// Tunable mic DSP parameters. Used by `Engine::mic_set_param`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MicParam {
-    GainDb,
-    HighpassFreq,
-    VadThreshold,
-    VadGraceMs,
-    VadRetroGraceMs,
-    GateThreshold,
-    CompThresholdDb,
-    CompRatio,
-    CompMakeupDb,
-}
+pub use crate::state::MicParam;
 
 /// A reconcile-step descriptor used for pure planning + test assertions before any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -832,10 +820,7 @@ impl<R: CommandRunner> Engine<R> {
             }
         }
 
-        self.emit(Event::MicParamSet {
-            param: format!("{param:?}"),
-            value,
-        });
+        self.emit(Event::MicParamSet { param, value });
         Ok(())
     }
 
@@ -896,7 +881,7 @@ impl<R: CommandRunner> Engine<R> {
         self.save_config()?;
 
         // Recreate
-        {
+        let hw_mic_snapshot = {
             let profile = self.config.active()?.clone();
             let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
             self.mic_availability = availability;
@@ -906,7 +891,11 @@ impl<R: CommandRunner> Engine<R> {
             if let Some(token) = handle.child {
                 self.children.track(token);
             }
-        }
+            profile.mic.hw_mic.clone()
+        };
+        self.emit(Event::MicHwMicSet {
+            hw_mic: hw_mic_snapshot,
+        });
         Ok(())
     }
 }
@@ -2370,11 +2359,8 @@ mod tests {
                 .unwrap_or(false)),
             "expected a spawn of arctis_clean_mic.conf, got: {spawned:?}"
         );
-        // children tracks the mic token
-        assert!(
-            !engine.children.is_empty(),
-            "at least 1 child token (the mic source)"
-        );
+        // children tracks exactly the mic token (channels were already present → no channel tokens)
+        assert_eq!(engine.children.len(), 1, "only the mic source token");
 
         let _ = &ls_mic_absent;
     }

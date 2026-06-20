@@ -257,13 +257,11 @@ pub fn mic_chain_nodes(
                 ],
             });
         }
-        if !cfg.eq.is_empty() {
-            availability.push(StageAvailability {
-                stage: crate::state::StageName::MicEq,
-                available: true,
-                requested: true,
-            });
-        }
+        availability.push(StageAvailability {
+            stage: crate::state::StageName::MicEq,
+            available: true,
+            requested: true,
+        });
     }
 
     // ── Passthrough fallback: ensure nodes is never empty ────────────────────
