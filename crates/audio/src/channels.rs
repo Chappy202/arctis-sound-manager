@@ -2,6 +2,7 @@ use crate::backend::{AudioBackend, ConfHandle};
 use crate::config::SinkSpec;
 use crate::eq::EqModel;
 use crate::error::AudioError;
+use crate::runner::ChildToken;
 use crate::runner::CommandRunner;
 
 /// One submix channel: a stable logical id, its PipeWire sink node.name,
@@ -91,12 +92,22 @@ impl<R: CommandRunner> ChannelManager<R> {
     }
 
     /// Create every channel sink idempotently. Reuses `AudioBackend::create`.
-    pub fn up(&mut self, eq: &EqModel) -> Result<Vec<ConfHandle>, AudioError> {
+    ///
+    /// Returns a `(ConfHandle, Option<ChildToken>)` pair per channel. The token is
+    /// `Some` when a new `pipewire -c` instance was spawned for that channel;
+    /// `None` when the sink was already present. The caller (engine) must call
+    /// `children.track(token)` for each `Some` to ensure shutdown reaps it.
+    pub fn up(
+        &mut self,
+        eq: &EqModel,
+    ) -> Result<Vec<(ConfHandle, Option<ChildToken>)>, AudioError> {
         let mut handles = Vec::with_capacity(self.config.channels.len());
         for ch in &self.config.channels {
             let spec = ch.sink_spec();
             let mut be = AudioBackend::new(&mut self.runner, spec);
-            handles.push(be.create(eq)?);
+            let handle = be.create(eq)?;
+            let token = handle.child.clone();
+            handles.push((handle, token));
         }
         Ok(handles)
     }
@@ -161,24 +172,29 @@ mod tests {
 
     #[test]
     fn up_creates_every_channel_when_absent() {
-        // For each of 3 channels, create() runs: ls Node (absent) + spawn.
+        // For each of 3 channels, create() runs: ls Node (absent) + spawn_owned.
+        // spawn_owned goes to `spawned`, NOT `calls` — only ls checks consume queued outputs.
         let runner = MockRunner::new()
             .with_output(0, "id 1\n    node.name = \"x\"\n", "") // game ls
-            .with_output(0, "", "") // game spawn
             .with_output(0, "id 1\n    node.name = \"x\"\n", "") // chat ls
-            .with_output(0, "", "") // chat spawn
-            .with_output(0, "id 1\n    node.name = \"x\"\n", "") // media ls
-            .with_output(0, "", ""); // media spawn
+            .with_output(0, "id 1\n    node.name = \"x\"\n", ""); // media ls
         let mut mgr = ChannelManager::new(runner, cfg());
-        let handles = mgr.up(&EqModel::default_10band()).unwrap();
-        assert_eq!(handles.len(), 3);
+        let pairs = mgr.up(&EqModel::default_10band()).unwrap();
+        assert_eq!(pairs.len(), 3);
+        // Each pair has a Some token (new spawn per channel).
+        for (_, token) in &pairs {
+            assert!(token.is_some(), "each channel spawn must yield a token");
+        }
+        // `calls` only has the 3 ls-Node existence checks.
         let calls = &mgr.runner().calls;
-        // 3 channels × (1 ls + 1 spawn) = 6 calls.
-        assert_eq!(calls.len(), 6);
+        assert_eq!(calls.len(), 3, "only ls-Node calls go through run");
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
-        assert_eq!(calls[1][0], "pipewire");
-        assert!(calls[1][2].ends_with("Arctis_Game.conf"));
-        assert!(calls[5][2].ends_with("Arctis_Media.conf"));
+        // `spawned` has the 3 pipewire -c invocations.
+        let spawned = &mgr.runner().spawned;
+        assert_eq!(spawned.len(), 3);
+        assert_eq!(spawned[0][0], "pipewire");
+        assert!(spawned[0][2].ends_with("Arctis_Game.conf"));
+        assert!(spawned[2][2].ends_with("Arctis_Media.conf"));
     }
 
     #[test]
@@ -193,7 +209,7 @@ id 12\n    node.name = \"Arctis_Media\"\n";
             .with_output(0, present, "")
             .with_output(0, present, "");
         let mut mgr = ChannelManager::new(runner, cfg());
-        mgr.up(&EqModel::default_10band()).unwrap();
+        let pairs = mgr.up(&EqModel::default_10band()).unwrap();
         // 3 ls checks only; no spawns.
         assert_eq!(mgr.runner().calls.len(), 3);
         assert!(mgr
@@ -201,6 +217,15 @@ id 12\n    node.name = \"Arctis_Media\"\n";
             .calls
             .iter()
             .all(|c| c == &vec!["pw-cli", "ls", "Node"]));
+        // All tokens are None — sinks were already present.
+        assert!(
+            pairs.iter().all(|(_, t)| t.is_none()),
+            "no child tokens when sinks present"
+        );
+        assert!(
+            mgr.runner().spawned.is_empty(),
+            "no spawn_owned when all present"
+        );
     }
 
     #[test]
@@ -225,10 +250,11 @@ id 12\n    node.name = \"Arctis_Media\"\n";
             mgr.find("media").unwrap().output_device.as_deref(),
             Some("alsa_output.speakers")
         );
-        // A fresh instance was spawned with the Media conf.
-        let last = mgr.runner().calls.last().unwrap();
-        assert_eq!(last[0], "pipewire");
-        assert!(last[2].ends_with("Arctis_Media.conf"));
+        // A fresh instance was spawned with the Media conf via spawn_owned → in `spawned`.
+        let spawned = &mgr.runner().spawned;
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0][0], "pipewire");
+        assert!(spawned[0][2].ends_with("Arctis_Media.conf"));
     }
 
     #[test]

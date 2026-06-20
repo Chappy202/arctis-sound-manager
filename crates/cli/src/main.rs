@@ -1,9 +1,14 @@
+mod coexist;
+mod daemon;
+
 use arctis_audio::{
     AppMatch, AudioBackend, BandKind, ChannelManager, ChannelSetConfig, EqBand, EqModel,
     RealRunner, RouteRule, Router, SinkSpec,
 };
+use arctis_config::store as config_store;
 use arctis_device::{discover, read_status, HidrawTransport, Registry};
 use arctis_domain::StatusValue;
+use arctis_engine::Engine;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
@@ -44,6 +49,18 @@ enum Command {
     Channel {
         #[command(subcommand)]
         action: ChannelCmd,
+    },
+    /// Profile management.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+    /// Reconcile the live graph to the active profile in config.
+    Apply,
+    /// Run the resident daemon (default: foreground).
+    Daemon {
+        #[arg(long, default_value_t = true)]
+        foreground: bool,
     },
 }
 
@@ -124,6 +141,20 @@ enum ChannelOutputAction {
         /// Hardware sink node.name, or `default` to follow the default sink.
         device: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileAction {
+    /// List available profiles.
+    List,
+    /// Show a profile's details (defaults to the active profile).
+    Show { name: Option<String> },
+    /// Switch the active profile.
+    Switch { name: String },
+    /// Persist the current in-memory config to disk (normalization pass).
+    Save,
+    /// Create a new profile as a copy of the active one.
+    New { name: String },
 }
 
 const SINK_NAME: &str = "arctis_eq";
@@ -413,6 +444,192 @@ fn main() -> ExitCode {
                 }
             },
         },
+        Command::Profile { action } => dispatch_profile(action),
+        Command::Apply => dispatch_apply(),
+        Command::Daemon { foreground: _ } => {
+            // Coexist check: scan for legacy nodes using pw-cli ls Node output.
+            let node_stdout = std::process::Command::new("pw-cli")
+                .args(["ls", "Node"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+            let report = coexist::detect_from(&node_stdout, &home);
+            if let Some(w) = coexist::warning(&report) {
+                eprintln!("{w}");
+            }
+            match daemon::run_daemon() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("daemon error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_profile(action: ProfileAction) -> ExitCode {
+    match action {
+        ProfileAction::List => {
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            for name in cfg.profile_names() {
+                let marker = if name == cfg.active_profile { " *" } else { "" };
+                println!("{name}{marker}");
+            }
+            ExitCode::SUCCESS
+        }
+        ProfileAction::Show { name } => {
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let target = name.as_deref().unwrap_or(&cfg.active_profile);
+            match cfg.profiles.iter().find(|p| p.name == target) {
+                Some(p) => {
+                    println!("profile: {}", p.name);
+                    println!("  channels: {}", p.channels.len());
+                    println!("  routes: {}", p.routes.len());
+                    ExitCode::SUCCESS
+                }
+                None => {
+                    eprintln!("error: profile '{target}' not found");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Switch { name } => {
+            // Try daemon first.
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::SwitchProfile { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("switched to profile '{name}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {
+                        // Fall through to direct engine path.
+                    }
+                }
+            }
+            // Direct engine path.
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.switch_profile(&name) {
+                Ok(()) => {
+                    println!("switched to profile '{name}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Save => {
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("config saved");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::New { name } => {
+            let mut cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match cfg.new_profile_from_active(&name) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("error creating profile: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("profile '{name}' created");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_apply() -> ExitCode {
+    // Try daemon first via Reload.
+    if daemon::socket_path().exists() {
+        match daemon::send_request(&daemon::Request::Reload) {
+            Ok(resp) if resp.ok => {
+                println!("applied active profile");
+                return ExitCode::SUCCESS;
+            }
+            Ok(resp) => {
+                eprintln!("error: {}", resp.error.unwrap_or_default());
+                return ExitCode::FAILURE;
+            }
+            Err(_) => {
+                // Fall through to direct engine path.
+            }
+        }
+    }
+    // Direct engine path.
+    let cfg = match config_store::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut engine = Engine::new(RealRunner, cfg);
+    match engine.reconcile() {
+        Ok(()) => {
+            println!("applied active profile");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

@@ -1,12 +1,14 @@
 [package]
-name = "arctis-audio"
+name = "arctis-config"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
+edition = "2021"
 
 [dependencies]
 arctis-domain = { workspace = true }
-thiserror = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 serde_json = { workspace = true }
-libc = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

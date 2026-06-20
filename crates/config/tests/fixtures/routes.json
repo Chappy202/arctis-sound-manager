@@ -1,0 +1,4 @@
+[
+  { "app_binary": "firefox", "target_sink": "Arctis_Media" },
+  { "app_binary": "discord", "target_sink": "Arctis_Chat" }
+]

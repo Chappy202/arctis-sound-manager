@@ -1,0 +1,11 @@
+active_profile = "default"
+
+[[channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
