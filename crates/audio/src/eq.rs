@@ -154,4 +154,94 @@ mod tests {
         };
         assert!(m.validate().is_err());
     }
+
+    // --- boundary: exact valid edges must pass ---
+
+    #[test]
+    fn gain_max_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 1000.0, 1.0, 12.0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn gain_min_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 1000.0, 1.0, -12.0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn q_min_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 1000.0, 0.3, 0.0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn q_max_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 1000.0, 10.0, 0.0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn freq_min_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 20.0, 1.0, 0.0)
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn freq_max_edge_passes() {
+        assert!(EqBand::new(BandKind::Peaking, 20_000.0, 1.0, 0.0)
+            .validate()
+            .is_ok());
+    }
+
+    // --- boundary: just-past edges must fail ---
+
+    #[test]
+    fn gain_just_above_max_fails() {
+        let b = EqBand::new(BandKind::Peaking, 1000.0, 1.0, 12.1);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    #[test]
+    fn gain_just_below_min_fails() {
+        let b = EqBand::new(BandKind::Peaking, 1000.0, 1.0, -12.1);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    #[test]
+    fn q_just_below_min_fails() {
+        let b = EqBand::new(BandKind::Peaking, 1000.0, 0.29, 0.0);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    #[test]
+    fn q_just_above_max_fails() {
+        let b = EqBand::new(BandKind::Peaking, 1000.0, 10.1, 0.0);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    #[test]
+    fn freq_just_below_min_fails() {
+        let b = EqBand::new(BandKind::Peaking, 19.9, 1.0, 0.0);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    #[test]
+    fn freq_just_above_max_fails() {
+        let b = EqBand::new(BandKind::Peaking, 20_000.1, 1.0, 0.0);
+        assert!(matches!(b.validate(), Err(AudioError::Invalid(_))));
+    }
+
+    // --- EqModel with no bands must fail ---
+
+    #[test]
+    fn empty_bands_rejected() {
+        let m = EqModel { bands: vec![] };
+        assert!(matches!(m.validate(), Err(AudioError::Invalid(_))));
+    }
 }
