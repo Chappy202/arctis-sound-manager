@@ -67,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         action: DeviceAction,
     },
+    /// Microphone DSP chain (Clean Mic virtual source).
+    Mic {
+        #[command(subcommand)]
+        action: MicAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -201,6 +206,53 @@ enum DeviceAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum MicAction {
+    /// Print the mic DSP chain status (enabled flag, per-stage, params, EQ bands).
+    Status,
+    /// Enable a mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
+    Enable {
+        /// Stage name: gain|highpass|rnnoise|compressor|gate|eq
+        stage: String,
+    },
+    /// Disable a mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
+    Disable {
+        /// Stage name: gain|highpass|rnnoise|compressor|gate|eq
+        stage: String,
+    },
+    /// Set a mic DSP parameter live (no restart).
+    Set {
+        /// Param name: gain_db|highpass_freq|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db
+        param: String,
+        /// Parameter value (float; negative values accepted for dB params)
+        #[arg(allow_negative_numbers = true)]
+        value: f32,
+    },
+    /// Set one mic EQ band live (no restart).
+    Eq {
+        /// Band index (0-based)
+        #[arg(long)]
+        band: usize,
+        /// Center/corner frequency in Hz
+        #[arg(long)]
+        freq: f32,
+        /// Q factor
+        #[arg(long)]
+        q: f32,
+        /// Gain in dB (negative accepted)
+        #[arg(long, allow_negative_numbers = true)]
+        gain: f32,
+        /// Filter kind: peaking|lowshelf|highshelf
+        #[arg(long, default_value = "peaking")]
+        kind: String,
+    },
+    /// Set (or clear) the hardware mic capture source.
+    HwMic {
+        /// Hardware mic node.name to capture from; omit to clear the pin.
+        device: Option<String>,
+    },
+}
+
 const SINK_NAME: &str = "arctis_eq";
 const SINK_DESC: &str = "Arctis EQ Sink";
 
@@ -255,6 +307,92 @@ fn device_set_via_daemon(control: &str, value: i64) -> ExitCode {
         }
         Ok(resp) => {
             // Surface the daemon's gate/validation error verbatim.
+            let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error communicating with daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn dispatch_mic(action: MicAction) -> ExitCode {
+    if !daemon::socket_path().exists() {
+        eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+        eprintln!(
+            "note: mic commands require the daemon (single worker enforces PipeWire serialisation)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let is_status = matches!(action, MicAction::Status);
+    let req = match action {
+        MicAction::Status => daemon::Request::MicStatus,
+        MicAction::Enable { stage } => daemon::Request::MicStage {
+            stage,
+            enabled: true,
+        },
+        MicAction::Disable { stage } => daemon::Request::MicStage {
+            stage,
+            enabled: false,
+        },
+        MicAction::Set { param, value } => daemon::Request::MicSet { param, value },
+        MicAction::Eq {
+            band,
+            freq,
+            q,
+            gain,
+            kind,
+        } => daemon::Request::MicEqBand {
+            band,
+            kind,
+            freq_hz: freq,
+            q,
+            gain_db: gain,
+        },
+        MicAction::HwMic { device } => daemon::Request::MicHwMic { device },
+    };
+
+    match daemon::send_request(&req) {
+        Ok(resp) if resp.ok => {
+            if is_status {
+                if let Some(state) = resp.state {
+                    let mic = &state.mic;
+                    println!("mic: {}", if mic.enabled { "enabled" } else { "disabled" });
+                    for stage in &mic.stages {
+                        let avail_str = if stage.available {
+                            String::new()
+                        } else {
+                            format!(" (unavailable: {:?} plugin not found)", stage.kind)
+                        };
+                        println!(
+                            "  {:?}: {}{}",
+                            stage.kind,
+                            if stage.enabled { "enabled" } else { "disabled" },
+                            avail_str
+                        );
+                        for (k, v) in &stage.params {
+                            println!("    {k}: {v}");
+                        }
+                    }
+                    if !mic.eq_bands.is_empty() {
+                        println!("  eq bands:");
+                        for (i, b) in mic.eq_bands.iter().enumerate() {
+                            println!(
+                                "    band {i}: {} {:.1} Hz Q {:.2} {:.1} dB",
+                                b.kind, b.freq_hz, b.q, b.gain_db
+                            );
+                        }
+                    }
+                }
+            } else {
+                println!("ok");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(resp) => {
             let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
             eprintln!("error: {msg}");
             ExitCode::FAILURE
@@ -637,6 +775,7 @@ fn main() -> ExitCode {
             },
         },
         Command::Device { action } => dispatch_device(action),
+        Command::Mic { action } => dispatch_mic(action),
         Command::Profile { action } => dispatch_profile(action),
         Command::Apply => dispatch_apply(),
         Command::Daemon { foreground: _ } => {
@@ -1206,6 +1345,128 @@ mod tests {
                 assert_eq!(control, "mic_volume");
                 assert_eq!(value, -1);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── mic subcommand parsing tests ─────────────────────────────────────────
+
+    #[test]
+    fn mic_status_parses() {
+        let cmd = parse(&["mic", "status"]).expect("mic status should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Mic {
+                action: super::MicAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn mic_enable_parses() {
+        let cmd = parse(&["mic", "enable", "rnnoise"]).expect("mic enable should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Enable { stage },
+            } => assert_eq!(stage, "rnnoise"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_disable_parses() {
+        let cmd = parse(&["mic", "disable", "gain"]).expect("mic disable should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Disable { stage },
+            } => assert_eq!(stage, "gain"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_set_vad_threshold_parses() {
+        let cmd = parse(&["mic", "set", "vad_threshold", "40"])
+            .expect("mic set vad_threshold 40 should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Set { param, value },
+            } => {
+                assert_eq!(param, "vad_threshold");
+                assert!((value - 40.0).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_set_negative_gain_db_parses() {
+        let cmd = parse(&["mic", "set", "gain_db", "-6"]).expect("mic set gain_db -6 should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Set { param, value },
+            } => {
+                assert_eq!(param, "gain_db");
+                assert!((value - (-6.0)).abs() < f32::EPSILON);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_eq_parses() {
+        let cmd = parse(&[
+            "mic",
+            "eq",
+            "--band",
+            "2",
+            "--freq",
+            "1000",
+            "--q",
+            "1.0",
+            "--gain=-3.0",
+        ])
+        .expect("mic eq should parse");
+        match cmd {
+            super::Command::Mic {
+                action:
+                    super::MicAction::Eq {
+                        band,
+                        freq,
+                        q,
+                        gain,
+                        kind,
+                    },
+            } => {
+                assert_eq!(band, 2);
+                assert!((freq - 1000.0).abs() < f32::EPSILON);
+                assert!((q - 1.0).abs() < f32::EPSILON);
+                assert!((gain - (-3.0)).abs() < f32::EPSILON);
+                assert_eq!(kind, "peaking");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_hw_mic_with_device_parses() {
+        let cmd = parse(&["mic", "hw-mic", "alsa_input.usb-SteelSeries"])
+            .expect("mic hw-mic with device should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::HwMic { device },
+            } => assert_eq!(device, Some("alsa_input.usb-SteelSeries".into())),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_hw_mic_no_device_parses() {
+        let cmd = parse(&["mic", "hw-mic"]).expect("mic hw-mic (no device) should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::HwMic { device },
+            } => assert_eq!(device, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

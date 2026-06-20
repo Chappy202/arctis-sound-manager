@@ -1,10 +1,45 @@
-use arctis_audio::{CommandRunner, RealRunner};
+use arctis_audio::{CommandRunner, RealRunner, StageKind};
 use arctis_config::{Config, EqBandConfig};
-use arctis_engine::{Engine, EngineError};
+use arctis_engine::{Engine, EngineError, MicParam};
 
 // Re-export protocol types and client from arctis-client so that `main.rs`
 // can continue to reference `daemon::Request`, `daemon::send_request`, etc.
 pub use arctis_client::{send_request, socket_path, Request, Response};
+
+/// Map a canonical stage string (from the protocol wire or CLI) to a `StageKind`.
+/// Returns `EngineError::BadRequest` for unknown strings.
+fn parse_mic_stage(s: &str) -> Result<StageKind, EngineError> {
+    match s {
+        "gain" => Ok(StageKind::Gain),
+        "highpass" => Ok(StageKind::Highpass),
+        "rnnoise" => Ok(StageKind::Rnnoise),
+        "compressor" => Ok(StageKind::Compressor),
+        "gate" => Ok(StageKind::Gate),
+        "eq" => Ok(StageKind::MicEq),
+        other => Err(EngineError::BadRequest(format!(
+            "unknown mic stage '{other}' (use: gain|highpass|rnnoise|compressor|gate|eq)"
+        ))),
+    }
+}
+
+/// Map a canonical param string (from the protocol wire or CLI) to a `MicParam`.
+/// Returns `EngineError::BadRequest` for unknown strings.
+fn parse_mic_param(s: &str) -> Result<MicParam, EngineError> {
+    match s {
+        "gain_db" => Ok(MicParam::GainDb),
+        "highpass_freq" => Ok(MicParam::HighpassFreq),
+        "vad_threshold" => Ok(MicParam::VadThreshold),
+        "vad_grace_ms" => Ok(MicParam::VadGraceMs),
+        "vad_retro_grace_ms" => Ok(MicParam::VadRetroGraceMs),
+        "gate_threshold" => Ok(MicParam::GateThreshold),
+        "comp_threshold_db" => Ok(MicParam::CompThresholdDb),
+        "comp_ratio" => Ok(MicParam::CompRatio),
+        "comp_makeup_db" => Ok(MicParam::CompMakeupDb),
+        other => Err(EngineError::BadRequest(format!(
+            "unknown mic param '{other}' (use: gain_db|highpass_freq|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db)"
+        ))),
+    }
+}
 
 pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) -> Response {
     match req {
@@ -58,6 +93,43 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Err(e) => Response::err(e.to_string()),
         },
         Request::Shutdown => Response::ok_with_state(engine.state()),
+        Request::MicStatus => Response::ok_with_state(engine.state()),
+        Request::MicStage { stage, enabled } => match parse_mic_stage(&stage) {
+            Ok(kind) => match engine.mic_set_stage_enabled(kind, enabled) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::MicSet { param, value } => match parse_mic_param(&param) {
+            Ok(p) => match engine.mic_set_param(p, value) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::MicEqBand {
+            band,
+            kind,
+            freq_hz,
+            q,
+            gain_db,
+        } => {
+            let cfg = EqBandConfig {
+                kind,
+                freq_hz,
+                q,
+                gain_db,
+            };
+            match engine.mic_set_eq_band(band, cfg) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::MicHwMic { device } => match engine.mic_set_hw_mic(device) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
     }
 }
 
@@ -617,6 +689,150 @@ mod tests {
 
         drop(engine);
         worker.join().expect("fake worker must not panic");
+    }
+
+    // ── Task 5: parse_mic_stage unit tests ──────────────────────────────────
+
+    #[test]
+    fn parse_mic_stage_all_valid_mappings() {
+        use arctis_audio::StageKind;
+        assert!(matches!(
+            super::parse_mic_stage("gain"),
+            Ok(StageKind::Gain)
+        ));
+        assert!(matches!(
+            super::parse_mic_stage("highpass"),
+            Ok(StageKind::Highpass)
+        ));
+        assert!(matches!(
+            super::parse_mic_stage("rnnoise"),
+            Ok(StageKind::Rnnoise)
+        ));
+        assert!(matches!(
+            super::parse_mic_stage("compressor"),
+            Ok(StageKind::Compressor)
+        ));
+        assert!(matches!(
+            super::parse_mic_stage("gate"),
+            Ok(StageKind::Gate)
+        ));
+        assert!(matches!(super::parse_mic_stage("eq"), Ok(StageKind::MicEq)));
+    }
+
+    #[test]
+    fn parse_mic_stage_unknown_returns_bad_request() {
+        let e = super::parse_mic_stage("invalid").unwrap_err();
+        assert!(
+            matches!(e, EngineError::BadRequest(_)),
+            "unknown stage must be BadRequest"
+        );
+        assert!(
+            e.to_string().contains("invalid"),
+            "error must include input"
+        );
+    }
+
+    // ── Task 5: parse_mic_param unit tests ──────────────────────────────────
+
+    #[test]
+    fn parse_mic_param_all_valid_mappings() {
+        use arctis_engine::MicParam;
+        assert!(matches!(
+            super::parse_mic_param("gain_db"),
+            Ok(MicParam::GainDb)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("highpass_freq"),
+            Ok(MicParam::HighpassFreq)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("vad_threshold"),
+            Ok(MicParam::VadThreshold)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("vad_grace_ms"),
+            Ok(MicParam::VadGraceMs)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("vad_retro_grace_ms"),
+            Ok(MicParam::VadRetroGraceMs)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("gate_threshold"),
+            Ok(MicParam::GateThreshold)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("comp_threshold_db"),
+            Ok(MicParam::CompThresholdDb)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("comp_ratio"),
+            Ok(MicParam::CompRatio)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("comp_makeup_db"),
+            Ok(MicParam::CompMakeupDb)
+        ));
+    }
+
+    #[test]
+    fn parse_mic_param_unknown_returns_bad_request() {
+        let e = super::parse_mic_param("bogus_param").unwrap_err();
+        assert!(
+            matches!(e, EngineError::BadRequest(_)),
+            "unknown param must be BadRequest"
+        );
+        assert!(
+            e.to_string().contains("bogus_param"),
+            "error must include input"
+        );
+    }
+
+    // ── Task 5: mic dispatch tests ───────────────────────────────────────────
+
+    #[test]
+    fn handle_mic_status_returns_ok_with_mic_snapshot() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::MicStatus);
+        assert!(resp.ok, "MicStatus must return ok:true");
+        let state = resp.state.expect("state must be present");
+        // mic snapshot is always present (even with default config)
+        // stages vec must have entries
+        assert!(
+            !state.mic.stages.is_empty(),
+            "mic snapshot must have stage entries"
+        );
+    }
+
+    #[test]
+    fn handle_mic_stage_unknown_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::MicStage {
+                stage: "nonexistent_stage".into(),
+                enabled: true,
+            },
+        );
+        assert!(!resp.ok, "unknown stage must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_mic_set_unknown_param_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::MicSet {
+                param: "bogus_param".into(),
+                value: 1.0,
+            },
+        );
+        assert!(!resp.ok, "unknown param must return ok:false");
+        assert!(resp.error.is_some());
     }
 
     #[test]
