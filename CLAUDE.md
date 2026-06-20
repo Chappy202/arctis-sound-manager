@@ -56,3 +56,7 @@ Not yet scaffolded. Once the workspace exists:
 - Use the superpowers workflow: brainstorm → spec → plan → implement; TDD for features.
 - Reference (do not run/modify) the old app for protocol/behavior: `/home/jj/src/Arctis-Sound-Manager`
   and `/home/jj/Dev/Personal/sound-manager/Arctis-Sound-Manager`.
+
+## Web searches
+
+- Never include a date in searches, always pull the latest content.
