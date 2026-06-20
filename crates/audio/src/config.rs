@@ -17,10 +17,11 @@ pub fn band_node_name(index: usize) -> String {
     format!("eq_band_{index}")
 }
 
-/// Format a value the way the conf expects: drop a trailing `.0`.
+/// Format a value the way the conf expects: always emit a decimal point for
+/// whole numbers so PipeWire parses them as floats.
 fn fmt_num(v: f32) -> String {
     if v.fract() == 0.0 {
-        format!("{}", v as i64)
+        format!("{:.1}", v)
     } else {
         // Trim to a stable short form (no scientific notation for our ranges).
         format!("{v}")
@@ -71,7 +72,17 @@ pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String,
     out.push_str(&format!("    default.clock.rate = {rate}\n"));
     out.push_str(&format!("    default.clock.allowed-rates = [ {rate} ]\n"));
     out.push_str("}\n");
+    out.push_str("context.spa-libs = {\n");
+    out.push_str("    audio.convert.* = audioconvert/libspa-audioconvert\n");
+    out.push_str("    support.*       = support/libspa-support\n");
+    out.push_str("}\n");
     out.push_str("context.modules = [\n");
+    out.push_str("    {   name = libpipewire-module-rt\n");
+    out.push_str("        flags = [ ifexists nofail ]\n");
+    out.push_str("    }\n");
+    out.push_str("    {   name = libpipewire-module-protocol-native }\n");
+    out.push_str("    {   name = libpipewire-module-client-node }\n");
+    out.push_str("    {   name = libpipewire-module-adapter }\n");
     out.push_str("    {   name = libpipewire-module-filter-chain\n");
     out.push_str("        args = {\n");
     out.push_str(&format!("            node.description = \"{desc}\"\n"));
