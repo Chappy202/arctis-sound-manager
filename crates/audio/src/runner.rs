@@ -105,7 +105,8 @@ impl CommandRunner for RealRunner {
         // ESRCH (-3) means the process group is already gone — treat as success.
         let ret = unsafe { libc::kill(-token.pgid, libc::SIGTERM) };
         if ret != 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            // Read errno immediately after the failed syscall, before any other call.
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             if errno != libc::ESRCH {
                 return Err(AudioError::Spawn {
                     program: format!("kill(-{}, SIGTERM)", token.pgid),
@@ -128,6 +129,8 @@ pub struct MockRunner {
     pub spawned: Vec<Vec<String>>,
     /// Records every token passed to `kill_owned`.
     pub killed: Vec<ChildToken>,
+    /// If set, `kill_owned` returns an error for the token with this label.
+    pub fail_kill_label: Option<String>,
 }
 
 impl MockRunner {
@@ -185,6 +188,16 @@ impl CommandRunner for MockRunner {
 
     fn kill_owned(&mut self, token: &ChildToken) -> Result<(), AudioError> {
         self.killed.push(token.clone());
+        if self
+            .fail_kill_label
+            .as_deref()
+            .is_some_and(|l| l == token.label)
+        {
+            return Err(AudioError::Spawn {
+                program: format!("kill({})", token.label),
+                source_msg: "simulated kill failure".to_string(),
+            });
+        }
         Ok(())
     }
 }

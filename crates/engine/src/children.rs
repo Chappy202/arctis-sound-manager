@@ -37,12 +37,22 @@ impl ChildOwner {
     /// Kill all tracked process groups via the runner, then clear the list.
     ///
     /// Idempotent: calling again after a successful `kill_all` is a no-op.
-    /// Errors on the first failure; remaining tokens are not killed in that case.
+    ///
+    /// Every token is attempted even if an earlier kill fails. The first error
+    /// encountered (if any) is returned after all kills have been tried.
     pub fn kill_all<R: CommandRunner>(&mut self, runner: &mut R) -> Result<(), AudioError> {
+        let mut first_err: Option<AudioError> = None;
         for token in self.tokens.drain(..) {
-            runner.kill_owned(&token)?;
+            if let Err(e) = runner.kill_owned(&token) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -92,6 +102,37 @@ mod tests {
 
         // Only one kill should have occurred (from the first call).
         assert_eq!(runner.killed.len(), 1);
+        assert_eq!(owner.len(), 0);
+    }
+
+    #[test]
+    fn child_owner_kill_all_continues_after_first_kill_error() {
+        // Verify: if kill of the first token errors, the second token is still killed.
+        let mut owner = ChildOwner::new();
+        let mut runner = MockRunner::new();
+
+        let t1 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/fail.conf"])
+            .expect("spawn_owned");
+        let t2 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/ok.conf"])
+            .expect("spawn_owned");
+        // Make kill of t1 fail by matching its label.
+        runner.fail_kill_label = Some(t1.label.clone());
+        owner.track(t1);
+        owner.track(t2);
+
+        let result = owner.kill_all(&mut runner);
+
+        // kill_all should return an error (from t1's failed kill)...
+        assert!(result.is_err(), "expected error from first kill failure");
+        // ...but BOTH tokens must have been attempted.
+        assert_eq!(
+            runner.killed.len(),
+            2,
+            "both tokens must be attempted even on partial failure"
+        );
+        // Owner list cleared regardless.
         assert_eq!(owner.len(), 0);
     }
 
