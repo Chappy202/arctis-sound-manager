@@ -123,6 +123,10 @@ flowchart TB
 Capability flags gate **both** what the engine sends and what the UI renders. Adding a device = add a
 descriptor file; **no code changes**.
 
+**hidraw build deps:** `hidapi` uses the C `linux-static-hidraw` backend (libudev-based enumeration);
+the pure-Rust `linux-native` backend does not enumerate the Nova Pro Wireless. Build requires
+`libudev` (`systemd-devel`) + a C compiler (`gcc`/`clang`).
+
 ## 5. Control / data flow (UI ↔ engine)
 
 - Commands (request/response): `Result<T, E>` via Tauri `#[command]`.

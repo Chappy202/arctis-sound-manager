@@ -2,7 +2,7 @@
 
 Tracked gaps deferred for later resolution (typically during end-to-end testing).
 
-## KI-1 — Device not enumerated by hidapi even with hidraw access (OPEN)
+## KI-1 — Device not enumerated by hidapi even with hidraw access (RESOLVED 2026-06-20)
 
 **Symptom:** `asm-cli list` reports "no recognized SteelSeries device connected" on the
 target machine even though the Arctis Nova Pro Wireless (`1038:12e5`) is physically present.
@@ -36,6 +36,12 @@ permission/enumeration hint instead of a bare "no device" message.
 
 **Does not block:** building the audio engine (PipeWire, independent of HID), config, and
 engine structure. Revisit during E2E hardware testing.
+
+**RESOLUTION (2026-06-20):** root cause was the `hidapi` `linux-native` (pure-Rust) backend
+not enumerating this composite wireless device. Switching to the C `linux-static-hidraw`
+backend fixes it. Validated on real HW (owner-run): `asm-cli list` finds
+"Arctis Nova Pro Wireless (1038:12e5) on interface 4"; `asm-cli probe` reads
+`battery_charge: 100%` and `mic_muted: false`. Build deps: `systemd-devel` + C toolchain.
 
 ## KI-2 — Audio backend writes filter-chain conf to a predictable /tmp path (LOW, OPEN)
 
