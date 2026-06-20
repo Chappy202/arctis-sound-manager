@@ -1,64 +1,10 @@
 use arctis_audio::{CommandRunner, RealRunner};
 use arctis_config::{Config, EqBandConfig};
-use arctis_engine::{Engine, EngineError, EngineState};
+use arctis_engine::{Engine, EngineError};
 
-/// Path to the Unix domain socket used for IPC.
-pub fn socket_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    base.join("arctis-sound-manager.sock")
-}
-
-#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "cmd", rename_all = "kebab-case")]
-pub enum Request {
-    GetState,
-    SwitchProfile {
-        name: String,
-    },
-    SetEqBand {
-        channel: String,
-        band: usize,
-        kind: String,
-        freq_hz: f32,
-        q: f32,
-        gain_db: f32,
-    },
-    Route {
-        app_binary: String,
-        target_sink: String,
-    },
-    Reload,
-    Shutdown,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct Response {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<EngineState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl Response {
-    fn ok_with_state(state: EngineState) -> Self {
-        Self {
-            ok: true,
-            state: Some(state),
-            error: None,
-        }
-    }
-
-    fn err(msg: String) -> Self {
-        Self {
-            ok: false,
-            state: None,
-            error: Some(msg),
-        }
-    }
-}
+// Re-export protocol types and client from arctis-client so that `main.rs`
+// can continue to reference `daemon::Request`, `daemon::send_request`, etc.
+pub use arctis_client::{send_request, socket_path, Request, Response};
 
 pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) -> Response {
     match req {
@@ -90,6 +36,16 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             app_binary,
             target_sink,
         } => match engine.set_route(&app_binary, &target_sink) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SetChannelOutput { channel, device } => {
+            match engine.set_channel_output(&channel, device) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::ProfileNew { name } => match engine.new_profile(&name) {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
@@ -224,25 +180,6 @@ pub fn run_daemon() -> Result<(), EngineError> {
     run_daemon_with_engine(&mut engine, &path)
 }
 
-pub fn send_request(req: &Request) -> Result<Response, EngineError> {
-    use std::io::{BufRead, BufReader, Write};
-
-    let path = socket_path();
-    let stream = std::os::unix::net::UnixStream::connect(&path)
-        .map_err(|e| EngineError::Ipc(format!("connect to {}: {}", path.display(), e)))?;
-    let req_str = serde_json::to_string(req).map_err(|e| EngineError::Ipc(e.to_string()))?;
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| EngineError::Ipc(e.to_string()))?;
-    writeln!(writer, "{req_str}").map_err(|e| EngineError::Ipc(e.to_string()))?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| EngineError::Ipc(e.to_string()))?;
-    serde_json::from_str(line.trim()).map_err(|e| EngineError::Ipc(e.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,64 +252,6 @@ mod tests {
             }
         }
         r
-    }
-
-    #[test]
-    fn parse_get_state() {
-        let req: Request = serde_json::from_str(r#"{"cmd":"get-state"}"#).unwrap();
-        assert_eq!(req, Request::GetState);
-    }
-
-    #[test]
-    fn parse_switch() {
-        let req: Request =
-            serde_json::from_str(r#"{"cmd":"switch-profile","name":"gaming"}"#).unwrap();
-        assert_eq!(
-            req,
-            Request::SwitchProfile {
-                name: "gaming".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_set_eq_band() {
-        let req: Request = serde_json::from_str(
-            r#"{"cmd":"set-eq-band","channel":"game","band":2,"kind":"peaking","freq_hz":1000.0,"q":1.0,"gain_db":-3.0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            req,
-            Request::SetEqBand {
-                channel: "game".into(),
-                band: 2,
-                kind: "peaking".into(),
-                freq_hz: 1000.0,
-                q: 1.0,
-                gain_db: -3.0,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_route() {
-        let req: Request = serde_json::from_str(
-            r#"{"cmd":"route","app_binary":"firefox","target_sink":"Arctis_Media"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            req,
-            Request::Route {
-                app_binary: "firefox".into(),
-                target_sink: "Arctis_Media".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_shutdown() {
-        let req: Request = serde_json::from_str(r#"{"cmd":"shutdown"}"#).unwrap();
-        assert_eq!(req, Request::Shutdown);
     }
 
     #[test]
@@ -509,6 +388,99 @@ mod tests {
             result.is_err(),
             "I/O error must propagate out of serve_connection"
         );
+    }
+
+    // ── New verb dispatch tests (TDD) ────────────────────────────────────────
+
+    #[test]
+    fn handle_set_channel_output_updates_state() {
+        let _env_lock = std::sync::Mutex::new(());
+        let tmp = std::env::temp_dir().join(format!("asm9_sco_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // set_channel_output calls ChannelManager::set_output:
+        // queues ls for present-check, then spawn if absent.
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, &ls, "");
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelOutput {
+                channel: "game".into(),
+                device: Some("alsa_output.speakers".into()),
+            },
+        );
+        assert!(resp.ok, "expected ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game.output_device,
+            Some("alsa_output.speakers".into()),
+            "state must reflect new output_device"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_output_unknown_channel_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelOutput {
+                channel: "nonexistent".into(),
+                device: None,
+            },
+        );
+        assert!(!resp.ok, "unknown channel must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_profile_new_creates_and_returns_state() {
+        let tmp = std::env::temp_dir().join(format!("asm9_pn_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileNew {
+                name: "competitive".into(),
+            },
+        );
+        assert!(resp.ok, "expected ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.active_profile, "competitive");
+        assert!(
+            state.profiles.contains(&"competitive".to_string()),
+            "new profile must appear in profile list"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_new_duplicate_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileNew {
+                name: "default".into(), // already exists
+            },
+        );
+        assert!(!resp.ok, "duplicate name must return ok:false");
+        assert!(resp.error.is_some());
     }
 
     // ── Integration test: shutdown breaks accept loop ─────────────────────────

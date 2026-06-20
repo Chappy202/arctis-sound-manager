@@ -93,7 +93,7 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&self) -> crate::state::EngineState {
-        use crate::state::{ChannelSnapshot, EngineState};
+        use crate::state::{ChannelSnapshot, EngineState, EqBandSnapshot};
         let active = self.config.active().ok();
         let channels = active
             .map(|p| {
@@ -103,7 +103,16 @@ impl<R: CommandRunner> Engine<R> {
                         id: ch.id.clone(),
                         node_name: ch.node_name.clone(),
                         output_device: ch.output_device.clone(),
-                        eq_bands: ch.eq.len(),
+                        eq_bands: ch
+                            .eq
+                            .iter()
+                            .map(|b| EqBandSnapshot {
+                                kind: b.kind.clone(),
+                                freq_hz: b.freq_hz,
+                                q: b.q,
+                                gain_db: b.gain_db,
+                            })
+                            .collect(),
                     })
                     .collect()
             })
@@ -239,6 +248,80 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::RouteSet {
             app_binary: app_binary.to_string(),
             target_sink: target_sink.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Set (or clear) the output device for a single channel in the active profile.
+    ///
+    /// Updates the in-memory config, persists it atomically, rebuilds that
+    /// channel live via `ChannelManager::set_output`, tracks any new child token,
+    /// and emits a `ChannelOutputSet` event.
+    pub fn set_channel_output(
+        &mut self,
+        channel_id: &str,
+        device: Option<String>,
+    ) -> Result<(), EngineError> {
+        // Validate channel exists before touching disk
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.output_device = device.clone();
+        }
+        // Persist
+        self.save_config()?;
+        // Apply live: rebuild that channel with the new output device
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let channel_set = convert::channel_set_from_profile(&profile);
+            let mut mgr = ChannelManager::new(&mut self.runner, channel_set);
+            let handle = mgr.set_output(channel_id, device.clone(), &eq_model)?;
+            if let Some(t) = handle.child {
+                self.children.track(t);
+            }
+        }
+        // Emit event
+        self.emit(Event::ChannelOutputSet {
+            channel_id: channel_id.to_string(),
+            device,
+        });
+        Ok(())
+    }
+
+    /// Create a new profile by cloning the currently active one under `name`,
+    /// make it active, persist the config, reconcile the graph to it, and emit
+    /// a `ProfileCreated` event.
+    pub fn new_profile(&mut self, name: &str) -> Result<(), EngineError> {
+        // new_profile_from_active validates (errors on duplicate name), clones, sets active
+        self.config
+            .new_profile_from_active(name)
+            .map_err(EngineError::Config)?;
+        // Persist
+        self.save_config()?;
+        // Reconcile to the new (identical) profile
+        self.reconcile()?;
+        // Emit event
+        self.emit(Event::ProfileCreated {
+            name: name.to_string(),
         });
         Ok(())
     }
@@ -1206,6 +1289,294 @@ mod tests {
                 band: 2,
             }
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // TDD: new features — get-state full EQ, set_channel_output, new_profile
+    // ─────────────────────────────────────────────
+
+    /// Config with EQ bands set on the game channel.
+    fn make_config_with_eq_bands() -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![
+                            arctis_config::EqBandConfig {
+                                kind: "peaking".into(),
+                                freq_hz: 100.0,
+                                q: 1.0,
+                                gain_db: 3.0,
+                            },
+                            arctis_config::EqBandConfig {
+                                kind: "highshelf".into(),
+                                freq_hz: 8000.0,
+                                q: 0.7,
+                                gain_db: -2.0,
+                            },
+                        ],
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: Some("alsa_output.headphones".into()),
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                ],
+                routes: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn state_includes_full_eq_band_values_from_config() {
+        let cfg = make_config_with_eq_bands();
+        let engine = Engine::new(MockRunner::new(), cfg);
+        let s = engine.state();
+
+        // Find game channel
+        let game = s
+            .channels
+            .iter()
+            .find(|c| c.id == "game")
+            .expect("game channel");
+        assert_eq!(game.eq_bands.len(), 2, "game should have 2 EQ bands");
+
+        // Verify band values come from config (not just a count)
+        let b0 = &game.eq_bands[0];
+        assert_eq!(b0.kind, "peaking");
+        assert!((b0.freq_hz - 100.0).abs() < f32::EPSILON, "band0 freq_hz");
+        assert!((b0.q - 1.0).abs() < f32::EPSILON, "band0 q");
+        assert!((b0.gain_db - 3.0).abs() < f32::EPSILON, "band0 gain_db");
+
+        let b1 = &game.eq_bands[1];
+        assert_eq!(b1.kind, "highshelf");
+        assert!((b1.freq_hz - 8000.0).abs() < f32::EPSILON, "band1 freq_hz");
+        assert!((b1.q - 0.7).abs() < f32::EPSILON, "band1 q");
+        assert!((b1.gain_db - -2.0).abs() < f32::EPSILON, "band1 gain_db");
+
+        // Chat channel: output_device present, empty eq
+        let chat = s
+            .channels
+            .iter()
+            .find(|c| c.id == "chat")
+            .expect("chat channel");
+        assert_eq!(chat.output_device, Some("alsa_output.headphones".into()));
+        assert!(chat.eq_bands.is_empty(), "chat has no configured EQ");
+    }
+
+    #[test]
+    fn state_channel_snapshot_has_output_device() {
+        let cfg = make_config_with_eq_bands();
+        let engine = Engine::new(MockRunner::new(), cfg);
+        let s = engine.state();
+        let chat = s.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert_eq!(chat.output_device, Some("alsa_output.headphones".into()));
+        let game = s.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game.output_device, None);
+    }
+
+    #[test]
+    fn set_channel_output_updates_config_persists_and_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("set_ch_out");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+
+        // set_channel_output calls ChannelManager::set_output which does:
+        //   1. ls Node (find existing handle) + possibly spawn
+        // Queue a present ls so set_output succeeds without spawn.
+        let ls = ls_all_present();
+        // set_output: ls Node to find channel + attempt to set output device
+        // ChannelManager::set_output: ls to find node_id, then up + maybe spawn
+        // When sinks are present, set_output does: ls (find) → present → no new spawn
+        // But it re-creates the channel with new output, which means: ls (exists?) + spawn_owned
+        // For simplicity, queue enough outputs so the operation can complete
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // ls for set_output
+            .with_output(0, &ls, ""); // extra ls if needed
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_output("game", Some("alsa_output.speakers".to_string()))
+            .expect("set_channel_output should succeed");
+
+        // In-memory config updated
+        let active = engine.config().active().unwrap();
+        let game_ch = active.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game_ch.output_device,
+            Some("alsa_output.speakers".to_string()),
+            "in-memory output_device must be updated"
+        );
+
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("alsa_output.speakers"),
+            "persisted config must contain the new output device"
+        );
+
+        // Event emitted
+        let event = rx.try_recv().expect("ChannelOutputSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::ChannelOutputSet {
+                channel_id: "game".to_string(),
+                device: Some("alsa_output.speakers".to_string()),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_output_none_clears_device() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("set_ch_out_none");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Start with a channel that HAS an output device
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].channels[0].output_device = Some("alsa_output.old".into());
+
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, &ls, "");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_output("game", None)
+            .expect("set_channel_output(None) should succeed");
+
+        let active = engine.config().active().unwrap();
+        let game_ch = active.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game_ch.output_device, None, "output_device must be cleared");
+
+        let event = rx.try_recv().expect("ChannelOutputSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::ChannelOutputSet {
+                channel_id: "game".to_string(),
+                device: None,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_output_unknown_channel_errors() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.set_channel_output("nonexistent", Some("some_device".into()));
+        assert!(result.is_err(), "unknown channel_id must return an error");
+    }
+
+    #[test]
+    fn new_profile_creates_clones_active_persists_reconciles_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("new_profile");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        // Queue outputs for one reconcile pass (new_profile calls reconcile)
+        let runner = queue_reconcile_present(MockRunner::new());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .new_profile("competitive")
+            .expect("new_profile should succeed");
+
+        // New profile created and active
+        assert_eq!(engine.config().active_profile, "competitive");
+        let names = engine.config().profile_names();
+        assert!(
+            names.contains(&"default".to_string()),
+            "original profile preserved"
+        );
+        assert!(
+            names.contains(&"competitive".to_string()),
+            "new profile exists"
+        );
+
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("competitive"),
+            "persisted config must contain new profile name"
+        );
+
+        // Reconcile was called (pw-cli ls Node issued)
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c == &vec!["pw-cli", "ls", "Node"]),
+            "reconcile must be called after new_profile"
+        );
+
+        // Event emitted
+        let event = rx.try_recv().expect("ProfileCreated event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::ProfileCreated {
+                name: "competitive".to_string()
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn new_profile_duplicate_name_errors_no_disk_write() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("new_profile_dup");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let result = engine.new_profile("default"); // "default" already exists
+        assert!(result.is_err(), "duplicate profile name must error");
+        assert!(!tmp.exists(), "no disk write on error");
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");

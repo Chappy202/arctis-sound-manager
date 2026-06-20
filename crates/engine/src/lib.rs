@@ -11,4 +11,4 @@ pub mod state;
 pub use children::ChildOwner;
 pub use engine::Engine;
 pub use error::EngineError;
-pub use state::{ChannelSnapshot, EngineState, Event};
+pub use state::{ChannelSnapshot, EngineState, EqBandSnapshot, Event};
