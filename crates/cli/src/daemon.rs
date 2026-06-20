@@ -186,6 +186,11 @@ mod tests {
     use arctis_audio::MockRunner;
     use arctis_config::{ChannelConfig, Profile};
 
+    /// Shared mutex to serialize all tests that mutate the process-global
+    /// `ASM_CONFIG_HOME` env var. Without this, parallel test threads clobber
+    /// each other's env, causing intermittent failures.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn two_profile_config() -> Config {
         let channels = vec![
             ChannelConfig {
@@ -256,6 +261,7 @@ mod tests {
 
     #[test]
     fn handle_switch_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm7_sw_{}", std::process::id()));
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
@@ -394,7 +400,7 @@ mod tests {
 
     #[test]
     fn handle_set_channel_output_updates_state() {
-        let _env_lock = std::sync::Mutex::new(());
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm9_sco_{}", std::process::id()));
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
@@ -444,6 +450,7 @@ mod tests {
 
     #[test]
     fn handle_profile_new_creates_and_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm9_pn_{}", std::process::id()));
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
@@ -517,6 +524,7 @@ mod tests {
         let mut engine = Engine::new(runner, cfg);
 
         // Reconcile up-front (mimics what run_daemon does before the loop).
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
         if let Err(e) = engine.reconcile() {
             eprintln!("pre-reconcile warning (test): {e}");

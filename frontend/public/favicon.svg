@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" fill="none">
+  <!-- Arctis Sound Manager icon: orange arc + headset silhouette -->
+  <rect width="48" height="48" rx="8" fill="#0F0D0E"/>
+  <!-- Orange arc (top band) -->
+  <path d="M10 22 A14 14 0 0 1 38 22" stroke="#FF5200" stroke-width="3" stroke-linecap="round" fill="none"/>
+  <!-- Headset left cup -->
+  <rect x="8" y="22" width="6" height="9" rx="3" fill="#FF5200"/>
+  <!-- Headset right cup -->
+  <rect x="34" y="22" width="6" height="9" rx="3" fill="#FF5200"/>
+  <!-- Headset band -->
+  <path d="M14 22 L34 22" stroke="#FC4C02" stroke-width="2" stroke-linecap="round" fill="none"/>
+</svg>

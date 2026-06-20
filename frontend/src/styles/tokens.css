@@ -1,0 +1,221 @@
+/**
+ * tokens.css — Design system tokens for Arctis Sound Manager
+ * Mapped 1:1 from DESIGN.md (YAML front matter) to CSS custom properties.
+ * Prefix: --ss-
+ */
+
+:root {
+  /* =========================================================================
+   * COLORS — Accent / brand orange
+   * ========================================================================= */
+  --ss-accent:              #FF5200;         /* primary orange — interactive accent */
+  --ss-accent-brand:        #FC4C02;         /* SteelSeries brand orange (SS-official) */
+  --ss-accent-press:        #CD3400;         /* darker orange for :active / gradient end */
+  --ss-accent-hover:        #FF6A24;         /* lighter orange for :hover */
+  --ss-accent-soft:         rgba(255, 82, 0, 0.14);  /* 14% wash for selected rows / track fills */
+  --ss-accent-border:       rgba(255, 82, 0, 0.45);  /* accent at low alpha for focus rings */
+
+  /* =========================================================================
+   * COLORS — Surfaces (dark, near-black layered)
+   * ========================================================================= */
+  --ss-bg-root:             #0F0D0E;         /* app background / window chrome */
+  --ss-bg-base:             #161415;         /* base content area */
+  --ss-surface-1:           #1C1C1C;         /* primary card / panel */
+  --ss-surface-2:           #212121;         /* raised card / popover */
+  --ss-surface-3:           #262626;         /* highest surface / dropdown menu */
+  --ss-surface-input:       #2D2D2D;         /* input/control field fill */
+  --ss-surface-input-alt:   #404040;         /* secondary-button / track base */
+
+  /* =========================================================================
+   * COLORS — Hairlines & dividers
+   * ========================================================================= */
+  --ss-border:              rgba(255, 255, 255, 0.08);  /* default hairline */
+  --ss-border-strong:       rgba(255, 255, 255, 0.14);  /* emphasized divider */
+  --ss-border-inset:        rgba(255, 255, 255, 0.10);  /* inset top-light on raised modals */
+
+  /* =========================================================================
+   * COLORS — Text (light-on-dark)
+   * ========================================================================= */
+  --ss-text-primary:        #E6E6E6;         /* primary copy / headings */
+  --ss-text-bright:         #FFFFFF;         /* text on accent fills, selected items */
+  --ss-text-secondary:      #A5A7AA;         /* default body / labels */
+  --ss-text-tertiary:       #7A7C80;         /* captions, units, hints */
+  --ss-text-disabled:       #5A5A5A;         /* disabled */
+
+  /* =========================================================================
+   * COLORS — Semantic / status
+   * ========================================================================= */
+  --ss-selected:            #0091D1;         /* selected-item blue */
+  --ss-selected-brand:      #007EC8;         /* brand blue */
+  --ss-success:             #41A930;         /* ok / connected / charging */
+  --ss-warning:             #FFBE00;         /* low battery / caution */
+  --ss-danger:              #E5484D;         /* error / disconnect / destructive */
+  --ss-danger-soft:         rgba(229, 72, 77, 0.10); /* 10% danger tint for badge backgrounds */
+  --ss-muted:               #A5A7AA;         /* muted channel inactive state */
+
+  /* =========================================================================
+   * COLORS — Data-viz / EQ band identity colors (10 bands)
+   * ========================================================================= */
+  --ss-band-1:              #FF5200;
+  --ss-band-2:              #0091D1;
+  --ss-band-3:              #41A930;
+  --ss-band-4:              #754BD3;
+  --ss-band-5:              #FFBE00;
+  --ss-band-6:              #2A7199;
+  --ss-band-7:              #B24736;
+  --ss-band-8:              #356E74;
+  --ss-band-9:              #6F3969;
+  --ss-band-10:             #50648C;
+
+  /* =========================================================================
+   * COLORS — Gradients
+   * ========================================================================= */
+  --ss-gradient-primary:    linear-gradient(180deg, #FF5200 0%, #CD3400 100%);
+  --ss-gradient-secondary:  linear-gradient(180deg, #404040 0%, #2D2D2D 100%);
+
+  /* =========================================================================
+   * TYPOGRAPHY — Font families
+   * ========================================================================= */
+  --ss-font-ui:      'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --ss-font-display: 'Saira Condensed', 'Inter', system-ui, sans-serif;
+  --ss-font-mono:    'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+
+  /* =========================================================================
+   * TYPOGRAPHY — Scale
+   * ========================================================================= */
+  /* display — H1/page title */
+  --ss-type-display-family:        var(--ss-font-display);
+  --ss-type-display-size:          26px;
+  --ss-type-display-weight:        700;
+  --ss-type-display-line-height:   1.1;
+  --ss-type-display-letter-spacing:0.04em;
+  --ss-type-display-transform:     uppercase;
+
+  /* h2 — section header */
+  --ss-type-h2-family:             var(--ss-font-display);
+  --ss-type-h2-size:               18px;
+  --ss-type-h2-weight:             700;
+  --ss-type-h2-line-height:        1.2;
+  --ss-type-h2-letter-spacing:     0.03em;
+  --ss-type-h2-transform:          uppercase;
+
+  /* h3 — card title */
+  --ss-type-h3-family:             var(--ss-font-ui);
+  --ss-type-h3-size:               14px;
+  --ss-type-h3-weight:             700;
+  --ss-type-h3-line-height:        1.3;
+  --ss-type-h3-letter-spacing:     0.01em;
+
+  /* bodyLg */
+  --ss-type-body-lg-family:        var(--ss-font-ui);
+  --ss-type-body-lg-size:          14px;
+  --ss-type-body-lg-weight:        400;
+  --ss-type-body-lg-line-height:   1.45;
+
+  /* body — default */
+  --ss-type-body-family:           var(--ss-font-ui);
+  --ss-type-body-size:             13px;
+  --ss-type-body-weight:           400;
+  --ss-type-body-line-height:      1.45;
+
+  /* label — control labels */
+  --ss-type-label-family:          var(--ss-font-ui);
+  --ss-type-label-size:            12px;
+  --ss-type-label-weight:          600;
+  --ss-type-label-line-height:     1.3;
+  --ss-type-label-letter-spacing:  0.02em;
+
+  /* caption — hints, units */
+  --ss-type-caption-family:        var(--ss-font-ui);
+  --ss-type-caption-size:          11px;
+  --ss-type-caption-weight:        400;
+  --ss-type-caption-line-height:   1.3;
+
+  /* micro — tab/nav labels, badges */
+  --ss-type-micro-family:          var(--ss-font-ui);
+  --ss-type-micro-size:            10px;
+  --ss-type-micro-weight:          600;
+  --ss-type-micro-line-height:     1.2;
+  --ss-type-micro-letter-spacing:  0.06em;
+  --ss-type-micro-transform:       uppercase;
+
+  /* button */
+  --ss-type-button-family:         var(--ss-font-ui);
+  --ss-type-button-size:           12px;
+  --ss-type-button-weight:         700;
+  --ss-type-button-line-height:    1;
+  --ss-type-button-letter-spacing: 0.05em;
+  --ss-type-button-transform:      uppercase;
+
+  /* readout — dB / Hz / % numbers */
+  --ss-type-readout-family:        var(--ss-font-mono);
+  --ss-type-readout-size:          13px;
+  --ss-type-readout-weight:        500;
+  --ss-type-readout-line-height:   1;
+  --ss-type-readout-feature:       'tnum' 1;
+
+  /* =========================================================================
+   * LAYOUT — Spacing (4px base grid)
+   * ========================================================================= */
+  --ss-space-0:   0px;
+  --ss-space-1:   4px;
+  --ss-space-2:   8px;
+  --ss-space-3:   12px;
+  --ss-space-4:   16px;
+  --ss-space-5:   20px;
+  --ss-space-6:   24px;
+  --ss-space-8:   32px;
+  --ss-space-10:  40px;
+  --ss-space-12:  48px;
+  --ss-space-16:  64px;
+
+  /* =========================================================================
+   * LAYOUT — Sizing
+   * ========================================================================= */
+  --ss-nav-w:               72px;
+  --ss-nav-w-expanded:      220px;
+  --ss-topbar-h:            56px;
+  --ss-channel-strip-w:     120px;
+  --ss-channel-strip-w-min: 96px;
+  --ss-control-h:           36px;
+  --ss-control-h-sm:        28px;
+  --ss-field-h:             36px;
+  --ss-tab-h:               40px;
+  --ss-icon-btn:            32px;
+  --ss-page-padding:        24px;
+  --ss-content-max-w:       1280px;
+  --ss-window-min-w:        920px;
+  --ss-window-min-h:        620px;
+
+  /* =========================================================================
+   * ELEVATION
+   * ========================================================================= */
+  --ss-e0:          none;
+  --ss-e1:          0 1px 2px rgba(0, 0, 0, 0.4);
+  --ss-e2:          0 4px 8px rgba(0, 0, 0, 0.45);
+  --ss-e3:          inset 0 0 1px 1px rgba(255, 255, 255, 0.10),
+                    0 6px 8px rgba(0, 0, 0, 0.50);
+  --ss-glow-accent: 0 0 0 1px var(--ss-accent-border),
+                    0 0 12px rgba(255, 82, 0, 0.35);
+
+  /* =========================================================================
+   * SHAPES
+   * ========================================================================= */
+  --ss-radius-xs:    3px;
+  --ss-radius-sm:    4px;
+  --ss-radius-md:    6px;
+  --ss-radius-lg:    10px;
+  --ss-radius-pill:  999px;
+  --ss-border-width: 1px;
+
+  /* =========================================================================
+   * MOTION
+   * ========================================================================= */
+  --ss-dur-instant:    80ms;
+  --ss-dur-fast:       120ms;
+  --ss-dur-base:       180ms;
+  --ss-dur-slow:       280ms;
+  --ss-ease-standard:  cubic-bezier(0.2, 0, 0, 1);
+  --ss-ease-out:       cubic-bezier(0.16, 1, 0.3, 1);
+  --ss-ease-in:        cubic-bezier(0.4, 0, 1, 1);
+}
