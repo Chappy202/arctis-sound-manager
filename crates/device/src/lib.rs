@@ -1,5 +1,6 @@
 //! Data-driven HID device layer: descriptors, registry, transport, codec.
 pub mod codec;
+pub mod controller;
 pub mod descriptor;
 pub mod error;
 pub mod hidraw;
@@ -8,6 +9,7 @@ pub mod registry;
 pub mod transport;
 
 pub use codec::{decode_frame, encode_command, read_status, write_command};
+pub use controller::DeviceController;
 pub use descriptor::{
     parse_descriptor, CommandSpec, DeviceDescriptor, EnumEntry, Parser, StatusField, StatusSpec,
     ValueEncoding,
