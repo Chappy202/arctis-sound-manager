@@ -2,6 +2,14 @@ use arctis_audio::{AudioError, ChildToken, CommandRunner};
 
 /// Tracks every pipewire child the engine spawned, killing them on teardown.
 ///
+/// # Deduplication
+///
+/// Tokens are keyed by the `ChildToken::label` string (typically the conf path).
+/// `track(token)` REPLACES any existing entry for the same label, so reconcile
+/// can be called repeatedly without accumulating stale dead tokens.  The old
+/// instance is already killed by `recreate`/`remove` before re-tracking, so
+/// replacing is always safe.
+///
 /// # Drop and determinism
 ///
 /// Because `kill_all` requires a runner (which is owned by the engine), `ChildOwner`
@@ -11,7 +19,8 @@ use arctis_audio::{AudioError, ChildToken, CommandRunner};
 /// `SIGTERM`.
 #[derive(Default)]
 pub struct ChildOwner {
-    tokens: Vec<ChildToken>,
+    /// Key = token label (conf path or argv string); value = live token.
+    tokens: std::collections::HashMap<String, ChildToken>,
 }
 
 impl ChildOwner {
@@ -19,9 +28,11 @@ impl ChildOwner {
         Self::default()
     }
 
-    /// Start tracking a spawned child token.
+    /// Start tracking a spawned child token, replacing any previous entry with
+    /// the same label.  The old entry's process was already killed by the caller
+    /// (via `recreate`/`remove`) before this call, so replacement is safe.
     pub fn track(&mut self, token: ChildToken) {
-        self.tokens.push(token);
+        self.tokens.insert(token.label.clone(), token);
     }
 
     /// Number of currently tracked children.
@@ -34,7 +45,7 @@ impl ChildOwner {
         self.tokens.is_empty()
     }
 
-    /// Kill all tracked process groups via the runner, then clear the list.
+    /// Kill all tracked process groups via the runner, then clear the map.
     ///
     /// Idempotent: calling again after a successful `kill_all` is a no-op.
     ///
@@ -42,7 +53,7 @@ impl ChildOwner {
     /// encountered (if any) is returned after all kills have been tried.
     pub fn kill_all<R: CommandRunner>(&mut self, runner: &mut R) -> Result<(), AudioError> {
         let mut first_err: Option<AudioError> = None;
-        for token in self.tokens.drain(..) {
+        for (_label, token) in self.tokens.drain() {
             if let Err(e) = runner.kill_owned(&token) {
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -154,5 +165,52 @@ mod tests {
         owner.track(t);
         assert_eq!(owner.len(), 1);
         assert!(!owner.is_empty());
+    }
+
+    /// Fix #3: re-tracking a token with the same label replaces the old one,
+    /// keeping the map bounded to one entry per live channel.
+    #[test]
+    fn track_deduplicates_by_label_bounds_to_one_per_channel() {
+        let mut owner = ChildOwner::new();
+        let mut runner = MockRunner::new();
+
+        // Simulate initial reconcile: 3 channels spawn tokens.
+        let t_game1 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/Arctis_Game.conf"])
+            .expect("spawn_owned game1");
+        let t_chat1 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/Arctis_Chat.conf"])
+            .expect("spawn_owned chat1");
+        let t_media1 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/Arctis_Media.conf"])
+            .expect("spawn_owned media1");
+        owner.track(t_game1);
+        owner.track(t_chat1);
+        owner.track(t_media1);
+        assert_eq!(owner.len(), 3, "after first reconcile: 3 tracked");
+
+        // Simulate a respawn of the game channel (same label, new token).
+        // The old process was already killed by recreate/remove before this call.
+        let t_game2 = runner
+            .spawn_owned("pipewire", &["-c", "/tmp/Arctis_Game.conf"])
+            .expect("spawn_owned game2");
+        owner.track(t_game2);
+
+        // Must still be 3, not 4 — the old game token was replaced.
+        assert_eq!(
+            owner.len(),
+            3,
+            "re-tracking same label must replace, not append (dedup bound)"
+        );
+
+        // All 3 tokens are killed on shutdown.
+        owner.kill_all(&mut runner).expect("kill_all");
+        assert_eq!(owner.len(), 0);
+        // 3 kills: chat1, media1, game2 (game1 was replaced, never killed here).
+        assert_eq!(
+            runner.killed.len(),
+            3,
+            "kill_all sends exactly 3 kills (one per live token)"
+        );
     }
 }

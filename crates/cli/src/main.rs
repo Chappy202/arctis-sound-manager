@@ -148,19 +148,13 @@ enum ProfileAction {
     /// List available profiles.
     List,
     /// Show a profile's details (defaults to the active profile).
-    Show {
-        name: Option<String>,
-    },
+    Show { name: Option<String> },
     /// Switch the active profile.
-    Switch {
-        name: String,
-    },
+    Switch { name: String },
     /// Persist the current in-memory config to disk (normalization pass).
     Save,
     /// Create a new profile as a copy of the active one.
-    New {
-        name: String,
-    },
+    New { name: String },
 }
 
 const SINK_NAME: &str = "arctis_eq";

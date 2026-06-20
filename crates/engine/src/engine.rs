@@ -291,7 +291,10 @@ impl<R: CommandRunner> Engine<R> {
             if ch.output_device.is_some() {
                 let eq_model = convert::eq_model_for(ch)?;
                 let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
-                let _handle = mgr.set_output(&ch.id, ch.output_device.clone(), &eq_model)?;
+                let handle = mgr.set_output(&ch.id, ch.output_device.clone(), &eq_model)?;
+                if let Some(t) = handle.child {
+                    self.children.track(t);
+                }
             }
         }
 

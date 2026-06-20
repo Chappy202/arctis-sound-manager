@@ -42,9 +42,7 @@ pub fn warning(report: &LegacyReport) -> Option<String> {
         ));
     }
     if report.hrir_switch_present {
-        parts.push(
-            "hrir-switch script found at ~/.local/bin/hrir-switch".to_string(),
-        );
+        parts.push("hrir-switch script found at ~/.local/bin/hrir-switch".to_string());
     }
     if report.rpm_daemon_running {
         parts.push("legacy RPM daemon appears to be running".to_string());
@@ -64,8 +62,7 @@ mod tests {
     fn detects_loopbacks() {
         let node_output =
             "id 10\n    node.name = \"Arctis_Game\"\nid 11\n    node.name = \"Arctis_Chat\"\n";
-        let tmp = std::env::temp_dir()
-            .join(format!("asm7_coexist_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("asm7_coexist_{}", std::process::id()));
         let report = detect_from(node_output, &tmp);
         assert!(report.legacy_loopbacks.contains(&"Arctis_Game".to_string()));
         assert!(report.legacy_loopbacks.contains(&"Arctis_Chat".to_string()));
@@ -74,8 +71,7 @@ mod tests {
 
     #[test]
     fn clean_system() {
-        let tmp = std::env::temp_dir()
-            .join(format!("asm7_clean_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("asm7_clean_{}", std::process::id()));
         let report = detect_from("id 1\n    node.name = \"other_sink\"\n", &tmp);
         assert_eq!(report, LegacyReport::default());
         assert!(warning(&report).is_none());

@@ -151,28 +151,22 @@ where
     }
 }
 
-pub fn run_daemon() -> Result<(), EngineError> {
+/// Core accept loop. Accepts a pre-built engine so tests can inject a
+/// MockRunner-backed engine without touching real PipeWire.
+///
+/// On shutdown the loop breaks IMMEDIATELY after the connection that sent
+/// the shutdown request (no blocking accept()). Then `engine.shutdown()` is
+/// called for deterministic child teardown, and the socket file is removed.
+pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
+    engine: &mut Engine<R>,
+    path: &std::path::Path,
+) -> Result<(), EngineError> {
     use std::io::BufReader;
 
-    let path = socket_path();
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-
-    let listener = std::os::unix::net::UnixListener::bind(&path)
+    let listener = std::os::unix::net::UnixListener::bind(path)
         .map_err(|e| EngineError::Ipc(e.to_string()))?;
 
-    let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
-    let mut engine = Engine::new(RealRunner, cfg);
-    if let Err(e) = engine.reconcile() {
-        eprintln!("warning: reconcile on start failed: {e}");
-    }
-
-    let mut shutdown = false;
     for stream in listener.incoming() {
-        if shutdown {
-            break;
-        }
         // Transient accept error — log and continue rather than killing the daemon.
         let stream = match stream {
             Ok(s) => s,
@@ -190,20 +184,44 @@ pub fn run_daemon() -> Result<(), EngineError> {
         };
         let mut reader = BufReader::new(stream);
         let mut writer = writer_stream;
-        match serve_connection(&mut reader, &mut writer, &mut engine) {
-            Ok(true) => {
-                shutdown = true;
-            }
-            Ok(false) => {}
+        let shutdown = match serve_connection(&mut reader, &mut writer, engine) {
+            Ok(true) => true,
+            Ok(false) => false,
             Err(e) => {
                 // Per-connection I/O error (ECONNRESET, EPIPE, …): log and continue.
                 eprintln!("daemon: connection error (continuing): {e}");
+                false
             }
+        };
+        // Break IMMEDIATELY after the connection that requested shutdown — do NOT
+        // loop back to accept() which would block indefinitely.
+        if shutdown {
+            break;
         }
     }
 
-    let _ = std::fs::remove_file(&path);
+    // Deterministic teardown: kill all tracked children before returning.
+    // Do not rely solely on Drop timing.
+    if let Err(e) = engine.shutdown() {
+        eprintln!("daemon: shutdown warning: {e}");
+    }
+    let _ = std::fs::remove_file(path);
     Ok(())
+}
+
+pub fn run_daemon() -> Result<(), EngineError> {
+    let path = socket_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
+    let mut engine = Engine::new(RealRunner, cfg);
+    if let Err(e) = engine.reconcile() {
+        eprintln!("warning: reconcile on start failed: {e}");
+    }
+
+    run_daemon_with_engine(&mut engine, &path)
 }
 
 pub fn send_request(req: &Request) -> Result<Response, EngineError> {
@@ -491,5 +509,99 @@ mod tests {
             result.is_err(),
             "I/O error must propagate out of serve_connection"
         );
+    }
+
+    // ── Integration test: shutdown breaks accept loop ─────────────────────────
+
+    /// Fix #1 integration test: send `{"cmd":"shutdown"}` to a real Unix socket
+    /// backed by a MockRunner engine. The daemon thread must exit promptly (no
+    /// blocking accept()) and the socket file must be removed.
+    ///
+    /// This is the test that would have caught the original hang.
+    #[test]
+    fn shutdown_breaks_accept_loop_and_removes_socket() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        // Unique socket path per test run to avoid collisions.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let sock_path = std::env::temp_dir().join(format!(
+            "asm_shutdown_test_{}_{}.sock",
+            std::process::id(),
+            nanos
+        ));
+
+        // Use a temp ASM_CONFIG_HOME so save_config doesn't touch real files.
+        let tmp_cfg =
+            std::env::temp_dir().join(format!("asm_shutdown_cfg_{}_{}", std::process::id(), nanos));
+
+        // Build a MockRunner-backed engine with sinks all reported as present
+        // so reconcile-on-start spawns nothing real.
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        // Reconcile up-front (mimics what run_daemon does before the loop).
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+        if let Err(e) = engine.reconcile() {
+            eprintln!("pre-reconcile warning (test): {e}");
+        }
+        std::env::remove_var("ASM_CONFIG_HOME");
+
+        let sock_path_clone = sock_path.clone();
+
+        // Spawn daemon loop on a background thread.
+        let handle =
+            std::thread::spawn(move || run_daemon_with_engine(&mut engine, &sock_path_clone));
+
+        // Wait briefly for the socket to appear (daemon thread must bind first).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !sock_path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not create socket within 3s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Connect and send shutdown.
+        let stream = UnixStream::connect(&sock_path).expect("connect to daemon socket");
+        let mut writer = stream.try_clone().expect("try_clone");
+        writeln!(writer, r#"{{"cmd":"shutdown"}}"#).expect("write shutdown");
+
+        // Read the response.
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read response");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse response JSON");
+        assert!(resp.ok, "shutdown response must be ok:true");
+
+        // The daemon thread must exit promptly — no blocking accept().
+        let mut joined = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if handle.is_finished() {
+                joined = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            joined,
+            "daemon thread must exit promptly after shutdown (no blocking accept hang)"
+        );
+        let result = handle.join().expect("thread panicked");
+        assert!(result.is_ok(), "run_daemon_with_engine must return Ok");
+
+        // Socket file must be removed by the daemon.
+        assert!(
+            !sock_path.exists(),
+            "socket file must be removed after shutdown"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
     }
 }
