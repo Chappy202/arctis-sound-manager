@@ -246,4 +246,56 @@ id 58, type PipeWire:Interface:Node/3
         be.remove().unwrap();
         assert_eq!(be.runner().calls.len(), 1); // only the existence check
     }
+
+    #[test]
+    fn remove_when_present_destroys_exact_node_id() {
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // sink_exists (ls Node)
+            .with_output(0, LS_WITH_SINK, "") // find_node_id (ls Node)
+            .with_output(0, "", ""); // pw-cli destroy
+        let mut be = AudioBackend::new(runner, spec());
+        be.remove().unwrap();
+        let calls = &be.runner().calls;
+        // First two calls: existence check + id lookup (both ls Node)
+        assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
+        assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"]);
+        // Third call: exact destroy argv with the id from the fixture (57)
+        assert_eq!(calls[2], vec!["pw-cli", "destroy", "57"]);
+    }
+
+    #[test]
+    fn apply_all_issues_props_set_per_band() {
+        let band0 = EqBand::new(BandKind::Peaking, 100.0, 1.0, 2.0);
+        let band1 = EqBand::new(BandKind::Peaking, 1000.0, 1.0, -3.0);
+        let band2 = EqBand::new(BandKind::Peaking, 10000.0, 1.0, 0.0);
+        let model = EqModel {
+            bands: vec![band0, band1, band2],
+        };
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // find_node_id
+            .with_output(0, "", "") // band 0 set
+            .with_output(0, "", "") // band 1 set
+            .with_output(0, "", ""); // band 2 set
+        let mut be = AudioBackend::new(runner, spec());
+        be.apply_all(&model).unwrap();
+        let calls = &be.runner().calls;
+        // First call: find_node_id ls Node
+        assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
+        // Exactly 3 band set calls follow (one per band)
+        assert_eq!(calls.len(), 4);
+        // First band argv: ["pw-cli", "s", "57", "Props", "<payload>"]
+        let expected_band0_payload =
+            "{ params = [ \"eq_band_0:Freq\" 100.0 \"eq_band_0:Q\" 1.0 \"eq_band_0:Gain\" 2.0 ] }";
+        assert_eq!(
+            calls[1],
+            vec!["pw-cli", "s", "57", "Props", expected_band0_payload,]
+        );
+        // Last band argv
+        let expected_band2_payload =
+            "{ params = [ \"eq_band_2:Freq\" 10000.0 \"eq_band_2:Q\" 1.0 \"eq_band_2:Gain\" 0.0 ] }";
+        assert_eq!(
+            calls[3],
+            vec!["pw-cli", "s", "57", "Props", expected_band2_payload,]
+        );
+    }
 }
