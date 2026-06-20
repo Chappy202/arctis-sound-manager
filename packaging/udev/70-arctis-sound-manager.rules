@@ -1,0 +1,17 @@
+# udev rules for Arctis Sound Manager — grant the logged-in user access to
+# SteelSeries HID devices over hidraw.
+#
+# Filename is intentionally prefixed "70-" so it sorts BEFORE
+# /usr/lib/udev/rules.d/73-seat-late.rules: the `uaccess` tag must be applied
+# before seat-late processing or systemd-logind will not grant the ACL, and
+# the device node stays root-only (the classic symptom of a "99-" rule).
+#
+# Vendor 0x1038 = SteelSeries ApS (matches all SteelSeries devices, supporting
+# the app's multi-device goal). uaccess grants an ACL to the active local seat.
+#
+# Install:
+#   sudo cp packaging/udev/70-arctis-sound-manager.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (then replug / power-cycle the headset to be sure the ACL is applied)
+
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1038", MODE="0660", TAG+="uaccess"
