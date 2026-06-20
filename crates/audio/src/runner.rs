@@ -107,6 +107,17 @@ impl CommandRunner for MockRunner {
     }
 }
 
+/// Forward `CommandRunner` through a mutable reference so one runner can be
+/// shared across N per-channel `AudioBackend`s without cloning (G1 reuse seam).
+impl<R: CommandRunner + ?Sized> CommandRunner for &mut R {
+    fn run(&mut self, program: &str, args: &[&str]) -> Result<CmdOutput, AudioError> {
+        (**self).run(program, args)
+    }
+    fn spawn_detached(&mut self, program: &str, args: &[&str]) -> Result<(), AudioError> {
+        (**self).spawn_detached(program, args)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +143,16 @@ mod tests {
         r.spawn_detached("pipewire", &["-c", "/tmp/foo.conf"])
             .expect("spawn_detached never errors in mock");
         assert_eq!(r.calls[0], vec!["pipewire", "-c", "/tmp/foo.conf"]);
+    }
+
+    #[test]
+    fn mut_ref_runner_forwards_and_records() {
+        let mut r = MockRunner::new().with_output(0, "ok", "");
+        {
+            let by_ref = &mut r;
+            let out = by_ref.run("pw-cli", &["ls", "Node"]).expect("forwards");
+            assert_eq!(out.stdout, "ok");
+        }
+        assert_eq!(r.calls[0], vec!["pw-cli", "ls", "Node"]);
     }
 }

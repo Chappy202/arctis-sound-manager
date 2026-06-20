@@ -102,6 +102,14 @@ impl<R: CommandRunner> AudioBackend<R> {
         Ok(())
     }
 
+    /// Force a rebuild so a changed `SinkSpec` (e.g. a new playback target) is
+    /// actually applied: tear down any existing instance, then create fresh.
+    /// This is the enforcement the old per-channel output selector lacked.
+    pub fn recreate(&mut self, eq: &EqModel) -> Result<ConfHandle, AudioError> {
+        self.remove()?;
+        self.create(eq)
+    }
+
     /// Remove the sink idempotently: no-op if absent; else destroy the node
     /// and delete the conf. (Stopping the dedicated `pipewire -c` process is
     /// owner-managed for v1 — see Task 6; LATER: track and kill the child.)
@@ -271,6 +279,31 @@ id 58, type PipeWire:Interface:Node/3
         assert_eq!(calls[3][0], "pkill");
         assert_eq!(calls[3][1], "-f");
         assert!(calls[3][2].ends_with("arctis_eq.conf"));
+    }
+
+    #[test]
+    fn recreate_tears_down_then_creates_with_new_target() {
+        // remove(): sink_exists ls (present) → find_node_id ls → destroy → pkill
+        // create(): sink_exists ls (now absent) → spawn pipewire -c
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // remove: sink_exists
+            .with_output(0, LS_WITH_SINK, "") // remove: find_node_id
+            .with_output(0, "", "") // remove: destroy
+            .with_output(0, "", "") // remove: pkill
+            .with_output(0, "id 1\n    node.name = \"x\"\n", ""); // create: sink_exists (absent)
+        let spec = SinkSpec {
+            node_name: "arctis_eq".into(),
+            description: "Arctis EQ Sink".into(),
+            playback_target: Some("alsa_output.speakers".into()),
+        };
+        let mut be = AudioBackend::new(runner, spec);
+        be.recreate(&EqModel::default_10band()).unwrap();
+        let calls = &be.runner().calls;
+        assert_eq!(calls[2], vec!["pw-cli", "destroy", "57"]);
+        // last call spawns a fresh dedicated instance
+        let last = calls.last().unwrap();
+        assert_eq!(last[0], "pipewire");
+        assert!(last[2].ends_with("arctis_eq.conf"));
     }
 
     #[test]

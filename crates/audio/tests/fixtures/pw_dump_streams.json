@@ -1,0 +1,51 @@
+[
+  {
+    "id": 73,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "application.name": "Firefox",
+        "application.process.binary": "firefox",
+        "media.class": "Stream/Output/Audio",
+        "node.name": "Firefox"
+      }
+    }
+  },
+  {
+    "id": 88,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "application.name": "Discord",
+        "application.process.binary": "Discord",
+        "media.class": "Stream/Output/Audio",
+        "node.name": "WEBRTC VoiceEngine"
+      }
+    }
+  },
+  {
+    "id": 81,
+    "type": "PipeWire:Interface:Client",
+    "info": {
+      "props": {
+        "application.name": "Spotify",
+        "application.process.binary": "spotify"
+      }
+    }
+  },
+  {
+    "id": 86,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "application.name": "Spotify",
+        "client.id": 81,
+        "media.class": "Stream/Output/Audio",
+        "media.name": "Spotify",
+        "node.name": "spotify",
+        "object.id": 86,
+        "object.serial": 137
+      }
+    }
+  }
+]
