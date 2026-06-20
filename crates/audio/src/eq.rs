@@ -23,12 +23,14 @@ impl BandKind {
 /// Engine-wide audio constants (ARCHITECTURE G3 / spec §3).
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const MAX_BANDS: usize = 10;
-pub const GAIN_MIN_DB: f32 = -12.0;
-pub const GAIN_MAX_DB: f32 = 12.0;
-pub const Q_MIN: f32 = 0.3;
-pub const Q_MAX: f32 = 10.0;
-pub const FREQ_MIN_HZ: f32 = 20.0;
-pub const FREQ_MAX_HZ: f32 = 20_000.0;
+// EQ bounds are derived from the domain's single source of truth so that the
+// audio layer and the config layer always agree on valid ranges.
+pub const GAIN_MIN_DB: f32 = arctis_domain::eq_bounds::EQ_GAIN_MIN_DB;
+pub const GAIN_MAX_DB: f32 = arctis_domain::eq_bounds::EQ_GAIN_MAX_DB;
+pub const Q_MIN: f32 = arctis_domain::eq_bounds::EQ_Q_MIN;
+pub const Q_MAX: f32 = arctis_domain::eq_bounds::EQ_Q_MAX;
+pub const FREQ_MIN_HZ: f32 = arctis_domain::eq_bounds::EQ_FREQ_MIN_HZ;
+pub const FREQ_MAX_HZ: f32 = arctis_domain::eq_bounds::EQ_FREQ_MAX_HZ;
 
 /// One parametric EQ band.
 #[derive(Debug, Clone, Copy, PartialEq)]

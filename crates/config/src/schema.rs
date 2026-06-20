@@ -1,3 +1,6 @@
+use arctis_domain::eq_bounds::{
+    EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
@@ -132,25 +135,25 @@ impl Config {
                     )));
                 }
 
-                // EQ band validation: freq must be positive, Q must be positive
+                // EQ band validation: use the same bounds as the audio engine
+                // (single source of truth from arctis-domain::eq_bounds).
                 for band in &channel.eq {
-                    if band.freq_hz <= 0.0 {
+                    if !(EQ_FREQ_MIN_HZ..=EQ_FREQ_MAX_HZ).contains(&band.freq_hz) {
                         return Err(ConfigError::Invalid(format!(
-                            "EQ band freq_hz must be positive, got {} in channel '{}'",
-                            band.freq_hz, channel.id
+                            "EQ band freq_hz {} Hz out of range {}..={} in channel '{}'",
+                            band.freq_hz, EQ_FREQ_MIN_HZ, EQ_FREQ_MAX_HZ, channel.id
                         )));
                     }
-                    if band.q <= 0.0 {
+                    if !(EQ_Q_MIN..=EQ_Q_MAX).contains(&band.q) {
                         return Err(ConfigError::Invalid(format!(
-                            "EQ band Q must be positive, got {} in channel '{}'",
-                            band.q, channel.id
+                            "EQ band Q {} out of range {}..={} in channel '{}'",
+                            band.q, EQ_Q_MIN, EQ_Q_MAX, channel.id
                         )));
                     }
-                    // gain_db typical audio range: -24 to +24 dB
-                    if band.gain_db < -24.0 || band.gain_db > 24.0 {
+                    if !(EQ_GAIN_MIN_DB..=EQ_GAIN_MAX_DB).contains(&band.gain_db) {
                         return Err(ConfigError::Invalid(format!(
-                            "EQ band gain_db must be within [-24, 24], got {} in channel '{}'",
-                            band.gain_db, channel.id
+                            "EQ band gain_db {} dB out of range {}..={} in channel '{}'",
+                            band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, channel.id
                         )));
                     }
                 }
@@ -164,6 +167,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_channel_with_band(band: EqBandConfig) -> Config {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].eq = vec![band];
+        cfg
+    }
+
+    fn band(freq_hz: f32, q: f32, gain_db: f32) -> EqBandConfig {
+        EqBandConfig {
+            kind: "peaking".to_string(),
+            freq_hz,
+            q,
+            gain_db,
+        }
+    }
 
     #[test]
     fn default_config_is_valid() {
@@ -211,5 +229,121 @@ mod tests {
         let serialized = toml::to_string(&cfg).expect("serialize to TOML");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize from TOML");
         assert_eq!(cfg, deserialized, "TOML round-trip must preserve config");
+    }
+
+    // --- EQ gain bounds ---
+
+    #[test]
+    fn eq_gain_positive_boundary_passes() {
+        // +12.0 dB is valid
+        assert!(make_channel_with_band(band(1000.0, 1.0, 12.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_gain_negative_boundary_passes() {
+        // -12.0 dB is valid
+        assert!(make_channel_with_band(band(1000.0, 1.0, -12.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_gain_just_above_max_rejected() {
+        let err = make_channel_with_band(band(1000.0, 1.0, 12.1))
+            .validate()
+            .expect_err("12.1 dB should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn eq_gain_just_below_min_rejected() {
+        let err = make_channel_with_band(band(1000.0, 1.0, -12.1))
+            .validate()
+            .expect_err("-12.1 dB should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    // --- EQ Q bounds ---
+
+    #[test]
+    fn eq_q_min_boundary_passes() {
+        assert!(make_channel_with_band(band(1000.0, 0.3, 0.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_q_max_boundary_passes() {
+        assert!(make_channel_with_band(band(1000.0, 10.0, 0.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_q_just_below_min_rejected() {
+        let err = make_channel_with_band(band(1000.0, 0.29, 0.0))
+            .validate()
+            .expect_err("Q=0.29 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn eq_q_just_above_max_rejected() {
+        let err = make_channel_with_band(band(1000.0, 10.1, 0.0))
+            .validate()
+            .expect_err("Q=10.1 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    // --- EQ freq bounds ---
+
+    #[test]
+    fn eq_freq_min_boundary_passes() {
+        assert!(make_channel_with_band(band(20.0, 1.0, 0.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_freq_max_boundary_passes() {
+        assert!(make_channel_with_band(band(20_000.0, 1.0, 0.0))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn eq_freq_just_below_min_rejected() {
+        let err = make_channel_with_band(band(19.9, 1.0, 0.0))
+            .validate()
+            .expect_err("19.9 Hz should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn eq_freq_just_above_max_rejected() {
+        let err = make_channel_with_band(band(20_000.1, 1.0, 0.0))
+            .validate()
+            .expect_err("20000.1 Hz should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
     }
 }
