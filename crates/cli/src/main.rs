@@ -1,4 +1,7 @@
-use arctis_audio::{AudioBackend, BandKind, EqBand, EqModel, RealRunner, SinkSpec};
+use arctis_audio::{
+    AppMatch, AudioBackend, BandKind, ChannelManager, ChannelSetConfig, EqBand, EqModel,
+    RealRunner, RouteRule, Router, SinkSpec,
+};
 use arctis_device::{discover, read_status, HidrawTransport, Registry};
 use arctis_domain::StatusValue;
 use clap::{Parser, Subcommand};
@@ -26,6 +29,21 @@ enum Command {
     Eq {
         #[command(subcommand)]
         action: EqAction,
+    },
+    /// Manage the full set of submix channels (Game / Chat / Media).
+    Channels {
+        #[command(subcommand)]
+        action: ChannelsAction,
+    },
+    /// Per-application routing (live + persistent).
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+    },
+    /// Per-channel output device control.
+    Channel {
+        #[command(subcommand)]
+        action: ChannelCmd,
     },
 }
 
@@ -58,6 +76,54 @@ enum EqAction {
     },
     /// Show the resolved node id and confirm the sink is present.
     Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelsAction {
+    /// Create all configured channels (idempotent).
+    Up {
+        /// Hardware sink node.name every channel feeds; omit to follow default.
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Remove all configured channels (idempotent).
+    Down,
+}
+
+#[derive(Subcommand, Debug)]
+enum RouteAction {
+    /// Route an app to a channel: live move + persistent WirePlumber rule.
+    Set {
+        /// Application matcher (application.process.binary by default).
+        app: String,
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// Match application.name instead of process.binary.
+        #[arg(long)]
+        by_name: bool,
+    },
+    /// Print the persistent routing fragment.
+    List,
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelCmd {
+    /// Set a channel's output device (enforced rebuild).
+    Output {
+        #[command(subcommand)]
+        action: ChannelOutputAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ChannelOutputAction {
+    /// Retarget a channel to a hardware sink (`default` clears the pin).
+    Set {
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// Hardware sink node.name, or `default` to follow the default sink.
+        device: String,
+    },
 }
 
 const SINK_NAME: &str = "arctis_eq";
@@ -228,6 +294,118 @@ fn main() -> ExitCode {
                 },
             }
         }
+        Command::Channels { action } => {
+            let target = match &action {
+                ChannelsAction::Up { target } => target.clone(),
+                ChannelsAction::Down => None,
+            };
+            let cfg = ChannelSetConfig::default_sonar(target.as_deref());
+            let mut mgr = ChannelManager::new(RealRunner, cfg);
+            match action {
+                ChannelsAction::Up { .. } => match mgr.up(&EqModel::default_10band()) {
+                    Ok(handles) => {
+                        println!("channels up: {} sinks ready", handles.len());
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error bringing channels up: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                ChannelsAction::Down => match mgr.down() {
+                    Ok(()) => {
+                        println!("channels down");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error bringing channels down: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+            }
+        }
+        Command::Route { action } => match action {
+            RouteAction::Set {
+                app,
+                channel,
+                by_name,
+            } => {
+                let cfg = ChannelSetConfig::default_sonar(None);
+                let sink = match cfg.find(&channel) {
+                    Some(c) => c.node_name.clone(),
+                    None => {
+                        eprintln!("error: unknown channel '{channel}' (use game|chat|media)");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let matcher = if by_name {
+                    AppMatch::Name(app.clone())
+                } else {
+                    AppMatch::Binary(app.clone())
+                };
+                let mut router = Router::new(RealRunner);
+                // Live move first (instant), then persist.
+                match router.apply_live(&matcher, &sink) {
+                    Ok(id) => println!("live: moved stream {id} ({app}) → {sink}"),
+                    Err(e) => {
+                        eprintln!("warning: live move failed (is the app playing?): {e}");
+                        // Still persist the rule so it applies next launch.
+                    }
+                }
+                router.set_rule(RouteRule::new(&app, &sink));
+                match router.write_persistent() {
+                    Ok(path) => {
+                        println!("persistent: rule written to {}", path.display());
+                        println!("note: run `systemctl --user restart wireplumber` to load it now");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error writing persistent rule: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RouteAction::List => {
+                let path = arctis_audio::wireplumber_fragment_path();
+                match std::fs::read_to_string(&path) {
+                    Ok(body) => {
+                        println!("# {}", path.display());
+                        print!("{body}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(_) => {
+                        println!("no persistent routes ({} absent)", path.display());
+                        ExitCode::SUCCESS
+                    }
+                }
+            }
+        },
+        Command::Channel { action } => match action {
+            ChannelCmd::Output { action } => match action {
+                ChannelOutputAction::Set { channel, device } => {
+                    let cfg = ChannelSetConfig::default_sonar(None);
+                    let mut mgr = ChannelManager::new(RealRunner, cfg);
+                    let dev = if device == "default" {
+                        None
+                    } else {
+                        Some(device.clone())
+                    };
+                    match mgr.set_output(&channel, dev, &EqModel::default_10band()) {
+                        Ok(h) => {
+                            println!(
+                                "channel '{channel}' output set to {device} (conf {})",
+                                h.conf_path.display()
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Err(e) => {
+                            eprintln!("error setting channel output: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+            },
+        },
     }
 }
 
@@ -386,5 +564,89 @@ mod tests {
             Ok(super::BandKind::HighShelf)
         ));
         assert!(super::band_kind("unknown").is_err());
+    }
+
+    #[test]
+    fn channels_up_with_target() {
+        let cmd = parse(&["channels", "up", "--target", "alsa_output.arctis"])
+            .expect("channels up --target should parse");
+        match cmd {
+            super::Command::Channels {
+                action: super::ChannelsAction::Up { target: Some(t) },
+            } => assert_eq!(t, "alsa_output.arctis"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channels_down() {
+        let cmd = parse(&["channels", "down"]).expect("channels down should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Channels {
+                action: super::ChannelsAction::Down
+            }
+        ));
+    }
+
+    #[test]
+    fn route_set_binary_default() {
+        let cmd = parse(&["route", "set", "firefox", "media"]).expect("route set should parse");
+        match cmd {
+            super::Command::Route {
+                action:
+                    super::RouteAction::Set {
+                        app,
+                        channel,
+                        by_name,
+                    },
+            } => {
+                assert_eq!(app, "firefox");
+                assert_eq!(channel, "media");
+                assert!(!by_name);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_set_by_name() {
+        let cmd = parse(&["route", "set", "Firefox", "media", "--by-name"])
+            .expect("route set --by-name should parse");
+        match cmd {
+            super::Command::Route {
+                action: super::RouteAction::Set { by_name, .. },
+            } => assert!(by_name),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_list() {
+        let cmd = parse(&["route", "list"]).expect("route list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Route {
+                action: super::RouteAction::List
+            }
+        ));
+    }
+
+    #[test]
+    fn channel_output_set() {
+        let cmd = parse(&["channel", "output", "set", "media", "alsa_output.speakers"])
+            .expect("channel output set should parse");
+        match cmd {
+            super::Command::Channel {
+                action:
+                    super::ChannelCmd::Output {
+                        action: super::ChannelOutputAction::Set { channel, device },
+                    },
+            } => {
+                assert_eq!(channel, "media");
+                assert_eq!(device, "alsa_output.speakers");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
