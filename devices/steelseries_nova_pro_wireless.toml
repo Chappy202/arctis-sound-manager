@@ -1,0 +1,48 @@
+name = "Arctis Nova Pro Wireless"
+vendor_id = 0x1038
+product_ids = [0x12e0, 0x12e5]
+interface = 4
+report_id = 0x06
+report_length = 64
+capabilities = [
+    "battery", "sidetone", "anc", "mic_volume",
+    "inactive_time", "hardware_eq", "eq_preset", "chat_mix", "mic_led",
+]
+
+[status]
+# 0x06 0xb0 = status request. Writer prepends report_id, so request starts at 0xb0.
+request = [0xb0]
+
+[[status.fields]]
+name = "battery_charge"
+match_prefix = [0x06, 0xb0]
+offset = 6
+parser = { type = "percentage", min = 0, max = 8 }
+
+[[status.fields]]
+name = "mic_muted"
+match_prefix = [0x06, 0xb0]
+offset = 9
+parser = { type = "bool", true_value = 1 }
+
+[[status.fields]]
+name = "anc_mode"
+match_prefix = [0x07, 0xbd]
+offset = 2
+parser = { type = "enum", entries = [
+    { value = 0, label = "off" },
+    { value = 1, label = "transparency" },
+    { value = 2, label = "on" },
+] }
+
+[[status.fields]]
+name = "media_mix"
+match_prefix = [0x07, 0x45]
+offset = 2
+parser = { type = "int" }
+
+[[status.fields]]
+name = "chat_mix"
+match_prefix = [0x07, 0x45]
+offset = 3
+parser = { type = "int" }

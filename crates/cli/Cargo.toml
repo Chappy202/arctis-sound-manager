@@ -1,0 +1,14 @@
+[package]
+name = "arctis-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asm-cli"
+path = "src/main.rs"
+
+[dependencies]
+arctis-domain = { workspace = true }
+arctis-device = { workspace = true }
+clap = { workspace = true }
