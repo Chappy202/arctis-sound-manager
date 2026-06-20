@@ -1,3 +1,4 @@
+use arctis_audio::StageKind;
 use serde::{Deserialize, Serialize};
 
 /// Shared device state mutated by the DeviceWorker and read by engine::state().
@@ -28,6 +29,59 @@ pub fn render_device_fields(
         .collect()
 }
 
+/// Availability of a single mic DSP stage, as detected during the last reconcile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageAvailability {
+    pub stage: StageName,
+    /// True when the stage's plugin/builtin is present on the system.
+    pub available: bool,
+    /// True when the stage is enabled in the config (i.e. was requested).
+    pub requested: bool,
+}
+
+/// Serializable stage name (mirrors `StageKind` but Serialize/Deserialize).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageName {
+    Gain,
+    Highpass,
+    Rnnoise,
+    Compressor,
+    Gate,
+    MicEq,
+}
+
+impl From<StageKind> for StageName {
+    fn from(k: StageKind) -> Self {
+        match k {
+            StageKind::Gain => StageName::Gain,
+            StageKind::Highpass => StageName::Highpass,
+            StageKind::Rnnoise => StageName::Rnnoise,
+            StageKind::Compressor => StageName::Compressor,
+            StageKind::Gate => StageName::Gate,
+            StageKind::MicEq => StageName::MicEq,
+        }
+    }
+}
+
+/// Snapshot of one mic DSP stage: kind, enabled in config, available on system, params map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicStageSnapshot {
+    pub kind: StageName,
+    pub enabled: bool,
+    pub available: bool,
+    /// Human-readable param name → value. Populated for enabled stages; empty for disabled.
+    pub params: std::collections::BTreeMap<String, f32>,
+}
+
+/// Full mic chain snapshot returned in `EngineState`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MicSnapshot {
+    pub enabled: bool,
+    pub stages: Vec<MicStageSnapshot>,
+    pub eq_bands: Vec<EqBandSnapshot>,
+}
+
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -37,6 +91,7 @@ pub struct EngineState {
     pub routes: Vec<(String, String)>, // (app_binary, target_sink)
     pub device_present: bool,
     pub device_fields: std::collections::BTreeMap<String, String>, // best-effort, may be empty
+    pub mic: MicSnapshot,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI
@@ -83,5 +138,16 @@ pub enum Event {
     },
     DeviceState {
         fields: std::collections::BTreeMap<String, String>,
+    },
+    MicStageSet {
+        stage: StageName,
+        enabled: bool,
+    },
+    MicParamSet {
+        param: String,
+        value: f32,
+    },
+    MicEqBandSet {
+        band: usize,
     },
 }

@@ -19,7 +19,10 @@ pub const SC4M_LABEL: &str = "sc4m";
 
 /// Returns true if a LADSPA plugin .so exists and is (likely) usable.
 /// Builtin nodes are always available and never need a probe check.
-pub trait PluginProbe {
+///
+/// `Send` bound required so that `Box<dyn PluginProbe>` can be held in `Engine<R>`
+/// which the daemon spawns on a thread.
+pub trait PluginProbe: Send {
     fn ladspa_exists(&self, plugin_path: &str) -> bool;
 }
 
