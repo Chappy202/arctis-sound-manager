@@ -36,3 +36,12 @@ permission/enumeration hint instead of a bare "no device" message.
 
 **Does not block:** building the audio engine (PipeWire, independent of HID), config, and
 engine structure. Revisit during E2E hardware testing.
+
+## KI-2 — Audio backend writes filter-chain conf to a predictable /tmp path (LOW, OPEN)
+
+`AudioBackend::create` writes the filter-chain `.conf` to a predictable `/tmp/arctis_eq.<node_name>.conf`
+path. Low severity (local, non-privileged audio utility), but a local user could pre-place a symlink
+there. Follow-up: write to `~/.config/arctis-sound-manager/` or use `tempfile::NamedTempFile` with a
+stable rename. Also: the conf filename doubles the name (`arctis_eq.arctis_eq.conf`) when node_name ==
+the literal prefix — cosmetic. And `AudioError::Spawn{program:"write-conf"}` is reused for file-I/O
+errors; add a dedicated `AudioError::Io` variant in a later pass. Revisit in the engine-orchestrator plan.

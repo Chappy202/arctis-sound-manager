@@ -53,9 +53,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arctis-audio"
+version = "0.1.0"
+dependencies = [
+ "arctis-domain",
+ "thiserror",
+]
+
+[[package]]
 name = "arctis-cli"
 version = "0.1.0"
 dependencies = [
+ "arctis-audio",
  "arctis-device",
  "arctis-domain",
  "clap",
