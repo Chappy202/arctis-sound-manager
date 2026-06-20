@@ -1,6 +1,8 @@
-use crate::{children::ChildOwner, convert, error::EngineError};
-use arctis_audio::{ChannelManager, CommandRunner, EqModel, Router};
-use arctis_config::Config;
+use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
+use arctis_audio::{
+    AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, RouteRule, Router,
+};
+use arctis_config::{Config, EqBandConfig};
 
 /// A reconcile-step descriptor used for pure planning + test assertions before any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,7 @@ pub struct Engine<R: CommandRunner> {
     runner: R,
     config: Config,
     children: ChildOwner,
+    event_sink: Option<std::sync::mpsc::Sender<Event>>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -68,11 +71,186 @@ impl<R: CommandRunner> Engine<R> {
             runner,
             config,
             children: ChildOwner::new(),
+            event_sink: None,
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Set the engine's event sink. Events are pushed here (daemon owns the Receiver).
+    pub fn set_event_sink(&mut self, tx: std::sync::mpsc::Sender<Event>) {
+        self.event_sink = Some(tx);
+    }
+
+    /// Emit an event on the optional sink (ignores send errors).
+    fn emit(&self, event: Event) {
+        if let Some(tx) = &self.event_sink {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Return a flat UI-agnostic snapshot of the current engine state.
+    pub fn state(&self) -> crate::state::EngineState {
+        use crate::state::{ChannelSnapshot, EngineState};
+        let active = self.config.active().ok();
+        let channels = active
+            .map(|p| {
+                p.channels
+                    .iter()
+                    .map(|ch| ChannelSnapshot {
+                        id: ch.id.clone(),
+                        node_name: ch.node_name.clone(),
+                        output_device: ch.output_device.clone(),
+                        eq_bands: ch.eq.len(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let routes = active
+            .map(|p| {
+                p.routes
+                    .iter()
+                    .map(|r| (r.app_binary.clone(), r.target_sink.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        EngineState {
+            active_profile: self.config.active_profile.clone(),
+            profiles: self.config.profile_names(),
+            channels,
+            routes,
+            device_present: false,
+            device_fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Switch active profile in config, persist, then reconcile the graph to it.
+    pub fn switch_profile(&mut self, name: &str) -> Result<(), EngineError> {
+        // Validate first (no disk write on error)
+        self.config.switch_profile(name)?;
+        // Persist
+        self.save_config()?;
+        // Reconcile to the new profile
+        self.reconcile()?;
+        // Emit event
+        self.emit(Event::ProfileSwitched {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Mutate one EQ band in the active profile's channel, persist config, apply live via audio.
+    pub fn set_eq_band(
+        &mut self,
+        channel_id: &str,
+        band: usize,
+        cfg: EqBandConfig,
+    ) -> Result<(), EngineError> {
+        // Update in-memory config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            // Ensure there are enough bands (extend if needed)
+            while channel.eq.len() <= band {
+                channel.eq.push(EqBandConfig {
+                    kind: "peaking".to_string(),
+                    freq_hz: 1000.0,
+                    q: 1.0,
+                    gain_db: 0.0,
+                });
+            }
+            channel.eq[band] = cfg.clone();
+        }
+        // Persist
+        self.save_config()?;
+        // Apply live via AudioBackend
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let eq_band = convert::eq_band_from_cfg(&cfg)?;
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_band(band, &eq_band)?;
+            let _ = active_name; // suppress unused warning
+        }
+        // Emit event
+        self.emit(Event::EqBandSet {
+            channel_id: channel_id.to_string(),
+            band,
+        });
+        Ok(())
+    }
+
+    /// Add/upsert a route in the active profile, persist, set_rule + save_persistent + apply_live.
+    pub fn set_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
+        // Update in-memory config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            if let Some(existing) = profile
+                .routes
+                .iter_mut()
+                .find(|r| r.app_binary == app_binary)
+            {
+                existing.target_sink = target_sink.to_string();
+            } else {
+                profile.routes.push(arctis_config::RouteConfig {
+                    app_binary: app_binary.to_string(),
+                    target_sink: target_sink.to_string(),
+                });
+            }
+        }
+        // Persist unified config
+        self.save_config()?;
+        // Apply via Router (persistent fragment + best-effort live move)
+        {
+            let mut router = Router::new(&mut self.runner);
+            router.set_rule(RouteRule::new(app_binary, target_sink));
+            router.save_persistent()?;
+            // Best-effort live move (ignore error if app not running)
+            let _ = router.apply_live(&AppMatch::Binary(app_binary.to_string()), target_sink);
+        }
+        // Emit event
+        self.emit(Event::RouteSet {
+            app_binary: app_binary.to_string(),
+            target_sink: target_sink.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Persist the in-memory config via arctis_config::store::save.
+    pub fn save_config(&self) -> Result<(), EngineError> {
+        arctis_config::store::save(&self.config).map_err(EngineError::Config)
+    }
+
+    /// Best-effort device status read; never errors the caller (returns empty on failure).
+    pub fn refresh_device(&mut self) -> std::collections::BTreeMap<String, String> {
+        std::collections::BTreeMap::new()
     }
 
     /// Bring the live graph to match the active profile. Idempotent. Order:
@@ -149,6 +327,10 @@ mod tests {
     use super::*;
     use arctis_audio::MockRunner;
     use arctis_config::{ChannelConfig, Config, Profile, RouteConfig};
+
+    /// Global mutex to serialize tests that mutate process-wide env vars (HOME, ASM_CONFIG_HOME).
+    /// Tests setting those variables MUST hold this lock for their entire lifetime.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // ─────────────────────────────────────────────
     // Helpers
@@ -569,7 +751,9 @@ mod tests {
         // Phase 4: Router::save_persistent writes files — no runner calls.
 
         // Use a temp HOME so we don't touch real WirePlumber config.
-        let tmp_home = std::env::temp_dir().join(format!("asm_engine_test_{}", std::process::id()));
+        // Serialize all env-var-touching tests via mutex.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("route_frag");
         std::env::set_var("HOME", &tmp_home);
 
         let _cfg = make_config_with_output_and_route();
@@ -626,6 +810,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("HOME");
     }
 
     #[test]
@@ -738,5 +923,270 @@ mod tests {
         );
         // No kills
         assert!(engine.runner.killed.is_empty(), "no kills during reconcile");
+    }
+
+    // ─────────────────────────────────────────────
+    // TDD Step 1: Task 6 — state / switch / mutation / events
+    // ─────────────────────────────────────────────
+
+    /// Helper: create a unique temp dir (does NOT touch HOME / XDG / real FS).
+    fn unique_cfg_tmp(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        std::env::temp_dir().join(format!(
+            "asm_eng6_{tag}_{pid}_{nanos}",
+            pid = std::process::id()
+        ))
+    }
+
+    /// Queue enough MockRunner outputs to survive `reconcile()` on a 3-channel,
+    /// no-EQ, no-routes config where all sinks are already present.
+    fn queue_reconcile_present(runner: MockRunner) -> MockRunner {
+        let ls = ls_all_present();
+        let mut r = runner;
+        // Phase 1: 3 ls (all present)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+        }
+        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+            for _ in 0..10 {
+                r = r.with_output(0, "", "");
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn state_reflects_active_profile() {
+        let cfg = make_config_no_eq_no_routes();
+        let engine = Engine::new(MockRunner::new(), cfg);
+        let s = engine.state();
+        assert_eq!(s.active_profile, "default");
+        assert_eq!(s.channels.len(), 3);
+        assert!(s.profiles.contains(&"default".to_string()));
+    }
+
+    #[test]
+    fn switch_profile_persists_and_reconciles() {
+        // Seed a 2-profile config
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles.push(Profile {
+            name: "gaming".into(),
+            channels: vec![
+                ChannelConfig {
+                    id: "game".into(),
+                    node_name: "Arctis_Game".into(),
+                    description: "Game".into(),
+                    output_device: None,
+                    eq: vec![],
+                },
+                ChannelConfig {
+                    id: "chat".into(),
+                    node_name: "Arctis_Chat".into(),
+                    description: "Chat".into(),
+                    output_device: None,
+                    eq: vec![],
+                },
+                ChannelConfig {
+                    id: "media".into(),
+                    node_name: "Arctis_Media".into(),
+                    description: "Media".into(),
+                    output_device: None,
+                    eq: vec![],
+                },
+            ],
+            routes: vec![],
+        });
+
+        // Use a temp ASM_CONFIG_HOME so we don't touch real config.
+        // Serialize all env-var-touching tests via mutex.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("switch");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Queue outputs for one reconcile pass
+        let runner = queue_reconcile_present(MockRunner::new());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .switch_profile("gaming")
+            .expect("switch_profile should succeed");
+
+        // In-memory config updated
+        assert_eq!(engine.config().active_profile, "gaming");
+
+        // On-disk config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written on switch");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("active_profile = \"gaming\""),
+            "persisted config must show gaming as active"
+        );
+
+        // MockRunner saw reconcile calls (ls Node for channels up)
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c == &vec!["pw-cli", "ls", "Node"]),
+            "reconcile must issue pw-cli ls Node"
+        );
+
+        // Event received
+        let event = rx.try_recv().expect("ProfileSwitched event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::ProfileSwitched {
+                name: "gaming".to_string()
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn switch_unknown_errors_no_disk_write() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("switch_err");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let result = engine.switch_profile("nope");
+        assert!(
+            matches!(result, Err(EngineError::Config(_))),
+            "should error on unknown profile"
+        );
+        // No disk write should have happened
+        assert!(
+            !tmp.exists(),
+            "config dir must not be created on failed switch"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_eq_band_persists_and_applies_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_band");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+
+        // set_eq_band("game", 2, band) → apply_band:
+        //   apply_band calls find_node_id (1 ls) + 1 pw-cli s <id> Props
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id ls
+            .with_output(0, "", ""); // pw-cli s <id> Props
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        let band_cfg = EqBandConfig {
+            kind: "peaking".to_string(),
+            freq_hz: 1000.0,
+            q: 1.0,
+            gain_db: 3.0,
+        };
+        engine
+            .set_eq_band("game", 2, band_cfg)
+            .expect("set_eq_band should succeed");
+
+        // Config persisted to disk
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+
+        // pw-cli s <id> Props was called for band 2
+        let calls = &engine.runner.calls;
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.len() >= 4 && c[1] == "s" && c[3] == "Props"),
+            "must issue pw-cli s <id> Props for band set"
+        );
+
+        // Event received
+        let event = rx.try_recv().expect("EqBandSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::EqBandSet {
+                channel_id: "game".to_string(),
+                band: 2,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_route_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("route");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        // Also set HOME so WirePlumber fragment goes somewhere safe
+        let tmp_home = unique_cfg_tmp("route_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let cfg = make_config_no_eq_no_routes();
+
+        // set_route: Router::save_persistent (disk only, no runner calls for that)
+        //            Router::apply_live (pw-dump + pw-metadata) — but app likely absent,
+        //            so we queue pw-dump returning empty JSON array (apply_live will error
+        //            internally but that's best-effort and ignored).
+        let runner = MockRunner::new().with_output(0, "[]", ""); // pw-dump for apply_live (app not running → error ignored)
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_route("firefox", "Arctis_Media")
+            .expect("set_route should succeed");
+
+        // Unified config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("firefox"),
+            "persisted config must contain firefox route"
+        );
+
+        // MockRunner shows pw-metadata was attempted (pw-dump ran at minimum)
+        assert!(
+            engine.runner.calls.iter().any(|c| c[0] == "pw-dump"),
+            "pw-dump must be called for live move attempt"
+        );
+
+        // Event received
+        let event = rx.try_recv().expect("RouteSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::RouteSet {
+                app_binary: "firefox".to_string(),
+                target_sink: "Arctis_Media".to_string(),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
     }
 }
