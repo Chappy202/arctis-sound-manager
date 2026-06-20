@@ -11,6 +11,7 @@ import {
   buildSetEqBandArgs,
   buildSetRouteArgs,
   buildSetChannelOutputArgs,
+  buildDeviceSetArgs,
 } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,32 @@ describe("setChannelOutput return type contract", () => {
     expect(args.device).toBe("SteelSeries Arctis Nova Pro");
     // No extra keys (Tauri rejects unknown params in strict mode)
     expect(Object.keys(args).sort()).toEqual(["channel", "device"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildDeviceSetArgs
+// ---------------------------------------------------------------------------
+describe("buildDeviceSetArgs", () => {
+  it("passes control and value through unchanged", () => {
+    const args = buildDeviceSetArgs("sidetone", 2);
+    expect(args).toEqual({ control: "sidetone", value: 2 });
+  });
+
+  it("produces exactly two keys: control and value", () => {
+    const args = buildDeviceSetArgs("anc", 0);
+    expect(Object.keys(args).sort()).toEqual(["control", "value"]);
+  });
+
+  it("supports integer values in full i64 safe range", () => {
+    const args = buildDeviceSetArgs("inactive_time", 3);
+    expect(args.value).toBe(3);
+    expect(args.control).toBe("inactive_time");
+  });
+
+  it("supports value=0 (off/min)", () => {
+    const args = buildDeviceSetArgs("sidetone", 0);
+    expect(args.value).toBe(0);
   });
 });
 

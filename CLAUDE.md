@@ -22,7 +22,9 @@ core + `asm-cli` before any UI.
 ## Stack
 
 - **Rust** Cargo workspace (engine) + **Tauri v2** web UI. Audio via **PipeWire** (`pipewire-rs` on a
-  dedicated thread; `pw-metadata`/`wpctl` as subprocess for discrete actions). HID via `hidraw`.
+  dedicated thread; `pw-metadata`/`wpctl` as subprocess for discrete actions). HID via `hidraw` using
+  the `hidapi` **C backend** (`linux-static-hidraw`); the pure-Rust `linux-native` backend does NOT
+  enumerate the Nova Pro Wireless. Build deps: `libudev` (`systemd-devel`) + a C toolchain (`gcc`/`clang`).
 - Crates: `domain`, `device`, `audio`, `config`, `engine`, `cli`, (future `daemon`); `src-tauri` + `ui`.
 - Dependency rule: `tauri` only in `src-tauri`; `engine` and below are UI-agnostic. See ARCHITECTURE §2.
 

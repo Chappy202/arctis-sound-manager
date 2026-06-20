@@ -12,7 +12,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
-hidapi = { version = "2", default-features = false, features = ["linux-native"] }
+hidapi = { version = "2", default-features = false, features = ["linux-static-hidraw"] }
 arctis-domain = { path = "crates/domain" }
 arctis-device = { path = "crates/device" }
 arctis-audio = { path = "crates/audio" }

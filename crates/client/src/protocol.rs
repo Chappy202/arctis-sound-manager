@@ -36,6 +36,12 @@ pub enum Request {
     ProfileNew {
         name: String,
     },
+    /// Set a single device hardware control by name (sidetone|mic_led|anc|inactive_time|...).
+    /// Writes are gated by the enabled_writes allowlist (empty until Task 7 owner-validation).
+    DeviceSet {
+        control: String,
+        value: i64,
+    },
     Reload,
     Shutdown,
 }
@@ -289,6 +295,45 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("profile-new"), "cmd tag must be kebab-case");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task 6: DeviceSet verb ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_device_set() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"device-set","control":"sidetone","value":2}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::DeviceSet {
+                control: "sidetone".into(),
+                value: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn request_device_set_round_trips() {
+        let req = Request::DeviceSet {
+            control: "sidetone".into(),
+            value: 2,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("device-set"), "cmd tag must be kebab-case");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_device_set_negative_value_round_trips() {
+        // Verify i64 sign is preserved (some controls may use signed values in future).
+        let req = Request::DeviceSet {
+            control: "mic_volume".into(),
+            value: -1,
+        };
+        let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

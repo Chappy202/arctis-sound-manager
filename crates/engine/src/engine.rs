@@ -3,6 +3,7 @@ use arctis_audio::{
     AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, RouteRule, Router,
 };
 use arctis_config::{Config, EqBandConfig};
+use std::sync::Arc;
 
 /// A reconcile-step descriptor used for pure planning + test assertions before any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,9 @@ pub struct Engine<R: CommandRunner> {
     config: Config,
     children: ChildOwner,
     event_sink: Option<std::sync::mpsc::Sender<Event>>,
+    device: std::sync::Arc<std::sync::Mutex<crate::state::DeviceShared>>,
+    /// Sender to the DeviceWorker write-command channel. Set after the worker is spawned.
+    device_tx: Option<std::sync::mpsc::Sender<crate::device::DeviceCommand>>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -72,7 +76,49 @@ impl<R: CommandRunner> Engine<R> {
             config,
             children: ChildOwner::new(),
             event_sink: None,
+            device: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::DeviceShared::default(),
+            )),
+            device_tx: None,
         }
+    }
+
+    /// Return a clone of the Arc holding the shared device state.
+    /// The DeviceWorker (spawned externally) writes to this; engine::state() reads it.
+    pub fn device_shared(&self) -> std::sync::Arc<std::sync::Mutex<crate::state::DeviceShared>> {
+        Arc::clone(&self.device)
+    }
+
+    /// Wire up the DeviceWorker command channel so `device_set` can route writes
+    /// to the single-owner worker thread. Called after the worker is spawned.
+    pub fn set_device_tx(&mut self, tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>) {
+        self.device_tx = Some(tx);
+    }
+
+    /// Send a validated device write through the worker thread.
+    ///
+    /// Returns `Err` if:
+    /// - the worker is not running (`device_tx` is `None`),
+    /// - the channel is broken (worker thread died), or
+    /// - the write is rejected by the `enabled_writes` gate (control not yet owner-validated).
+    ///
+    /// Surfaces all failures — never swallows errors.
+    pub fn device_set(&self, name: &str, value: i64) -> Result<(), EngineError> {
+        let tx = self
+            .device_tx
+            .as_ref()
+            .ok_or_else(|| EngineError::BadRequest("device worker not running".into()))?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        tx.send(crate::device::DeviceCommand::Set {
+            name: name.to_string(),
+            value,
+            reply: reply_tx,
+        })
+        .map_err(|_| EngineError::BadRequest("device worker gone".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::BadRequest("no reply from device worker".into()))?
+            .map_err(EngineError::Device)
     }
 
     pub fn config(&self) -> &Config {
@@ -125,13 +171,14 @@ impl<R: CommandRunner> Engine<R> {
                     .collect()
             })
             .unwrap_or_default();
+        let dev = self.device.lock().map(|g| g.clone()).unwrap_or_default();
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
             channels,
             routes,
-            device_present: false,
-            device_fields: std::collections::BTreeMap::new(),
+            device_present: dev.present,
+            device_fields: dev.fields,
         }
     }
 
@@ -329,11 +376,6 @@ impl<R: CommandRunner> Engine<R> {
     /// Persist the in-memory config via arctis_config::store::save.
     pub fn save_config(&self) -> Result<(), EngineError> {
         arctis_config::store::save(&self.config).map_err(EngineError::Config)
-    }
-
-    /// Best-effort device status read; never errors the caller (returns empty on failure).
-    pub fn refresh_device(&mut self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::new()
     }
 
     /// Bring the live graph to match the active profile. Idempotent. Order:
@@ -1580,6 +1622,82 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // TDD: Task 6 — engine.device_set
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn device_set_errors_when_worker_not_wired() {
+        let cfg = make_config_no_eq_no_routes();
+        let engine = Engine::new(MockRunner::new(), cfg);
+        // device_tx is None — must return BadRequest
+        let result = engine.device_set("sidetone", 2);
+        assert!(
+            matches!(result, Err(EngineError::BadRequest(_))),
+            "must error with BadRequest when worker not running: {result:?}"
+        );
+    }
+
+    #[test]
+    fn device_set_returns_gated_error_when_control_not_enabled() {
+        // Wire a fake worker channel backed by a receiver that always replies Err (gate refused).
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<crate::device::DeviceCommand>();
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_device_tx(cmd_tx);
+
+        // Spawn a fake worker that drains commands and sends back a gate-refused error.
+        let worker = std::thread::spawn(move || {
+            while let Ok(crate::device::DeviceCommand::Set { reply, .. }) = cmd_rx.recv() {
+                let _ = reply.send(Err(
+                    "sidetone is not enabled (no validated OWNER-RUN gate)".into()
+                ));
+            }
+        });
+
+        let result = engine.device_set("sidetone", 2);
+        assert!(
+            matches!(result, Err(EngineError::Device(_))),
+            "gate-refused reply must surface as EngineError::Device: {result:?}"
+        );
+        if let Err(EngineError::Device(msg)) = result {
+            assert!(
+                msg.contains("not enabled") || msg.contains("OWNER-RUN"),
+                "error message must mention the gate: {msg}"
+            );
+        }
+
+        // Drop engine (which drops the cmd_tx) to let the worker finish.
+        drop(engine);
+        worker.join().expect("fake worker must not panic");
+    }
+
+    #[test]
+    fn device_set_returns_ok_when_worker_accepts() {
+        // Wire a fake worker channel that always replies Ok(()).
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<crate::device::DeviceCommand>();
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_device_tx(cmd_tx);
+
+        let worker = std::thread::spawn(move || {
+            while let Ok(crate::device::DeviceCommand::Set { name, value, reply }) = cmd_rx.recv() {
+                assert_eq!(name, "sidetone", "worker received correct control name");
+                assert_eq!(value, 2, "worker received correct value");
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let result = engine.device_set("sidetone", 2);
+        assert!(
+            result.is_ok(),
+            "worker-accepted write must return Ok: {result:?}"
+        );
+
+        drop(engine);
+        worker.join().expect("fake worker must not panic");
     }
 
     #[test]

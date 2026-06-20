@@ -1,4 +1,5 @@
-use crate::descriptor::{DeviceDescriptor, Parser, StatusField};
+use crate::descriptor::{DeviceDescriptor, Parser, StatusField, ValueEncoding};
+use crate::error::DeviceError;
 use crate::transport::{Transport, TransportError};
 use arctis_domain::{DeviceState, StatusValue};
 
@@ -100,10 +101,106 @@ pub fn read_status<T: Transport>(
     Ok(state)
 }
 
+/// Encode a single write command into a fully-formed, zero-padded report.
+///
+/// `value` is the wire value: for `IntRange` it is the user integer (clamped to
+/// `[min, max]`); for `Enum` it is the numeric wire byte (must match an entry).
+///
+/// SAFETY: builds exactly ONE report — `report_id + opcode + one value byte`,
+/// padded to `report_length`. No init bytes, no extra opcodes.
+pub fn encode_command(
+    desc: &DeviceDescriptor,
+    name: &str,
+    value: i64,
+) -> Result<Vec<u8>, DeviceError> {
+    let spec = desc
+        .commands
+        .get(name)
+        .ok_or_else(|| DeviceError::Unsupported(name.to_string()))?;
+
+    let wire_value: u8 = match &spec.encoding {
+        ValueEncoding::IntRange { min, max } => {
+            let min = i64::from(*min);
+            let max = i64::from(*max);
+            if value < min || value > max {
+                return Err(DeviceError::InvalidValue {
+                    cmd: name.to_string(),
+                    detail: format!("{value} out of range [{min}, {max}]"),
+                });
+            }
+            value as u8
+        }
+        ValueEncoding::Enum { entries } => {
+            let v = u8::try_from(value).map_err(|_| DeviceError::InvalidValue {
+                cmd: name.to_string(),
+                detail: format!("{value} out of byte range"),
+            })?;
+            if !entries.iter().any(|e| e.value == v) {
+                return Err(DeviceError::InvalidValue {
+                    cmd: name.to_string(),
+                    detail: format!("{v} is not a valid choice"),
+                });
+            }
+            v
+        }
+    };
+
+    let mut report = Vec::with_capacity(desc.report_length);
+    report.push(desc.report_id);
+    report.extend_from_slice(&spec.opcode);
+    report.push(wire_value);
+    if report.len() > desc.report_length {
+        return Err(DeviceError::InvalidValue {
+            cmd: name.to_string(),
+            detail: "opcode longer than report_length".into(),
+        });
+    }
+    report.resize(desc.report_length, 0);
+    Ok(report)
+}
+
+/// Build the save/commit report from `desc.save_command` (padded to report_length).
+fn encode_save(desc: &DeviceDescriptor) -> Option<Vec<u8>> {
+    let save = desc.save_command.as_ref()?;
+    let mut report = Vec::with_capacity(desc.report_length);
+    report.push(desc.report_id);
+    report.extend_from_slice(save);
+    report.resize(desc.report_length, 0);
+    Some(report)
+}
+
+/// Send exactly one command report (and at most one save report when `spec.save` is true).
+///
+/// SAFETY: only the encoded command report and the optional save report are written —
+/// never a burst. Every transport error is surfaced as [`DeviceError`].
+pub fn write_command<T: Transport>(
+    transport: &mut T,
+    desc: &DeviceDescriptor,
+    name: &str,
+    value: i64,
+) -> Result<(), DeviceError> {
+    // encode_command already validates the command name; the lookup below is a
+    // defensive fallback that returns a typed error rather than panicking.
+    let report = encode_command(desc, name, value)?;
+    transport.write_report(&report)?;
+
+    let spec = desc
+        .commands
+        .get(name)
+        .ok_or_else(|| DeviceError::Unsupported(name.to_string()))?;
+    if spec.save {
+        if let Some(save_report) = encode_save(desc) {
+            transport.write_report(&save_report)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::descriptor::parse_descriptor;
+    use crate::error::DeviceError;
     use crate::mock::MockTransport;
     use crate::registry::Registry;
     use arctis_domain::StatusValue;
@@ -349,5 +446,172 @@ mod tests {
             !state.fields.contains_key("far_field"),
             "field beyond frame length must be absent, not panicked"
         );
+    }
+
+    // ── encoder tests (Task 3) ────────────────────────────────────────────────
+
+    #[test]
+    fn encode_command_builds_padded_report_with_report_id_opcode_value() {
+        let d = nova();
+        // sidetone level 2 -> [0x06, 0x39, 0x02, 0,0,...] len 64
+        let report = encode_command(&d, "sidetone", 2).expect("encode");
+        assert_eq!(report.len(), d.report_length);
+        assert_eq!(report[0], 0x06, "report_id first");
+        assert_eq!(report[1], 0x39, "opcode");
+        assert_eq!(report[2], 0x02, "encoded value");
+        assert!(report[3..].iter().all(|&b| b == 0), "rest zero-padded");
+    }
+
+    #[test]
+    fn encode_command_int_range_rejects_out_of_range() {
+        let d = nova();
+        // mic_volume range 1..10; request 11 (above max) -> error, no bytes sent
+        let err = encode_command(&d, "mic_volume", 11).unwrap_err();
+        assert!(
+            matches!(err, DeviceError::InvalidValue { .. }),
+            "above-max must return InvalidValue, got {err:?}"
+        );
+
+        // mic_volume range 1..10; request 0 (below min) -> error
+        let err = encode_command(&d, "mic_volume", 0).unwrap_err();
+        assert!(
+            matches!(err, DeviceError::InvalidValue { .. }),
+            "below-min must return InvalidValue, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_command_out_of_range_writes_no_bytes() {
+        let d = nova();
+        let mut t = MockTransport::new();
+        // mic_volume range 1..10; request 11 -> must error and write nothing
+        let err = write_command(&mut t, &d, "mic_volume", 11).unwrap_err();
+        assert!(matches!(err, DeviceError::InvalidValue { .. }));
+        assert!(
+            t.written.is_empty(),
+            "no bytes must be written for out-of-range value"
+        );
+    }
+
+    #[test]
+    fn encode_command_int_range_in_range_succeeds() {
+        let d = nova();
+        // sidetone max is 3; value 3 (at boundary) -> succeeds
+        let report = encode_command(&d, "sidetone", 3).expect("encode");
+        assert_eq!(report[2], 3, "max boundary value must be encoded as-is");
+
+        // sidetone min is 0; value 0 -> succeeds
+        let report = encode_command(&d, "sidetone", 0).expect("encode");
+        assert_eq!(report[2], 0, "min boundary value must be encoded as-is");
+    }
+
+    #[test]
+    fn encode_command_enum_maps_wire_value() {
+        let d = nova();
+        // anc enum: value 1 == transparency. encode_command takes the wire value (i64).
+        let report = encode_command(&d, "anc", 1).expect("encode");
+        assert_eq!(report[1], 0xbd);
+        assert_eq!(report[2], 1);
+    }
+
+    #[test]
+    fn encode_command_enum_unknown_wire_value_returns_error() {
+        let d = nova();
+        // anc only has values 0/1/2; 99 is unknown
+        let err = encode_command(&d, "anc", 99).unwrap_err();
+        assert!(matches!(err, DeviceError::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn encode_command_unknown_command_returns_unsupported_error() {
+        let d = nova();
+        let err = encode_command(&d, "oled", 0).unwrap_err();
+        assert!(matches!(err, DeviceError::Unsupported(_)));
+    }
+
+    #[test]
+    fn encode_command_mic_volume_int_range() {
+        let d = nova();
+        // mic_volume range 1..10; value 5 -> [0x06, 0x37, 0x05, 0,...]
+        let report = encode_command(&d, "mic_volume", 5).expect("encode");
+        assert_eq!(report.len(), 64);
+        assert_eq!(report[0], 0x06);
+        assert_eq!(report[1], 0x37, "mic_volume opcode");
+        assert_eq!(report[2], 5);
+        assert!(report[3..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encode_command_inactive_time_enum_10min() {
+        let d = nova();
+        // inactive_time enum: value 3 == "10min" -> opcode 0xc1, wire byte 3
+        let report = encode_command(&d, "inactive_time", 3).expect("encode");
+        assert_eq!(report.len(), 64);
+        assert_eq!(report[0], 0x06);
+        assert_eq!(report[1], 0xc1, "inactive_time opcode");
+        assert_eq!(report[2], 3, "10min wire value");
+        assert!(report[3..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn write_command_sends_exactly_one_report_then_save() {
+        let d = nova();
+        let mut t = MockTransport::new();
+        // sidetone has save = true -> expect 2 writes: the command, then save.
+        write_command(&mut t, &d, "sidetone", 1).expect("write");
+        assert_eq!(t.written.len(), 2, "command + save = exactly two writes");
+        assert_eq!(t.written[0][0], 0x06);
+        assert_eq!(t.written[0][1], 0x39);
+        assert_eq!(t.written[0][2], 1);
+        // save report = [0x06, 0x09, 0, ...]
+        assert_eq!(t.written[1][0], 0x06);
+        assert_eq!(t.written[1][1], 0x09);
+        assert!(t.written[1][2..].iter().all(|&b| b == 0));
+        assert_eq!(t.written[1].len(), d.report_length);
+    }
+
+    #[test]
+    fn write_command_no_save_sends_one_report() {
+        // Build a descriptor with save=false (no save_command) to prove no extra write.
+        let d = parse_descriptor(
+            r#"
+            name = "T"
+            vendor_id = 0x1038
+            product_ids = [0x12e5]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = ["sidetone"]
+
+            [status]
+            request = [0xb0]
+
+            [commands.sidetone]
+            opcode = [0x39]
+            capability = "sidetone"
+            encoding = { type = "int_range", min = 0, max = 3 }
+        "#,
+        )
+        .unwrap();
+        let mut t = MockTransport::new();
+        write_command(&mut t, &d, "sidetone", 2).unwrap();
+        assert_eq!(t.written.len(), 1, "no save -> exactly one write");
+    }
+
+    #[test]
+    fn write_command_surfaces_transport_error() {
+        // A transport that errors on write must propagate (never swallow).
+        struct FailWrite;
+        impl Transport for FailWrite {
+            fn write_report(&mut self, _d: &[u8]) -> Result<(), TransportError> {
+                Err(TransportError::Io("boom".into()))
+            }
+            fn read_report(&mut self, _b: &mut [u8], _t: i32) -> Result<usize, TransportError> {
+                Err(TransportError::Timeout)
+            }
+        }
+        let d = nova();
+        let err = write_command(&mut FailWrite, &d, "sidetone", 1).unwrap_err();
+        assert!(matches!(err, DeviceError::Transport(_)));
     }
 }
