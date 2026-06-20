@@ -11,4 +11,5 @@ path = "src/main.rs"
 [dependencies]
 arctis-domain = { workspace = true }
 arctis-device = { workspace = true }
+arctis-audio = { workspace = true }
 clap = { workspace = true }
