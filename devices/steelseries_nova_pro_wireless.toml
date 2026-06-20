@@ -8,6 +8,8 @@ capabilities = [
     "battery", "sidetone", "anc", "mic_volume",
     "inactive_time", "hardware_eq", "eq_preset", "chat_mix", "mic_led",
 ]
+# Documented save/commit opcode (HeadsetControl sendCommandWithSave).
+save_command = [0x09]
 
 [status]
 # 0x06 0xb0 = status request. Writer prepends report_id, so request starts at 0xb0.
@@ -46,9 +48,6 @@ name = "chat_mix"
 match_prefix = [0x07, 0x45]
 offset = 3
 parser = { type = "int" }
-
-# Documented save/commit opcode (HeadsetControl sendCommandWithSave).
-save_command = [0x09]
 
 # ── WRITE COMMANDS ─────────────────────────────────────────────────────────
 # Each is a SINGLE opcode. No bursts. No OLED. Capability-gated.
