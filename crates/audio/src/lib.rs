@@ -7,6 +7,7 @@ pub mod config;
 pub mod eq;
 pub mod error;
 pub mod props;
+pub mod routing;
 pub mod runner;
 
 pub use backend::{AudioBackend, ConfHandle};
@@ -18,4 +19,5 @@ pub use eq::{
 };
 pub use error::AudioError;
 pub use props::{band_props_json, set_band_props_argv};
+pub use routing::{node_rules_fragment, wireplumber_fragment_path, RouteRule};
 pub use runner::{CmdOutput, CommandRunner, MockRunner, RealRunner};
