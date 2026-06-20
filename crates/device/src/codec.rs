@@ -179,14 +179,15 @@ pub fn write_command<T: Transport>(
     name: &str,
     value: i64,
 ) -> Result<(), DeviceError> {
-    // encode_command already validates the command name; the unwrap below can never fail.
+    // encode_command already validates the command name; the lookup below is a
+    // defensive fallback that returns a typed error rather than panicking.
     let report = encode_command(desc, name, value)?;
     transport.write_report(&report)?;
 
     let spec = desc
         .commands
         .get(name)
-        .expect("already validated by encode_command");
+        .ok_or_else(|| DeviceError::Unsupported(name.to_string()))?;
     if spec.save {
         if let Some(save_report) = encode_save(desc) {
             transport.write_report(&save_report)?;

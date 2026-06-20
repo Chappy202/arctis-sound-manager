@@ -44,7 +44,8 @@ pub struct CommandSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ValueEncoding {
-    /// Clamp the integer to [min, max] and send it directly as one byte.
+    /// Validate the integer against [min, max] and send it directly as one byte.
+    /// Values outside the range are rejected with an error — no clamping occurs.
     IntRange { min: u8, max: u8 },
     /// Map a named choice to a fixed byte. Used for enums like ANC mode.
     Enum { entries: Vec<EnumEntry> },
