@@ -33,9 +33,12 @@ impl PluginProbe for FsPluginProbe {
 }
 
 /// Test probe: only reports plugins in its allow-set as present.
+/// Counts every `ladspa_exists` call so tests can assert the probe was (or was
+/// not) consulted.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct MockPluginProbe {
     pub present: std::collections::HashSet<String>,
+    call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockPluginProbe {
@@ -43,6 +46,7 @@ impl MockPluginProbe {
     pub fn none() -> Self {
         Self {
             present: Default::default(),
+            call_count: Default::default(),
         }
     }
 
@@ -50,12 +54,20 @@ impl MockPluginProbe {
     pub fn with<I: IntoIterator<Item = S>, S: Into<String>>(paths: I) -> Self {
         Self {
             present: paths.into_iter().map(|s| s.into()).collect(),
+            call_count: Default::default(),
         }
+    }
+
+    /// Total number of times `ladspa_exists` has been called on this probe.
+    pub fn calls(&self) -> usize {
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl PluginProbe for MockPluginProbe {
     fn ladspa_exists(&self, plugin_path: &str) -> bool {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.present.contains(plugin_path)
     }
 }
@@ -186,6 +198,7 @@ impl<R: CommandRunner, P: PluginProbe> MicBackend<R, P> {
     /// Remove the Clean Mic source idempotently.
     pub fn remove(&mut self) -> Result<(), AudioError> {
         if !self.source_exists()? {
+            // Best-effort stale-conf cleanup (mirrors AudioBackend::remove); ignore errors.
             let _ = std::fs::remove_file(self.conf_path());
             return Ok(());
         }
@@ -343,6 +356,8 @@ id 40, type PipeWire:Interface:Node/3
         // source_exists: absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_MIC, "");
         let probe = MockPluginProbe::none(); // probe never consulted for builtin-only
+                                             // Keep a shared ref to count probe calls before MicBackend takes ownership.
+        let probe_calls = probe.call_count.clone();
         let mut be = MicBackend::new(runner, probe, mic_spec());
         let handle = be.create(&passthrough_nodes()).unwrap();
 
@@ -358,6 +373,12 @@ id 40, type PipeWire:Interface:Node/3
         );
         // Handle carries the child token.
         assert!(handle.child.is_some());
+        // Probe must never have been consulted: passthrough chain has no LADSPA nodes.
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "probe must not be consulted for a builtin-only passthrough chain"
+        );
     }
 
     // ── Test 2: full chain with rnnoise present ──────────────────────────────
@@ -446,7 +467,7 @@ id 40, type PipeWire:Interface:Node/3
 
     #[test]
     fn availability_marks_builtin_true_ladspa_per_probe() {
-        let probe = MockPluginProbe::none(); // rnnoise NOT present
+        let probe = MockPluginProbe::none(); // no LADSPA plugins present
         let be = MicBackend::new(MockRunner::new(), probe, mic_spec());
 
         let stages = vec![
@@ -454,14 +475,18 @@ id 40, type PipeWire:Interface:Node/3
             StageKind::Highpass,
             StageKind::Rnnoise,
             StageKind::Gate,
+            StageKind::MicEq,
+            StageKind::Compressor,
         ];
         let avail = be.availability(&stages);
 
-        assert_eq!(avail.len(), 4);
-        assert_eq!(avail[0], (StageKind::Gain, true));
-        assert_eq!(avail[1], (StageKind::Highpass, true));
-        assert_eq!(avail[2], (StageKind::Rnnoise, false)); // probe says absent
-        assert_eq!(avail[3], (StageKind::Gate, true));
+        assert_eq!(avail.len(), 6);
+        assert_eq!(avail[0], (StageKind::Gain, true)); // builtin
+        assert_eq!(avail[1], (StageKind::Highpass, true)); // builtin
+        assert_eq!(avail[2], (StageKind::Rnnoise, false)); // LADSPA, probe says absent
+        assert_eq!(avail[3], (StageKind::Gate, true)); // builtin
+        assert_eq!(avail[4], (StageKind::MicEq, true)); // builtin
+        assert_eq!(avail[5], (StageKind::Compressor, false)); // LADSPA, probe says absent
     }
 
     #[test]
