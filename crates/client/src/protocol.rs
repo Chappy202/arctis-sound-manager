@@ -68,6 +68,10 @@ pub enum Request {
     MicHwMic {
         device: Option<String>,
     },
+    /// Enable or disable the whole mic chain (master switch).
+    MicEnable {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -501,6 +505,38 @@ mod tests {
         let req = Request::MicHwMic { device: None };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("mic-hw-mic"), "cmd tag must be mic-hw-mic");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task 5b: MicEnable wire-tag parse test ───────────────────────────────
+
+    #[test]
+    fn parse_mic_enable_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-enable","enabled":true}"#).unwrap();
+        assert_eq!(req, Request::MicEnable { enabled: true });
+    }
+
+    #[test]
+    fn parse_mic_enable_false_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-enable","enabled":false}"#).unwrap();
+        assert_eq!(req, Request::MicEnable { enabled: false });
+    }
+
+    #[test]
+    fn request_mic_enable_true_round_trips() {
+        let req = Request::MicEnable { enabled: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_enable_false_round_trips() {
+        let req = Request::MicEnable { enabled: false };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

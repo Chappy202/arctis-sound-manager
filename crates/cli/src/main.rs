@@ -210,6 +210,10 @@ enum DeviceAction {
 enum MicAction {
     /// Print the mic DSP chain status (enabled flag, per-stage, params, EQ bands).
     Status,
+    /// Enable the whole mic chain (master switch on).
+    On,
+    /// Disable the whole mic chain (master switch off).
+    Off,
     /// Enable a mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
     Enable {
         /// Stage name: gain|highpass|rnnoise|compressor|gate|eq
@@ -342,6 +346,8 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
     let is_status = matches!(action, MicAction::Status);
     let req = match action {
         MicAction::Status => daemon::Request::MicStatus,
+        MicAction::On => daemon::Request::MicEnable { enabled: true },
+        MicAction::Off => daemon::Request::MicEnable { enabled: false },
         MicAction::Enable { stage } => daemon::Request::MicStage {
             stage,
             enabled: true,
@@ -1373,6 +1379,28 @@ mod tests {
             cmd,
             super::Command::Mic {
                 action: super::MicAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn mic_on_parses() {
+        let cmd = parse(&["mic", "on"]).expect("mic on should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Mic {
+                action: super::MicAction::On
+            }
+        ));
+    }
+
+    #[test]
+    fn mic_off_parses() {
+        let cmd = parse(&["mic", "off"]).expect("mic off should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Mic {
+                action: super::MicAction::Off
             }
         ));
     }

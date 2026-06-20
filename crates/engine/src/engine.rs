@@ -867,6 +867,53 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Enable or disable the whole mic chain (master switch). Builds the Clean Mic
+    /// source when enabling, removes it when disabling. Persists + emits.
+    pub fn mic_set_enabled(&mut self, on: bool) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            profile.mic.enabled = on;
+        }
+        self.save_config()?;
+
+        // Apply: mirror reconcile step5 create/remove logic exactly.
+        {
+            let profile = self.config.active()?.clone();
+            if on {
+                let (nodes, availability) =
+                    convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+                self.mic_availability = availability;
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+                match mic_be.create(&nodes) {
+                    Ok(handle) => {
+                        if let Some(token) = handle.child {
+                            self.children.track(token);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: mic_set_enabled create failed (post-spawn race?): {e}");
+                    }
+                }
+            } else {
+                let (_, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+                self.mic_availability = availability;
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+                if let Err(e) = mic_be.remove() {
+                    eprintln!("warning: mic_set_enabled remove failed (ignoring): {e}");
+                }
+            }
+        }
+
+        self.emit(Event::MicEnabledSet { enabled: on });
+        Ok(())
+    }
+
     /// Set (or clear) the hardware mic capture target.
     /// Capture target change → full recreate.
     pub fn mic_set_hw_mic(&mut self, hw_mic: Option<String>) -> Result<(), EngineError> {
@@ -2573,5 +2620,178 @@ mod tests {
             !rnnoise.available,
             "rnnoise must be unavailable (probe returns false)"
         );
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 5b TDD: mic_set_enabled (master switch)
+    // ─────────────────────────────────────────────
+
+    /// Build a 3-channel config with mic master switch DISABLED (default).
+    fn make_config_mic_disabled() -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                ],
+                routes: vec![],
+                mic: arctis_config::MicChainConfig {
+                    enabled: false,
+                    hw_mic: Some("alsa_input.hw_mic".to_string()),
+                    ..Default::default()
+                },
+            }],
+        }
+    }
+
+    /// Test 5b-1: mic_set_enabled(true) from master-off spawns the mic source and persists.
+    #[test]
+    fn mic_set_enabled_true_builds_source_and_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_true");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_disabled(); // mic.enabled = false
+
+        // mic_set_enabled(true) → create():
+        //   source_exists() (1 ls, absent) → spawn
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_enabled(true)
+            .expect("mic_set_enabled(true) should succeed");
+
+        // Config persisted to disk with mic.enabled = true
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("enabled = true"),
+            "persisted config must show mic.enabled = true"
+        );
+
+        // Reload and confirm
+        let reloaded = arctis_config::store::load().expect("reload must succeed");
+        assert!(
+            reloaded
+                .active()
+                .expect("active profile must exist")
+                .mic
+                .enabled,
+            "reloaded config must show mic.enabled = true"
+        );
+
+        // Mic source was spawned
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "mic source must be spawned when enabling"
+        );
+        // One child tracked
+        assert_eq!(engine.children.len(), 1, "one mic child must be tracked");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 5b-2: mic_set_enabled(false) from master-on takes the remove path.
+    #[test]
+    fn mic_set_enabled_false_removes_source() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_false");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled(); // mic.enabled = true
+
+        // mic_set_enabled(false) → remove():
+        //   source_exists() (1 ls, absent, so no destroy needed)
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_enabled(false)
+            .expect("mic_set_enabled(false) should succeed");
+
+        // Config persisted with mic.enabled = false
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+
+        // No spawn (remove path, source already absent)
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "no spawn on disable when source already absent"
+        );
+
+        // Reload and confirm
+        let reloaded = arctis_config::store::load().expect("reload must succeed");
+        assert!(
+            !reloaded
+                .active()
+                .expect("active profile must exist")
+                .mic
+                .enabled,
+            "reloaded config must show mic.enabled = false"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 5b-3: mic_set_enabled emits Event::MicEnabledSet.
+    #[test]
+    fn mic_set_enabled_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_event");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_disabled();
+
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_enabled(true)
+            .expect("mic_set_enabled should succeed");
+
+        let event = rx.try_recv().expect("MicEnabledSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::MicEnabledSet { enabled: true },
+            "event must be MicEnabledSet {{ enabled: true }}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }

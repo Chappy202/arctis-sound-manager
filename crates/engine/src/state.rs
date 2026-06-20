@@ -167,4 +167,7 @@ pub enum Event {
     MicHwMicSet {
         hw_mic: Option<String>,
     },
+    MicEnabledSet {
+        enabled: bool,
+    },
 }
