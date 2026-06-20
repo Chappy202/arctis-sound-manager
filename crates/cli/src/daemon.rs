@@ -165,6 +165,39 @@ pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
     Ok(())
 }
 
+/// Real device opener: discovers the Nova Pro on the hidraw interface and opens it.
+struct HidOpener;
+
+impl arctis_engine::DeviceOpener for HidOpener {
+    type T = arctis_device::HidrawTransport;
+    fn open(
+        &self,
+    ) -> Result<
+        Option<(arctis_device::DeviceController<Self::T>, Vec<String>)>,
+        arctis_device::DeviceError,
+    > {
+        let registry = arctis_device::Registry::builtin()
+            .map_err(|e| arctis_device::DeviceError::Unsupported(e.to_string()))?;
+        match arctis_device::discover(&registry)? {
+            Some((id, iface)) => {
+                let desc = registry
+                    .find(id)
+                    .ok_or(arctis_device::DeviceError::NotConnected)?
+                    .clone();
+                let transport = arctis_device::HidrawTransport::open(id, iface)?;
+                // SAFETY GATE: enabled_writes starts EMPTY. OWNER-RUN tasks (Task 7)
+                // add one name at a time AFTER real-HW validation. Do NOT add a name
+                // here unless its OWNER-RUN gate in this plan is signed off.
+                let enabled: Vec<String> = vec![/* filled by Task 7 gates */];
+                let controller = arctis_device::DeviceController::new(transport, desc)
+                    .with_enabled_writes(&enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                Ok(Some((controller, enabled)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 pub fn run_daemon() -> Result<(), EngineError> {
     let path = socket_path();
     if path.exists() {
@@ -177,7 +210,32 @@ pub fn run_daemon() -> Result<(), EngineError> {
         eprintln!("warning: reconcile on start failed: {e}");
     }
 
-    run_daemon_with_engine(&mut engine, &path)
+    // Spawn the DeviceWorker read-loop on a dedicated thread.
+    let device_shared = engine.device_shared();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_worker = std::sync::Arc::clone(&stop);
+    let worker_handle = std::thread::Builder::new()
+        .name("device-worker".into())
+        .spawn(move || {
+            arctis_engine::device::run_read_loop(
+                HidOpener,
+                device_shared,
+                None, // no event forwarding in daemon (events go through engine event_sink in future)
+                std::time::Duration::from_secs(2),
+                stop_worker,
+            );
+        })
+        .map_err(|e| EngineError::Ipc(format!("failed to spawn device worker: {e}")))?;
+
+    let result = run_daemon_with_engine(&mut engine, &path);
+
+    // Signal the worker to stop and join it.
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = worker_handle.join() {
+        eprintln!("daemon: device worker panicked: {:?}", e);
+    }
+
+    result
 }
 
 #[cfg(test)]

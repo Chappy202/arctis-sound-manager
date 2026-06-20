@@ -4,11 +4,13 @@
 //! into a single engine that owns the process lifecycle of PipeWire children.
 pub mod children;
 pub mod convert;
+pub mod device;
 pub mod engine;
 pub mod error;
 pub mod state;
 
 pub use children::ChildOwner;
+pub use device::DeviceOpener;
 pub use engine::Engine;
 pub use error::EngineError;
-pub use state::{ChannelSnapshot, EngineState, EqBandSnapshot, Event};
+pub use state::{ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, Event};

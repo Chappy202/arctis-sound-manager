@@ -3,6 +3,7 @@ use arctis_audio::{
     AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, RouteRule, Router,
 };
 use arctis_config::{Config, EqBandConfig};
+use std::sync::Arc;
 
 /// A reconcile-step descriptor used for pure planning + test assertions before any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +64,7 @@ pub struct Engine<R: CommandRunner> {
     config: Config,
     children: ChildOwner,
     event_sink: Option<std::sync::mpsc::Sender<Event>>,
+    device: std::sync::Arc<std::sync::Mutex<crate::state::DeviceShared>>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -72,7 +74,16 @@ impl<R: CommandRunner> Engine<R> {
             config,
             children: ChildOwner::new(),
             event_sink: None,
+            device: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::DeviceShared::default(),
+            )),
         }
+    }
+
+    /// Return a clone of the Arc holding the shared device state.
+    /// The DeviceWorker (spawned externally) writes to this; engine::state() reads it.
+    pub fn device_shared(&self) -> std::sync::Arc<std::sync::Mutex<crate::state::DeviceShared>> {
+        Arc::clone(&self.device)
     }
 
     pub fn config(&self) -> &Config {
@@ -125,13 +136,14 @@ impl<R: CommandRunner> Engine<R> {
                     .collect()
             })
             .unwrap_or_default();
+        let dev = self.device.lock().map(|g| g.clone()).unwrap_or_default();
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
             channels,
             routes,
-            device_present: false,
-            device_fields: std::collections::BTreeMap::new(),
+            device_present: dev.present,
+            device_fields: dev.fields,
         }
     }
 
@@ -329,11 +341,6 @@ impl<R: CommandRunner> Engine<R> {
     /// Persist the in-memory config via arctis_config::store::save.
     pub fn save_config(&self) -> Result<(), EngineError> {
         arctis_config::store::save(&self.config).map_err(EngineError::Config)
-    }
-
-    /// Best-effort device status read; never errors the caller (returns empty on failure).
-    pub fn refresh_device(&mut self) -> std::collections::BTreeMap<String, String> {
-        std::collections::BTreeMap::new()
     }
 
     /// Bring the live graph to match the active profile. Idempotent. Order:
