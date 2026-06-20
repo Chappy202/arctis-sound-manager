@@ -38,7 +38,27 @@ fn parse_field(field: &StatusField, frame: &[u8]) -> Option<StatusValue> {
     })
 }
 
-/// Build the status-request report, send it, read one frame, and decode it.
+/// Maximum number of response frames drained in a single [] call.
+const MAX_STATUS_FRAMES: usize = 8;
+
+/// Build the status-request report, send it, and drain up to [`MAX_STATUS_FRAMES`]
+/// response frames, merging decoded fields into a single [`DeviceState`].
+///
+/// # Partial-snapshot contract
+///
+/// The Nova Pro (and similar devices) scatter status fields across multiple
+/// frame headers (`[0x06,0xb0]`, `[0x07,0xbd]`, `[0x07,0x45]`, …).  A single
+/// request causes the device to push several frames; each frame carries only the
+/// subset of fields whose `match_prefix` matches that frame's header.
+///
+/// `read_status` reads frames until one of:
+/// - every field declared in `desc.status.fields` is present in the accumulator,
+/// - a [`TransportError::Timeout`] is returned (no more frames available), or
+/// - [`MAX_STATUS_FRAMES`] frames have been read.
+///
+/// If a non-timeout error occurs *before* any frame has been successfully
+/// decoded, that error is propagated.  If at least one frame was already merged
+/// into the accumulator, the partial state is returned instead of erring.
 pub fn read_status<T: Transport>(
     transport: &mut T,
     desc: &DeviceDescriptor,
@@ -49,9 +69,35 @@ pub fn read_status<T: Transport>(
     report.resize(desc.report_length, 0);
     transport.write_report(&report)?;
 
-    let mut buf = vec![0u8; desc.report_length];
-    let n = transport.read_report(&mut buf, 500)?;
-    Ok(decode_frame(desc, &buf[..n]))
+    let all_field_names: Vec<&str> = desc.status.fields.iter().map(|f| f.name.as_str()).collect();
+    let mut state = DeviceState::default();
+
+    for _ in 0..MAX_STATUS_FRAMES {
+        // Check if every declared field has been accumulated.
+        if all_field_names
+            .iter()
+            .all(|n| state.fields.contains_key(*n))
+        {
+            break;
+        }
+
+        let mut buf = vec![0u8; desc.report_length];
+        match transport.read_report(&mut buf, 500) {
+            Ok(n) => {
+                let frame_state = decode_frame(desc, &buf[..n]);
+                state.fields.extend(frame_state.fields);
+            }
+            Err(TransportError::Timeout) => break,
+            Err(e) => {
+                if state.fields.is_empty() {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -133,6 +179,71 @@ mod tests {
         );
     }
 
+    /// Three queued frames (one per header) must all be merged into a single DeviceState.
+    #[test]
+    fn read_status_merges_three_frames_for_nova_pro() {
+        let d = nova();
+        // Frame 1: [0x06,0xb0] -> battery_charge (8/8=100%) + mic_muted (1=true)
+        let frame1 = frame(&[0x06, 0xb0], &[(6, 8), (9, 1)]);
+        // Frame 2: [0x07,0xbd] -> anc_mode (1=transparency)
+        let frame2 = frame(&[0x07, 0xbd], &[(2, 1)]);
+        // Frame 3: [0x07,0x45] -> media_mix=42, chat_mix=7
+        let frame3 = frame(&[0x07, 0x45], &[(2, 42), (3, 7)]);
+
+        let mut t = MockTransport::new()
+            .with_response(frame1)
+            .with_response(frame2)
+            .with_response(frame3);
+
+        let state = read_status(&mut t, &d).expect("should read all three frames");
+
+        assert_eq!(
+            state.fields.get("battery_charge"),
+            Some(&StatusValue::Percentage(100)),
+            "battery_charge must be decoded from frame1"
+        );
+        assert_eq!(
+            state.fields.get("mic_muted"),
+            Some(&StatusValue::Bool(true)),
+            "mic_muted must be decoded from frame1"
+        );
+        assert_eq!(
+            state.fields.get("anc_mode"),
+            Some(&StatusValue::Enum("transparency".into())),
+            "anc_mode must be decoded from frame2"
+        );
+        assert_eq!(
+            state.fields.get("media_mix"),
+            Some(&StatusValue::Int(42)),
+            "media_mix must be decoded from frame3"
+        );
+        assert_eq!(
+            state.fields.get("chat_mix"),
+            Some(&StatusValue::Int(7)),
+            "chat_mix must be decoded from frame3"
+        );
+    }
+
+    /// A single queued frame followed by Timeout must return that frame's fields without error.
+    #[test]
+    fn read_status_returns_partial_state_on_timeout_after_first_frame() {
+        let d = nova();
+        // Only queue one frame; the next read will time out -> loop breaks cleanly.
+        let response = frame(&[0x06, 0xb0], &[(6, 4)]);
+        let mut t = MockTransport::new().with_response(response);
+
+        let state = read_status(&mut t, &d).expect("partial state must not error");
+
+        assert_eq!(
+            state.fields.get("battery_charge"),
+            Some(&StatusValue::Percentage(50)),
+            "battery_charge must be present from the single frame"
+        );
+        // Fields from other headers are absent -- that's the partial-snapshot contract.
+        assert!(!state.fields.contains_key("anc_mode"));
+        assert!(!state.fields.contains_key("media_mix"));
+    }
+
     /// A raw value below the Percentage min must clamp to 0%.
     #[test]
     fn percentage_below_min_clamps_to_zero() {
@@ -158,7 +269,7 @@ mod tests {
         )
         .expect("parse");
 
-        // raw value 1 is strictly below min=2 → must clamp to 0%
+        // raw value 1 is strictly below min=2 -> must clamp to 0%
         let f = frame(&[0x06, 0xb0], &[(3, 1)]);
         let state = decode_frame(&d, &f);
         assert_eq!(
@@ -196,7 +307,7 @@ mod tests {
         )
         .expect("parse");
 
-        // raw value 99 is not in entries → falls back to Int(99)
+        // raw value 99 is not in entries -> falls back to Int(99)
         let f = frame(&[0x06, 0xb0], &[(2, 99)]);
         let state = decode_frame(&d, &f);
         assert_eq!(
@@ -231,7 +342,7 @@ mod tests {
         )
         .expect("parse");
 
-        // Frame is only 2 bytes; field offset is 6 → should be silently skipped
+        // Frame is only 2 bytes; field offset is 6 -> should be silently skipped
         let short = vec![0xAA, 0xBB];
         let state = decode_frame(&d, &short);
         assert!(
