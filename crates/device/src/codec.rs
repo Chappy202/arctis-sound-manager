@@ -57,6 +57,7 @@ pub fn read_status<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::descriptor::parse_descriptor;
     use crate::mock::MockTransport;
     use crate::registry::Registry;
     use arctis_domain::StatusValue;
@@ -109,10 +110,18 @@ mod tests {
 
         let state = read_status(&mut t, &d).expect("should read");
 
-        // request was padded to report_length and starts with report_id + request bytes
+        // report_id must be the very first byte; request bytes follow immediately after
         assert_eq!(t.written.len(), 1);
         assert_eq!(t.written[0].len(), 64);
-        assert_eq!(&t.written[0][..2], &[0x06, 0xb0]);
+        assert_eq!(
+            t.written[0][0], d.report_id,
+            "first byte must be report_id, not a request byte"
+        );
+        assert_eq!(
+            &t.written[0][1..1 + d.status.request.len()],
+            &d.status.request[..],
+            "request bytes must follow report_id in the correct order"
+        );
         // battery 8/8 == 100%, mic muted
         assert_eq!(
             state.fields.get("battery_charge"),
@@ -121,6 +130,113 @@ mod tests {
         assert_eq!(
             state.fields.get("mic_muted"),
             Some(&StatusValue::Bool(true))
+        );
+    }
+
+    /// A raw value below the Percentage min must clamp to 0%.
+    #[test]
+    fn percentage_below_min_clamps_to_zero() {
+        let d = parse_descriptor(
+            r#"
+            name = "Test"
+            vendor_id = 0x1038
+            product_ids = [0x0001]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = []
+
+            [status]
+            request = [0xb0]
+
+            [[status.fields]]
+            name = "level"
+            match_prefix = [0x06, 0xb0]
+            offset = 3
+            parser = { type = "percentage", min = 2, max = 8 }
+        "#,
+        )
+        .expect("parse");
+
+        // raw value 1 is strictly below min=2 → must clamp to 0%
+        let f = frame(&[0x06, 0xb0], &[(3, 1)]);
+        let state = decode_frame(&d, &f);
+        assert_eq!(
+            state.fields.get("level"),
+            Some(&StatusValue::Percentage(0)),
+            "raw value below min should clamp to 0%"
+        );
+    }
+
+    /// An Enum field whose raw value is not in the entries list falls back to Int.
+    #[test]
+    fn enum_unknown_value_falls_back_to_int() {
+        let d = parse_descriptor(
+            r#"
+            name = "Test"
+            vendor_id = 0x1038
+            product_ids = [0x0002]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = []
+
+            [status]
+            request = [0xb0]
+
+            [[status.fields]]
+            name = "mode"
+            match_prefix = [0x06, 0xb0]
+            offset = 2
+            parser = { type = "enum", entries = [
+                { value = 0, label = "off" },
+                { value = 1, label = "on" },
+            ] }
+        "#,
+        )
+        .expect("parse");
+
+        // raw value 99 is not in entries → falls back to Int(99)
+        let f = frame(&[0x06, 0xb0], &[(2, 99)]);
+        let state = decode_frame(&d, &f);
+        assert_eq!(
+            state.fields.get("mode"),
+            Some(&StatusValue::Int(99)),
+            "unknown enum value should fall back to StatusValue::Int"
+        );
+    }
+
+    /// A frame shorter than a field's offset must not panic; that field is simply absent.
+    #[test]
+    fn short_frame_skips_out_of_bounds_field_without_panic() {
+        let d = parse_descriptor(
+            r#"
+            name = "Test"
+            vendor_id = 0x1038
+            product_ids = [0x0003]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = []
+
+            [status]
+            request = [0xb0]
+
+            [[status.fields]]
+            name = "far_field"
+            match_prefix = []
+            offset = 6
+            parser = { type = "int" }
+        "#,
+        )
+        .expect("parse");
+
+        // Frame is only 2 bytes; field offset is 6 → should be silently skipped
+        let short = vec![0xAA, 0xBB];
+        let state = decode_frame(&d, &short);
+        assert!(
+            !state.fields.contains_key("far_field"),
+            "field beyond frame length must be absent, not panicked"
         );
     }
 }
