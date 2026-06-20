@@ -140,6 +140,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_command_entry_with_enum_encoding() {
+        let src = r#"
+            name = "T"
+            vendor_id = 0x1038
+            product_ids = [0x12e5]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = ["inactive_time"]
+            save_command = [0x09]
+
+            [status]
+            request = [0xb0]
+
+            [commands.inactive_time]
+            opcode = [0xc1]
+            capability = "inactive_time"
+            save = true
+            encoding = { type = "enum", entries = [
+              { value = 0, label = "never" },
+              { value = 1, label = "1min" },
+              { value = 2, label = "5min" },
+              { value = 3, label = "10min" },
+              { value = 4, label = "15min" },
+              { value = 5, label = "30min" },
+              { value = 6, label = "60min" },
+            ] }
+        "#;
+        let d = parse_descriptor(src).expect("should parse");
+        let c = d
+            .commands
+            .get("inactive_time")
+            .expect("inactive_time command");
+        assert_eq!(c.opcode, vec![0xc1]);
+        assert_eq!(c.capability, Capability::InactiveTime);
+        assert!(c.save);
+        match &c.encoding {
+            ValueEncoding::Enum { entries } => {
+                assert_eq!(entries.len(), 7);
+                assert_eq!(
+                    entries[0],
+                    EnumEntry {
+                        value: 0,
+                        label: "never".to_string()
+                    }
+                );
+                assert_eq!(
+                    entries[6],
+                    EnumEntry {
+                        value: 6,
+                        label: "60min".to_string()
+                    }
+                );
+            }
+            other => panic!("expected Enum encoding, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_a_minimal_descriptor() {
         let src = r#"
             name = "Test Device"

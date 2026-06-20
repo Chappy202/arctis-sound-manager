@@ -70,7 +70,15 @@ encoding = { type = "int_range", min = 1, max = 10 }
 opcode = [0xc1]
 capability = "inactive_time"
 save = true
-encoding = { type = "int_range", min = 0, max = 6 }
+encoding = { type = "enum", entries = [
+  { value = 0, label = "never" },
+  { value = 1, label = "1min" },
+  { value = 2, label = "5min" },
+  { value = 3, label = "10min" },
+  { value = 4, label = "15min" },
+  { value = 5, label = "30min" },
+  { value = 6, label = "60min" },
+] }
 
 # Cross-check against the validated READ path ([0x07,0xbd] -> anc_mode):
 [commands.anc]                      # { 0x06, 0xbd, 0=off|1=transparency|2=on }
