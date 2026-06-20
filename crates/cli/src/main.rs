@@ -102,7 +102,7 @@ enum RouteAction {
         #[arg(long)]
         by_name: bool,
     },
-    /// Print the persistent routing fragment.
+    /// Print all persistent routing rules from routes.json.
     List,
 }
 
@@ -344,7 +344,11 @@ fn main() -> ExitCode {
                     AppMatch::Binary(app.clone())
                 };
                 let mut router = Router::new(RealRunner);
-                // Live move first (instant), then persist.
+                // Load existing rules so we never clobber them.
+                if let Err(e) = router.load_persistent() {
+                    eprintln!("warning: could not load existing routes: {e}");
+                }
+                // Live move first (best-effort — warn on failure, continue).
                 match router.apply_live(&matcher, &sink) {
                     Ok(id) => println!("live: moved stream {id} ({app}) → {sink}"),
                     Err(e) => {
@@ -352,32 +356,35 @@ fn main() -> ExitCode {
                         // Still persist the rule so it applies next launch.
                     }
                 }
+                // Upsert and persist all rules.
                 router.set_rule(RouteRule::new(&app, &sink));
-                match router.write_persistent() {
-                    Ok(path) => {
-                        println!("persistent: rule written to {}", path.display());
+                match router.save_persistent() {
+                    Ok(()) => {
+                        println!("persistent: rule saved ({app} → {sink})");
                         println!("note: run `systemctl --user restart wireplumber` to load it now");
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
-                        eprintln!("error writing persistent rule: {e}");
+                        eprintln!("error saving persistent rule: {e}");
                         ExitCode::FAILURE
                     }
                 }
             }
             RouteAction::List => {
-                let path = arctis_audio::wireplumber_fragment_path();
-                match std::fs::read_to_string(&path) {
-                    Ok(body) => {
-                        println!("# {}", path.display());
-                        print!("{body}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(_) => {
-                        println!("no persistent routes ({} absent)", path.display());
-                        ExitCode::SUCCESS
+                let mut router = Router::new(RealRunner);
+                if let Err(e) = router.load_persistent() {
+                    eprintln!("error loading routes: {e}");
+                    return ExitCode::FAILURE;
+                }
+                let rules = router.list();
+                if rules.is_empty() {
+                    println!("no persistent routes");
+                } else {
+                    for rule in rules {
+                        println!("{} → {}", rule.app_binary, rule.target_sink);
                     }
                 }
+                ExitCode::SUCCESS
             }
         },
         Command::Channel { action } => match action {

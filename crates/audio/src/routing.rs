@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::AudioError;
 
 /// One persistent routing rule: send the app's streams to a channel sink.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteRule {
     /// Matches `application.process.binary` (e.g. "firefox", "Discord").
     pub app_binary: String,
@@ -63,6 +65,23 @@ pub fn wireplumber_fragment_path() -> PathBuf {
     p.push("wireplumber.conf.d");
     p.push("90-asm-routing.conf");
     p
+}
+
+/// Compute the WirePlumber fragment path rooted at a given home dir.
+fn wireplumber_fragment_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config/wireplumber/wireplumber.conf.d/90-asm-routing.conf")
+}
+
+/// Path of the canonical routes JSON state file:
+/// `$HOME/.config/arctis-sound-manager/routes.json`.
+fn routes_state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".config/arctis-sound-manager/routes.json")
+}
+
+/// Compute the routes state path rooted at a given home dir.
+fn routes_state_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config/arctis-sound-manager/routes.json")
 }
 
 /// Which application property to match a running stream by.
@@ -212,6 +231,8 @@ use std::fs;
 pub struct Router<R: CommandRunner> {
     runner: R,
     rules: Vec<RouteRule>,
+    /// Optional home directory override for tests; `None` means read from $HOME.
+    home_override: Option<PathBuf>,
 }
 
 impl<R: CommandRunner> Router<R> {
@@ -219,11 +240,27 @@ impl<R: CommandRunner> Router<R> {
         Self {
             runner,
             rules: Vec::new(),
+            home_override: None,
         }
     }
 
     pub fn with_rules(runner: R, rules: Vec<RouteRule>) -> Self {
-        Self { runner, rules }
+        Self {
+            runner,
+            rules,
+            home_override: None,
+        }
+    }
+
+    /// Create a Router that reads/writes state under `home` instead of $HOME.
+    /// Intended for tests only.
+    #[cfg(test)]
+    pub fn with_home(runner: R, home: PathBuf) -> Self {
+        Self {
+            runner,
+            rules: Vec::new(),
+            home_override: Some(home),
+        }
     }
 
     #[cfg(test)]
@@ -233,6 +270,20 @@ impl<R: CommandRunner> Router<R> {
 
     pub fn list(&self) -> &[RouteRule] {
         &self.rules
+    }
+
+    fn effective_state_path(&self) -> PathBuf {
+        match &self.home_override {
+            Some(h) => routes_state_path_in(h),
+            None => routes_state_path(),
+        }
+    }
+
+    fn effective_fragment_path(&self) -> PathBuf {
+        match &self.home_override {
+            Some(h) => wireplumber_fragment_path_in(h),
+            None => wireplumber_fragment_path(),
+        }
     }
 
     fn check(
@@ -273,6 +324,78 @@ impl<R: CommandRunner> Router<R> {
         } else {
             self.rules.push(rule);
         }
+    }
+
+    /// Load persistent routes from `routes.json`. Absent file → empty rules (no error).
+    /// Parse failure → typed AudioError.
+    pub fn load_persistent(&mut self) -> Result<(), AudioError> {
+        let path = self.effective_state_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.rules = Vec::new();
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(AudioError::Spawn {
+                    program: format!("read {}", path.display()),
+                    source_msg: e.to_string(),
+                });
+            }
+        };
+        self.rules = serde_json::from_str(&content).map_err(|e| AudioError::Parse {
+            what: "routes.json".to_string(),
+            detail: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Save persistent routes to `routes.json` (atomic write), then regenerate
+    /// and atomically write the WirePlumber fragment from current rules.
+    pub fn save_persistent(&self) -> Result<(), AudioError> {
+        // --- Write routes.json atomically ---
+        let state_path = self.effective_state_path();
+        if let Some(dir) = state_path.parent() {
+            fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
+                program: format!("mkdir {}", dir.display()),
+                source_msg: e.to_string(),
+            })?;
+        }
+        let json = serde_json::to_string_pretty(&self.rules).map_err(|e| AudioError::Parse {
+            what: "routes.json serialization".to_string(),
+            detail: e.to_string(),
+        })?;
+        // Derive tmp path in same directory (same fs → rename is atomic).
+        let state_tmp = state_path.with_file_name(".routes.json.tmp");
+        fs::write(&state_tmp, &json).map_err(|e| AudioError::Spawn {
+            program: format!("write {}", state_tmp.display()),
+            source_msg: e.to_string(),
+        })?;
+        fs::rename(&state_tmp, &state_path).map_err(|e| AudioError::Spawn {
+            program: format!("rename {} -> {}", state_tmp.display(), state_path.display()),
+            source_msg: e.to_string(),
+        })?;
+
+        // --- Write WirePlumber fragment atomically ---
+        let frag_path = self.effective_fragment_path();
+        if let Some(dir) = frag_path.parent() {
+            fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
+                program: format!("mkdir {}", dir.display()),
+                source_msg: e.to_string(),
+            })?;
+        }
+        let body = node_rules_fragment(&self.rules);
+        let frag_tmp = frag_path.with_file_name(".90-asm-routing.conf.tmp");
+        fs::write(&frag_tmp, &body).map_err(|e| AudioError::Spawn {
+            program: format!("write {}", frag_tmp.display()),
+            source_msg: e.to_string(),
+        })?;
+        fs::rename(&frag_tmp, &frag_path).map_err(|e| AudioError::Spawn {
+            program: format!("rename {} -> {}", frag_tmp.display(), frag_path.display()),
+            source_msg: e.to_string(),
+        })?;
+
+        Ok(())
     }
 
     /// Write the persistent WirePlumber fragment to disk (creates dirs).
@@ -471,5 +594,94 @@ mod tests {
         assert!(body.contains("target.object = \"Arctis_Media\""));
         assert!(path.to_string_lossy().ends_with("90-asm-routing.conf"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Helper to create a unique temp dir for a test without touching HOME.
+    fn unique_tmp(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        std::env::temp_dir().join(format!("asm_{tag}_{pid}_{nanos}", pid = std::process::id()))
+    }
+
+    /// Verify that saving and loading preserves ALL rules across two separate Router instances.
+    #[test]
+    fn test_multi_app_persist_round_trip() {
+        let home = unique_tmp("persist");
+
+        // First router: set rule for app A and save.
+        {
+            let mut router = Router::with_home(MockRunner::new(), home.clone());
+            router.load_persistent().unwrap();
+            router.set_rule(RouteRule::new("firefox", "Arctis_Game"));
+            router.save_persistent().unwrap();
+        }
+
+        // Second router: load, add app B, save.
+        {
+            let mut router = Router::with_home(MockRunner::new(), home.clone());
+            router.load_persistent().unwrap();
+            router.set_rule(RouteRule::new("discord", "Arctis_Media"));
+            router.save_persistent().unwrap();
+        }
+
+        // Third router: load and assert BOTH rules are present.
+        {
+            let mut router = Router::with_home(MockRunner::new(), home.clone());
+            router.load_persistent().unwrap();
+            let rules = router.list();
+            assert_eq!(
+                rules.len(),
+                2,
+                "expected 2 rules, got {}: {:?}",
+                rules.len(),
+                rules
+            );
+            let has_firefox = rules
+                .iter()
+                .any(|r| r.app_binary == "firefox" && r.target_sink == "Arctis_Game");
+            let has_discord = rules
+                .iter()
+                .any(|r| r.app_binary == "discord" && r.target_sink == "Arctis_Media");
+            assert!(has_firefox, "firefox rule missing: {:?}", rules);
+            assert!(has_discord, "discord rule missing: {:?}", rules);
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// load_persistent on an absent file yields empty rules with no error.
+    #[test]
+    fn test_load_persistent_absent() {
+        let home = unique_tmp("absent");
+        let mut router = Router::with_home(MockRunner::new(), home.clone());
+        router.load_persistent().unwrap();
+        assert!(router.list().is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// After setting two rules and save_persistent, the WirePlumber fragment contains both app names.
+    #[test]
+    fn test_fragment_contains_both_apps() {
+        let home = unique_tmp("frag");
+
+        let mut router = Router::with_home(MockRunner::new(), home.clone());
+        router.set_rule(RouteRule::new("firefox", "Arctis_Game"));
+        router.set_rule(RouteRule::new("discord", "Arctis_Chat"));
+        router.save_persistent().unwrap();
+
+        let frag_path = wireplumber_fragment_path_in(&home);
+        let body = std::fs::read_to_string(&frag_path).unwrap();
+        assert!(
+            body.contains("firefox"),
+            "fragment missing 'firefox': {body}"
+        );
+        assert!(
+            body.contains("discord"),
+            "fragment missing 'discord': {body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
