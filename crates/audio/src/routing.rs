@@ -122,38 +122,86 @@ pub fn clear_stream_target_argv(stream_id: &str) -> Result<Vec<String>, AudioErr
 }
 
 /// Find the stream node id whose props match `app_match` in `pw-dump` JSON.
-/// Lightweight scan (no serde): locates the matched key/value, then reads the
-/// nearest preceding `"id":` within the same object. Verified against a canned
-/// fixture; OWNER-RUN confirms the real layout.
+///
+/// Parses the JSON array produced by `pw-dump` with `serde_json` and filters
+/// for objects that are:
+///   - `"type": "PipeWire:Interface:Node"`
+///   - `info.props.media.class` starts with `"Stream/Output/Audio"`
+///
+/// A `Client` object (which also carries `application.process.binary`) is
+/// intentionally excluded because targeting it with `pw-metadata` does not
+/// move the audio stream.
+///
+/// Matching rules:
+///   - `AppMatch::Name(v)` → `props["application.name"] == v`
+///   - `AppMatch::Binary(v)` → `props["node.name"] == v` OR
+///     `props["application.process.binary"] == v`
 pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<String, AudioError> {
-    let needle = format!("\"{}\": \"{}\"", app_match.key(), app_match.value());
-    let Some(match_pos) = pw_dump_json.find(&needle) else {
-        return Err(AudioError::Parse {
-            what: "stream id".to_string(),
-            detail: format!("no stream with {} = {}", app_match.key(), app_match.value()),
-        });
-    };
-    // Scan backwards from the match for the most recent `"id":` field.
-    let head = &pw_dump_json[..match_pos];
-    let Some(id_kw) = head.rfind("\"id\":") else {
-        return Err(AudioError::Parse {
-            what: "stream id".to_string(),
-            detail: "matched app but no preceding \"id\" field".to_string(),
-        });
-    };
-    let after = &head[id_kw + "\"id\":".len()..];
-    let digits: String = after
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    if digits.is_empty() {
-        return Err(AudioError::Parse {
-            what: "stream id".to_string(),
-            detail: "could not read numeric id".to_string(),
-        });
+    let array: serde_json::Value =
+        serde_json::from_str(pw_dump_json).map_err(|e| AudioError::Parse {
+            what: "pw-dump JSON".to_string(),
+            detail: e.to_string(),
+        })?;
+
+    let objects = array.as_array().ok_or_else(|| AudioError::Parse {
+        what: "pw-dump JSON".to_string(),
+        detail: "expected a top-level JSON array".to_string(),
+    })?;
+
+    for obj in objects {
+        // Must be a Node.
+        if obj.get("type").and_then(|v| v.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+
+        let props = match obj.get("info").and_then(|i| i.get("props")) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Must be a playback stream.
+        let media_class = match props.get("media.class").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+        if !media_class.starts_with("Stream/Output/Audio") {
+            continue;
+        }
+
+        // Match against the requested app identifier.
+        let matched = match app_match {
+            AppMatch::Name(v) => {
+                props.get("application.name").and_then(|s| s.as_str()) == Some(v.as_str())
+            }
+            AppMatch::Binary(v) => {
+                let node_name = props.get("node.name").and_then(|s| s.as_str());
+                let bin = props
+                    .get("application.process.binary")
+                    .and_then(|s| s.as_str());
+                node_name == Some(v.as_str()) || bin == Some(v.as_str())
+            }
+        };
+
+        if matched {
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| AudioError::Parse {
+                    what: "stream id".to_string(),
+                    detail: "matched node has no numeric top-level `id`".to_string(),
+                })?;
+            return Ok(id.to_string());
+        }
     }
-    Ok(digits)
+
+    Err(AudioError::Parse {
+        what: "stream id".to_string(),
+        detail: format!(
+            "no Stream/Output/Audio Node matching {} = {}",
+            app_match.key(),
+            app_match.value()
+        ),
+    })
 }
 
 use crate::runner::CommandRunner;
@@ -316,6 +364,42 @@ mod tests {
     fn parse_stream_id_absent_is_typed_error() {
         let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
         let err = parse_stream_id(dump, &AppMatch::Binary("nope".into())).unwrap_err();
+        assert!(matches!(err, AudioError::Parse { .. }));
+    }
+
+    /// Regression: the fixture contains BOTH a Client object (id 81, has
+    /// `application.process.binary: "spotify"`) AND a Node object (id 86,
+    /// `media.class: "Stream/Output/Audio"`, `node.name: "spotify"`).
+    /// The old text-scan returned 81 (the Client); the JSON parser must
+    /// return 86 (the Node) because only the Node can be targeted by
+    /// `pw-metadata`.
+    #[test]
+    fn parse_stream_id_returns_node_not_client_for_spotify_binary() {
+        let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
+        let id = parse_stream_id(dump, &AppMatch::Binary("spotify".into())).unwrap();
+        // Must be 86 (the Node), NOT 81 (the Client).
+        assert_eq!(
+            id, "86",
+            "expected Node id 86, got {id} — did we accidentally return the Client?"
+        );
+    }
+
+    #[test]
+    fn parse_stream_id_spotify_by_name_returns_node() {
+        let dump = include_str!("../tests/fixtures/pw_dump_streams.json");
+        let id = parse_stream_id(dump, &AppMatch::Name("Spotify".into())).unwrap();
+        assert_eq!(id, "86");
+    }
+
+    #[test]
+    fn parse_stream_id_malformed_json_is_parse_error() {
+        let err = parse_stream_id("not json at all", &AppMatch::Binary("x".into())).unwrap_err();
+        assert!(matches!(err, AudioError::Parse { .. }));
+    }
+
+    #[test]
+    fn parse_stream_id_empty_dump_is_parse_error() {
+        let err = parse_stream_id("", &AppMatch::Binary("x".into())).unwrap_err();
         assert!(matches!(err, AudioError::Parse { .. }));
     }
 
