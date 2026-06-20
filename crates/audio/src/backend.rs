@@ -66,8 +66,9 @@ impl<R: CommandRunner> AudioBackend<R> {
             source_msg: e.to_string(),
         })?;
         let path_str = path.to_string_lossy().into_owned();
-        let out = self.runner.run("pipewire", &["-c", &path_str])?;
-        Self::check(out, "pipewire")?;
+        // spawn_detached: pipewire -c <conf> is a long-lived process; we must
+        // not wait for it to exit (that would block create forever).
+        self.runner.spawn_detached("pipewire", &["-c", &path_str])?;
         Ok(ConfHandle { conf_path: path })
     }
 
@@ -112,6 +113,10 @@ impl<R: CommandRunner> AudioBackend<R> {
         let id = self.find_node_id()?;
         let out = self.runner.run("pw-cli", &["destroy", &id])?;
         Self::check(out, "pw-cli")?;
+        // Best-effort: stop the dedicated `pipewire -c <conf>` instance.
+        // pkill exits non-zero when nothing matches; ignore that — it's harmless.
+        let conf_path_str = self.conf_path().to_string_lossy().into_owned();
+        let _ = self.runner.run("pkill", &["-f", &conf_path_str]);
         let _ = std::fs::remove_file(self.conf_path());
         Ok(())
     }
@@ -252,7 +257,8 @@ id 58, type PipeWire:Interface:Node/3
         let runner = MockRunner::new()
             .with_output(0, LS_WITH_SINK, "") // sink_exists (ls Node)
             .with_output(0, LS_WITH_SINK, "") // find_node_id (ls Node)
-            .with_output(0, "", ""); // pw-cli destroy
+            .with_output(0, "", "") // pw-cli destroy
+            .with_output(0, "", ""); // pkill -f <conf> (best-effort)
         let mut be = AudioBackend::new(runner, spec());
         be.remove().unwrap();
         let calls = &be.runner().calls;
@@ -261,6 +267,10 @@ id 58, type PipeWire:Interface:Node/3
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"]);
         // Third call: exact destroy argv with the id from the fixture (57)
         assert_eq!(calls[2], vec!["pw-cli", "destroy", "57"]);
+        // Fourth call: best-effort pkill to stop the spawned pipewire instance
+        assert_eq!(calls[3][0], "pkill");
+        assert_eq!(calls[3][1], "-f");
+        assert!(calls[3][2].ends_with("arctis_eq.conf"));
     }
 
     #[test]
