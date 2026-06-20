@@ -1,64 +1,10 @@
 use arctis_audio::{CommandRunner, RealRunner};
 use arctis_config::{Config, EqBandConfig};
-use arctis_engine::{Engine, EngineError, EngineState};
+use arctis_engine::{Engine, EngineError};
 
-/// Path to the Unix domain socket used for IPC.
-pub fn socket_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-    base.join("arctis-sound-manager.sock")
-}
-
-#[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(tag = "cmd", rename_all = "kebab-case")]
-pub enum Request {
-    GetState,
-    SwitchProfile {
-        name: String,
-    },
-    SetEqBand {
-        channel: String,
-        band: usize,
-        kind: String,
-        freq_hz: f32,
-        q: f32,
-        gain_db: f32,
-    },
-    Route {
-        app_binary: String,
-        target_sink: String,
-    },
-    Reload,
-    Shutdown,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct Response {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<EngineState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl Response {
-    fn ok_with_state(state: EngineState) -> Self {
-        Self {
-            ok: true,
-            state: Some(state),
-            error: None,
-        }
-    }
-
-    fn err(msg: String) -> Self {
-        Self {
-            ok: false,
-            state: None,
-            error: Some(msg),
-        }
-    }
-}
+// Re-export protocol types and client from arctis-client so that `main.rs`
+// can continue to reference `daemon::Request`, `daemon::send_request`, etc.
+pub use arctis_client::{send_request, socket_path, Request, Response};
 
 pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) -> Response {
     match req {
@@ -224,25 +170,6 @@ pub fn run_daemon() -> Result<(), EngineError> {
     run_daemon_with_engine(&mut engine, &path)
 }
 
-pub fn send_request(req: &Request) -> Result<Response, EngineError> {
-    use std::io::{BufRead, BufReader, Write};
-
-    let path = socket_path();
-    let stream = std::os::unix::net::UnixStream::connect(&path)
-        .map_err(|e| EngineError::Ipc(format!("connect to {}: {}", path.display(), e)))?;
-    let req_str = serde_json::to_string(req).map_err(|e| EngineError::Ipc(e.to_string()))?;
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| EngineError::Ipc(e.to_string()))?;
-    writeln!(writer, "{req_str}").map_err(|e| EngineError::Ipc(e.to_string()))?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| EngineError::Ipc(e.to_string()))?;
-    serde_json::from_str(line.trim()).map_err(|e| EngineError::Ipc(e.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,64 +242,6 @@ mod tests {
             }
         }
         r
-    }
-
-    #[test]
-    fn parse_get_state() {
-        let req: Request = serde_json::from_str(r#"{"cmd":"get-state"}"#).unwrap();
-        assert_eq!(req, Request::GetState);
-    }
-
-    #[test]
-    fn parse_switch() {
-        let req: Request =
-            serde_json::from_str(r#"{"cmd":"switch-profile","name":"gaming"}"#).unwrap();
-        assert_eq!(
-            req,
-            Request::SwitchProfile {
-                name: "gaming".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parse_set_eq_band() {
-        let req: Request = serde_json::from_str(
-            r#"{"cmd":"set-eq-band","channel":"game","band":2,"kind":"peaking","freq_hz":1000.0,"q":1.0,"gain_db":-3.0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            req,
-            Request::SetEqBand {
-                channel: "game".into(),
-                band: 2,
-                kind: "peaking".into(),
-                freq_hz: 1000.0,
-                q: 1.0,
-                gain_db: -3.0,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_route() {
-        let req: Request = serde_json::from_str(
-            r#"{"cmd":"route","app_binary":"firefox","target_sink":"Arctis_Media"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            req,
-            Request::Route {
-                app_binary: "firefox".into(),
-                target_sink: "Arctis_Media".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_shutdown() {
-        let req: Request = serde_json::from_str(r#"{"cmd":"shutdown"}"#).unwrap();
-        assert_eq!(req, Request::Shutdown);
     }
 
     #[test]

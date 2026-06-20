@@ -68,6 +68,7 @@ name = "arctis-cli"
 version = "0.1.0"
 dependencies = [
  "arctis-audio",
+ "arctis-client",
  "arctis-config",
  "arctis-device",
  "arctis-domain",
@@ -75,6 +76,16 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "arctis-client"
+version = "0.1.0"
+dependencies = [
+ "arctis-engine",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
