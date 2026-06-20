@@ -265,25 +265,51 @@ impl<R: CommandRunner> Engine<R> {
         let channel_set = convert::channel_set_from_profile(&profile);
         let route_rules = convert::route_rules_from_profile(&profile);
 
-        // Step 1: channels up — track any freshly-spawned pipewire instances
-        {
+        // Step 1: channels up — track any freshly-spawned pipewire instances.
+        // Record which channel IDs were freshly spawned (token.is_some()) so Step 2
+        // can treat the post-spawn apply_all as non-fatal for those channels.
+        let freshly_spawned: std::collections::HashSet<String> = {
             let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
             let flat_eq = EqModel::default_10band();
             let pairs = mgr.up(&flat_eq)?;
-            for (_handle, token) in pairs {
+            let mut fresh = std::collections::HashSet::new();
+            for (i, (_handle, token)) in pairs.into_iter().enumerate() {
                 if let Some(t) = token {
+                    // Record the channel id as freshly spawned
+                    if let Some(ch) = profile.channels.get(i) {
+                        fresh.insert(ch.id.clone());
+                    }
                     self.children.track(t);
                 }
             }
-        }
+            fresh
+        };
 
-        // Step 2: per-channel EQ apply
+        // Step 2: per-channel EQ apply.
+        // For freshly-spawned channels the EQ is already baked into the filter-chain
+        // conf written at spawn time, so this live apply_all is a redundant re-apply
+        // for the initial state. A transient "node not yet registered" race (PipeWire
+        // hasn't published the node to the graph yet) must not fail daemon startup —
+        // log a warning and continue. For channels that were already present we treat
+        // the error the same way (non-fatal warn) for consistency; those are idempotent
+        // re-applies and a transient error there is equally recoverable.
         for ch in &profile.channels {
             let eq_model = convert::eq_model_for(ch)?;
             let def = convert::channel_def_from_cfg(ch);
             let spec = def.sink_spec();
             let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
-            be.apply_all(&eq_model)?;
+            if let Err(e) = be.apply_all(&eq_model) {
+                let freshness = if freshly_spawned.contains(&ch.id) {
+                    "freshly-spawned"
+                } else {
+                    "already-present"
+                };
+                eprintln!(
+                    "warning: reconcile apply_all for channel '{}' ({freshness}) failed \
+                     (EQ is conf-baked; ignoring): {e}",
+                    ch.id
+                );
+            }
         }
 
         // Step 3: per-channel output device overrides
@@ -889,6 +915,54 @@ mod tests {
             engine.children.len(),
             0,
             "children list must be empty after shutdown"
+        );
+    }
+
+    /// Regression test: post-spawn apply_all must be NON-FATAL when find_node_id fails.
+    ///
+    /// Simulates the real-PipeWire timing race: channels are freshly spawned (ls absent
+    /// in Phase 1), but in Phase 2 the node has not registered yet (ls still absent).
+    /// apply_all returns a Parse error; reconcile must return Ok (EQ is conf-baked).
+    #[test]
+    fn reconcile_ok_when_post_spawn_apply_all_node_not_yet_registered() {
+        let ls_absent = ls_all_absent();
+
+        // Phase 1: 3 ls-absent → spawn_owned per channel (tokens tracked)
+        // Phase 2: 3 ls-absent for find_node_id → apply_all errors → non-fatal warn
+        let runner = MockRunner::new()
+            // Phase 1 ls checks (absent → spawns)
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "")
+            // Phase 2: find_node_id for each channel — node absent → Parse error
+            .with_output(0, &ls_absent, "") // game
+            .with_output(0, &ls_absent, "") // chat
+            .with_output(0, &ls_absent, ""); // media
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(runner, cfg);
+
+        // Must return Ok — the Parse error from find_node_id is non-fatal
+        let result = engine.reconcile();
+        assert!(
+            result.is_ok(),
+            "reconcile must return Ok when post-spawn apply_all fails with node-not-yet-registered: {result:?}"
+        );
+
+        // 3 channels spawned
+        assert_eq!(
+            engine.runner.spawned.len(),
+            3,
+            "3 pipewire instances spawned"
+        );
+        // 3 tracked tokens
+        assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
+
+        // 6 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id; no band sets since apply_all errored)
+        assert_eq!(
+            engine.runner.calls.len(),
+            6,
+            "expected 6 run calls: 3 ls-up + 3 ls-find-node (no band sets after find fails)"
         );
     }
 
