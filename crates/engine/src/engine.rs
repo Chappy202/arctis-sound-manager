@@ -883,12 +883,11 @@ impl<R: CommandRunner> Engine<R> {
         // Apply: mirror reconcile step5 create/remove logic exactly.
         {
             let profile = self.config.active()?.clone();
+            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
             if on {
-                let (nodes, availability) =
-                    convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
-                self.mic_availability = availability;
-                let spec = convert::mic_chain_spec(&profile.mic);
-                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
                 match mic_be.create(&nodes) {
                     Ok(handle) => {
                         if let Some(token) = handle.child {
@@ -900,10 +899,6 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 }
             } else {
-                let (_, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
-                self.mic_availability = availability;
-                let spec = convert::mic_chain_spec(&profile.mic);
-                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
                 if let Err(e) = mic_be.remove() {
                     eprintln!("warning: mic_set_enabled remove failed (ignoring): {e}");
                 }
@@ -2748,6 +2743,7 @@ mod tests {
             engine.runner.spawned.is_empty(),
             "no spawn on disable when source already absent"
         );
+        assert_eq!(engine.children.len(), 0, "no child tracked on disable");
 
         // Reload and confirm
         let reloaded = arctis_config::store::load().expect("reload must succeed");
