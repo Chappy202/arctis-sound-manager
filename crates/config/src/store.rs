@@ -49,10 +49,9 @@ pub fn load_from(path: &Path) -> Result<Config, ConfigError> {
         // File absent: use defaults and import routes if present.
         let mut cfg = Config::default_config();
         let routes_path = path.parent().unwrap_or(Path::new(".")).join("routes.json");
-        if let Some(profile_name) = Some(cfg.active_profile.clone()) {
-            if let Some(profile) = cfg.profile_mut(&profile_name) {
-                import_routes_json(profile, &routes_path)?;
-            }
+        let profile_name = cfg.active_profile.clone();
+        if let Some(profile) = cfg.profile_mut(&profile_name) {
+            import_routes_json(profile, &routes_path)?;
         }
         return Ok(cfg);
     }

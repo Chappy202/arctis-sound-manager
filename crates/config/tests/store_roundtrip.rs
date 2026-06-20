@@ -34,10 +34,10 @@ fn save_then_load_roundtrips() {
 
     // The .tmp sibling must NOT remain after atomic rename.
     let p = config_path();
-    let tmp_sibling = p.with_extension("toml.tmp");
+    let tmp_sibling = std::path::PathBuf::from(format!("{}.tmp", p.display()));
     assert!(
         !tmp_sibling.exists(),
-        ".tmp sibling must be removed after rename"
+        "temp file {tmp_sibling:?} should be cleaned up after atomic rename"
     );
 
     // Round-trip: loaded config equals what we saved.
@@ -114,13 +114,16 @@ fn migrate_v0_to_v1() {
 fn atomic_write_no_partial() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let target = tmp.path().join("config.toml");
-    let tmp_sibling = target.with_extension("toml.tmp");
+    let tmp_sibling = std::path::PathBuf::from(format!("{}.tmp", target.display()));
 
     let cfg = Config::default_config();
     save_to(&target, &cfg).expect("save_to should succeed");
 
     // Temp file must be gone.
-    assert!(!tmp_sibling.exists(), ".tmp sibling must not remain");
+    assert!(
+        !tmp_sibling.exists(),
+        "temp file {tmp_sibling:?} must not remain"
+    );
 
     // Target must exist and parse correctly.
     assert!(target.exists(), "target file must exist");
