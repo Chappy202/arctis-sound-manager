@@ -70,6 +70,14 @@ export function buildSetChannelOutputArgs(
   return { channel, device };
 }
 
+/** Builds the arg object for device_set (no rename needed — both args are lowercase). */
+export function buildDeviceSetArgs(
+  control: string,
+  value: number,
+): { control: string; value: number } {
+  return { control, value };
+}
+
 // ---------------------------------------------------------------------------
 // IPC commands
 // ---------------------------------------------------------------------------
@@ -107,6 +115,14 @@ export const setEqBand = (
 /** Route an app binary to a target sink; returns updated EngineState. */
 export const setRoute = (app_binary: string, target_sink: string): Promise<EngineState> =>
   invoke<EngineState>("set_route", buildSetRouteArgs(app_binary, target_sink));
+
+/**
+ * Set a single device hardware control by name.
+ * Writes are gated by the daemon's enabled_writes allowlist (empty until Task 7 owner-validation).
+ * Returns the updated EngineState on success, or throws CommandError on gate refusal.
+ */
+export const deviceSet = (control: string, value: number): Promise<EngineState> =>
+  invoke<EngineState>("device_set", buildDeviceSetArgs(control, value));
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

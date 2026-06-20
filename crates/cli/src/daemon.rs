@@ -49,6 +49,10 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::DeviceSet { control, value } => match engine.device_set(&control, value) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::Reload => match engine.reconcile() {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
@@ -211,7 +215,10 @@ pub fn run_daemon() -> Result<(), EngineError> {
     }
 
     // Spawn the DeviceWorker read-loop on a dedicated thread.
+    // Create the write-command channel so writes are serialized through the worker.
     let device_shared = engine.device_shared();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<arctis_engine::DeviceCommand>();
+    engine.set_device_tx(cmd_tx);
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_worker = std::sync::Arc::clone(&stop);
     let worker_handle = std::thread::Builder::new()
@@ -223,6 +230,7 @@ pub fn run_daemon() -> Result<(), EngineError> {
                 None, // no event forwarding in daemon (events go through engine event_sink in future)
                 std::time::Duration::from_secs(2),
                 stop_worker,
+                Some(cmd_rx),
             );
         })
         .map_err(|e| EngineError::Ipc(format!("failed to spawn device worker: {e}")))?;
@@ -546,6 +554,95 @@ mod tests {
         );
         assert!(!resp.ok, "duplicate name must return ok:false");
         assert!(resp.error.is_some());
+    }
+
+    // ── Task 6: device-set dispatch ─────────────────────────────────────────
+
+    #[test]
+    fn handle_device_set_returns_error_when_worker_not_wired() {
+        // Engine without a device worker → device_tx is None → BadRequest.
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::DeviceSet {
+                control: "sidetone".into(),
+                value: 2,
+            },
+        );
+        assert!(!resp.ok, "device-set must fail when worker not wired");
+        assert!(
+            resp.error.is_some(),
+            "error message must be present in response"
+        );
+        let msg = resp.error.unwrap();
+        assert!(
+            msg.contains("not running") || msg.contains("device worker"),
+            "error must mention worker: {msg}"
+        );
+    }
+
+    #[test]
+    fn handle_device_set_gated_control_returns_ok_false() {
+        // Wire a fake worker that always replies with the gate-refused error.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<arctis_engine::DeviceCommand>();
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_device_tx(cmd_tx);
+
+        // Fake worker: drain commands, always reply gate refused.
+        let worker = std::thread::spawn(move || {
+            while let Ok(arctis_engine::DeviceCommand::Set { reply, .. }) = cmd_rx.recv() {
+                let _ = reply.send(Err(
+                    "sidetone is not enabled (no validated OWNER-RUN gate)".into()
+                ));
+            }
+        });
+
+        let resp = handle_request(
+            &mut engine,
+            Request::DeviceSet {
+                control: "sidetone".into(),
+                value: 2,
+            },
+        );
+        assert!(!resp.ok, "gate-refused write must return ok:false");
+        let msg = resp.error.expect("error must be present");
+        assert!(
+            msg.contains("not enabled") || msg.contains("OWNER-RUN"),
+            "error must describe the gate: {msg}"
+        );
+
+        drop(engine);
+        worker.join().expect("fake worker must not panic");
+    }
+
+    #[test]
+    fn handle_device_set_accepted_returns_ok_true_with_state() {
+        // Wire a fake worker that always replies Ok(()).
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<arctis_engine::DeviceCommand>();
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_device_tx(cmd_tx);
+
+        let worker = std::thread::spawn(move || {
+            while let Ok(arctis_engine::DeviceCommand::Set { reply, .. }) = cmd_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+
+        let resp = handle_request(
+            &mut engine,
+            Request::DeviceSet {
+                control: "sidetone".into(),
+                value: 2,
+            },
+        );
+        assert!(resp.ok, "accepted write must return ok:true");
+        assert!(resp.state.is_some(), "state must be present in response");
+
+        drop(engine);
+        worker.join().expect("fake worker must not panic");
     }
 
     // ── Integration test: shutdown breaks accept loop ─────────────────────────

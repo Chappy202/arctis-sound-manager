@@ -17,6 +17,7 @@ pub fn run() {
             commands::set_route,
             commands::set_channel_output,
             commands::profile_new,
+            commands::device_set,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

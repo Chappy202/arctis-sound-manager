@@ -95,3 +95,12 @@ pub async fn profile_new(
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::ProfileNew { name }).await
 }
+
+#[tauri::command]
+pub async fn device_set(
+    control: String,
+    value: i64,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::DeviceSet { control, value }).await
+}

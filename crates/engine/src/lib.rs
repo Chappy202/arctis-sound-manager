@@ -10,7 +10,7 @@ pub mod error;
 pub mod state;
 
 pub use children::ChildOwner;
-pub use device::DeviceOpener;
+pub use device::{DeviceCommand, DeviceOpener};
 pub use engine::Engine;
 pub use error::EngineError;
 pub use state::{ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, Event};

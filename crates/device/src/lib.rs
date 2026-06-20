@@ -8,7 +8,7 @@ pub mod mock;
 pub mod registry;
 pub mod transport;
 
-pub use codec::{decode_frame, encode_command, read_status, write_command};
+pub use codec::{decode_frame, read_status};
 pub use controller::DeviceController;
 pub use descriptor::{
     parse_descriptor, CommandSpec, DeviceDescriptor, EnumEntry, Parser, StatusField, StatusSpec,

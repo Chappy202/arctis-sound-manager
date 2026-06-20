@@ -11,13 +11,49 @@ pub trait DeviceOpener: Send + 'static {
     fn open(&self) -> OpenResult<Self::T>;
 }
 
+/// A write command sent to the device worker thread through its command channel.
+///
+/// The reply channel carries `Ok(())` on success or a stringified error.
+/// SAFETY: writes and reads happen on the same worker thread → serialized (Global Constraint).
+pub enum DeviceCommand {
+    Set {
+        name: String,
+        value: i64,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+}
+
+/// Drain all pending [`DeviceCommand`]s from `cmd_rx`, executing each against `controller`.
+///
+/// Called inside the inner read loop so writes are interleaved between status reads
+/// on the same thread — no separate mutex needed.
+fn drain_commands<T: Transport>(
+    controller: &mut DeviceController<T>,
+    cmd_rx: &std::sync::mpsc::Receiver<DeviceCommand>,
+) {
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(DeviceCommand::Set { name, value, reply }) => {
+                let result = controller.set(&name, value).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
 /// The read-loop: owns a controller and loops until `stop` is set.
+///
+/// `cmd_rx` is the write-command channel; when `None`, the loop is read-only
+/// (existing behaviour for tests and callers that don't need write support).
 pub fn run_read_loop<O: DeviceOpener>(
     opener: O,
     shared: std::sync::Arc<std::sync::Mutex<crate::DeviceShared>>,
     events: Option<std::sync::mpsc::Sender<crate::state::Event>>,
     poll: std::time::Duration,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cmd_rx: Option<std::sync::mpsc::Receiver<DeviceCommand>>,
 ) {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
@@ -25,6 +61,10 @@ pub fn run_read_loop<O: DeviceOpener>(
             Ok(Some((mut controller, _enabled))) => {
                 // Read until error/disconnect, then fall back to re-open.
                 while !stop.load(Ordering::Relaxed) {
+                    // Drain pending write commands before the next read.
+                    if let Some(rx) = &cmd_rx {
+                        drain_commands(&mut controller, rx);
+                    }
                     match controller.read() {
                         Ok(state) => {
                             let fields = crate::state::render_device_fields(&state);
@@ -154,6 +194,7 @@ mod tests {
                 Some(tx),
                 Duration::from_millis(1),
                 stop_clone,
+                None,
             );
         });
 
@@ -212,6 +253,7 @@ mod tests {
                 None,
                 Duration::from_millis(1),
                 stop_clone,
+                None,
             );
         });
 
@@ -248,6 +290,7 @@ mod tests {
                 None,
                 Duration::from_millis(1),
                 stop_clone,
+                None,
             );
         });
 
@@ -267,5 +310,133 @@ mod tests {
             !g.present,
             "device_present must be false when opener errors"
         );
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 6: DeviceCommand channel tests
+    // ─────────────────────────────────────────────
+
+    /// Helper: opener that provides a controller with `sidetone` enabled so we can
+    /// test both the gated path and the success path via the command channel.
+    struct EnabledOpener {
+        desc: arctis_device::DeviceDescriptor,
+        frame: Vec<u8>,
+        enabled_writes: Vec<String>,
+    }
+
+    impl DeviceOpener for EnabledOpener {
+        type T = MockTransport;
+        fn open(&self) -> Result<Option<(DeviceController<Self::T>, Vec<String>)>, DeviceError> {
+            let transport = MockTransport::new().with_response(self.frame.clone());
+            let names: Vec<&str> = self.enabled_writes.iter().map(|s| s.as_str()).collect();
+            let controller =
+                DeviceController::new(transport, self.desc.clone()).with_enabled_writes(&names);
+            Ok(Some((controller, self.enabled_writes.clone())))
+        }
+    }
+
+    /// send device-set for a NON-enabled control → reply must be Err (gate refused).
+    #[test]
+    fn device_command_gated_when_not_enabled() {
+        let shared = Arc::new(Mutex::new(crate::DeviceShared::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+
+        let opener = EnabledOpener {
+            desc: nova_desc(),
+            frame: battery_frame(),
+            enabled_writes: vec![], // nothing enabled
+        };
+
+        let shared_clone = Arc::clone(&shared);
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = std::thread::spawn(move || {
+            run_read_loop(
+                opener,
+                shared_clone,
+                None,
+                Duration::from_millis(5),
+                stop_clone,
+                Some(cmd_rx),
+            );
+        });
+
+        // Send a write command for a control that is NOT enabled.
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(DeviceCommand::Set {
+                name: "sidetone".into(),
+                value: 2,
+                reply: reply_tx,
+            })
+            .expect("send must succeed while worker is alive");
+
+        // The reply must arrive and be an error (gate refused).
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("reply must arrive within 3s");
+        assert!(
+            result.is_err(),
+            "non-enabled control must return Err from the worker"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("not enabled") || msg.contains("Unsupported"),
+            "error message must mention gating: {msg}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("worker must not panic");
+    }
+
+    /// send device-set for an ENABLED control → reply must be Ok(()).
+    #[test]
+    fn device_command_succeeds_when_enabled() {
+        let shared = Arc::new(Mutex::new(crate::DeviceShared::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+
+        let opener = EnabledOpener {
+            desc: nova_desc(),
+            frame: battery_frame(),
+            enabled_writes: vec!["sidetone".into()], // sidetone enabled
+        };
+
+        let shared_clone = Arc::clone(&shared);
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = std::thread::spawn(move || {
+            run_read_loop(
+                opener,
+                shared_clone,
+                None,
+                Duration::from_millis(5),
+                stop_clone,
+                Some(cmd_rx),
+            );
+        });
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(DeviceCommand::Set {
+                name: "sidetone".into(),
+                value: 2,
+                reply: reply_tx,
+            })
+            .expect("send must succeed while worker is alive");
+
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("reply must arrive within 3s");
+        assert!(
+            result.is_ok(),
+            "enabled control must return Ok from the worker, got: {result:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("worker must not panic");
     }
 }
