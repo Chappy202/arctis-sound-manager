@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# Harness scratch / worktree storage
+.claude/
+.superpowers/
