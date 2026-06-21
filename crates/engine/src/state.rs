@@ -113,6 +113,16 @@ pub struct MicSnapshot {
     pub available_suppression_backends: Vec<SuppressionBackend>,
 }
 
+/// Full surround snapshot returned in `EngineState`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SurroundSnapshot {
+    pub enabled: bool,
+    pub hrir: Option<String>,
+    pub available_hrirs: Vec<String>,
+    pub channels: Vec<String>,
+    pub hw_sink: Option<String>,
+}
+
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -123,6 +133,8 @@ pub struct EngineState {
     pub device_present: bool,
     pub device_fields: std::collections::BTreeMap<String, String>, // best-effort, may be empty
     pub mic: MicSnapshot,
+    #[serde(default)]
+    pub surround: SurroundSnapshot,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI
@@ -189,5 +201,17 @@ pub enum Event {
     },
     MicSuppressionBackendSet {
         backend: SuppressionBackend,
+    },
+    SurroundEnabledSet {
+        enabled: bool,
+    },
+    SurroundHrirSet {
+        hrir: Option<String>,
+    },
+    SurroundChannelsSet {
+        channels: Vec<String>,
+    },
+    SurroundHwSinkSet {
+        hw_sink: Option<String>,
     },
 }

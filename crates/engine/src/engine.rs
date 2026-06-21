@@ -2,7 +2,7 @@ use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
     query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
     CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
-    DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
+    SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
@@ -383,6 +383,19 @@ impl<R: CommandRunner> Engine<R> {
             MicSnapshot::default()
         };
 
+        let surround = if let Ok(p) = self.config.active() {
+            let sc = &p.surround;
+            crate::state::SurroundSnapshot {
+                enabled: sc.enabled,
+                hrir: sc.hrir.clone(),
+                available_hrirs: convert::available_hrirs(),
+                channels: sc.channels.clone(),
+                hw_sink: sc.hw_sink.clone(),
+            }
+        } else {
+            crate::state::SurroundSnapshot::default()
+        };
+
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
@@ -391,6 +404,7 @@ impl<R: CommandRunner> Engine<R> {
             device_present: dev.present,
             device_fields: dev.fields,
             mic,
+            surround,
         }
     }
 
@@ -700,6 +714,12 @@ impl<R: CommandRunner> Engine<R> {
                     eprintln!("warning: reconcile mic create failed (post-spawn race?): {e}");
                 }
             }
+        }
+
+        // Step 6: surround sink create/teardown + channel re-routing (surround channels → effect_input.arctis_surround).
+        // AFTER step 3/4 so that surround re-routing overrides any output-device set in step 3.
+        if let Err(e) = self.apply_surround(&profile) {
+            eprintln!("warning: reconcile surround step failed (ignoring): {e}");
         }
 
         Ok(())
@@ -1086,6 +1106,226 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::MicSuppressionBackendSet { backend });
         Ok(())
     }
+
+    /// Apply the surround config to the live graph:
+    /// - If disabled: remove the surround sink (idempotent; reconcile step3 restores channel routing).
+    /// - If enabled: resolve HRIR (warn+skip on error), create surround sink (track child),
+    ///   then recreate each surround channel with output = effect_input.arctis_surround.
+    ///
+    /// Idempotent; warn-and-continue on transient errors (mirrors reconcile step pattern).
+    fn apply_surround(
+        &mut self,
+        profile: &arctis_config::Profile,
+    ) -> Result<(), crate::error::EngineError> {
+        let sc = &profile.surround;
+        let spec = convert::surround_spec(sc);
+
+        if !sc.enabled {
+            // Remove surround sink (idempotent). Reconcile step3 already restores channel
+            // output devices to their configured values, so no reroute-back is needed here.
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            if let Err(e) = surround_be.remove() {
+                eprintln!("warning: apply_surround remove failed (ignoring): {e}");
+            }
+            return Ok(());
+        }
+
+        // Enabled path: resolve HRIR first.
+        let hrir_path = match convert::resolve_hrir_path(sc) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: apply_surround HRIR resolve failed (skipping surround): {e}");
+                return Ok(());
+            }
+        };
+
+        // Create surround sink (idempotent).
+        let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+        match surround_be.create(&hrir_path) {
+            Ok(handle) => {
+                if let Some(t) = handle.child {
+                    self.children.track(t);
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: apply_surround create failed (ignoring): {e}");
+            }
+        }
+
+        // Reroute the surround channels through the surround sink.
+        let surround_target = "effect_input.arctis_surround".to_string();
+        let channel_set = convert::channel_set_from_profile(profile);
+        for ch_id in &sc.channels {
+            if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                let eq_model = convert::eq_model_for(ch)?;
+                let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                match mgr.set_output(ch_id, Some(surround_target.clone()), &eq_model) {
+                    Ok(handle) => {
+                        if let Some(t) = handle.child {
+                            self.children.track(t);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: apply_surround reroute channel '{ch_id}' failed (ignoring): {e}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── Surround engine methods ──────────────────────────────────────────────────
+
+    /// Enable or disable virtual surround. When enabling, resolves HRIR first (errors if none found).
+    pub fn surround_set_enabled(&mut self, on: bool) -> Result<(), crate::error::EngineError> {
+        // When enabling, validate HRIR exists first (before mutating config).
+        if on {
+            let profile = self.config.active()?.clone();
+            convert::resolve_hrir_path(&profile.surround)?;
+        }
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.enabled = on;
+        }
+        self.save_config()?;
+        // Apply: mirror apply_surround (the same helper used by reconcile step6).
+        {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+            // When disabling, reroute surround channels back to their configured output device.
+            // (apply_surround only removes the sink; reconcile step3 handles config-driven routing,
+            //  but here we are outside reconcile so we must do it explicitly.)
+            if !on {
+                let channel_set = convert::channel_set_from_profile(&profile);
+                for ch_id in &profile.surround.channels {
+                    if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                        let eq_model = convert::eq_model_for(ch)?;
+                        let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                        match mgr.set_output(ch_id, ch.output_device.clone(), &eq_model) {
+                            Ok(handle) => {
+                                if let Some(t) = handle.child {
+                                    self.children.track(t);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: surround_set_enabled reroute-back channel '{ch_id}' failed (ignoring): {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.emit(crate::state::Event::SurroundEnabledSet { enabled: on });
+        Ok(())
+    }
+
+    /// Set the HRIR profile stem. Validates file exists, persists, recreates if enabled.
+    pub fn surround_set_hrir(&mut self, stem: String) -> Result<(), crate::error::EngineError> {
+        // Validate: update config temporarily to check path existence.
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            let old = profile.surround.hrir.clone();
+            profile.surround.hrir = Some(stem.clone());
+            // Validate the resolved path exists.
+            if let Err(e) = convert::resolve_hrir_path(&profile.surround) {
+                // Roll back mutation.
+                profile.surround.hrir = old;
+                return Err(e);
+            }
+        }
+        self.save_config()?;
+        // Recreate if enabled (HRIR change requires respawn).
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            let hrir_path = convert::resolve_hrir_path(&profile.surround)?;
+            let spec = convert::surround_spec(&profile.surround);
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            let handle = surround_be.recreate(&hrir_path)?;
+            if let Some(t) = handle.child {
+                self.children.track(t);
+            }
+        }
+        let hrir_snapshot = self.config.active()?.surround.hrir.clone();
+        self.emit(crate::state::Event::SurroundHrirSet {
+            hrir: hrir_snapshot,
+        });
+        Ok(())
+    }
+
+    /// Set the channels routed through surround. Persists, recreates routing if enabled.
+    pub fn surround_set_channels(
+        &mut self,
+        channels: Vec<String>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.channels = channels;
+        }
+        self.save_config()?;
+        // Reapply routing if enabled.
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        let channels_snapshot = self.config.active()?.surround.channels.clone();
+        self.emit(crate::state::Event::SurroundChannelsSet {
+            channels: channels_snapshot,
+        });
+        Ok(())
+    }
+
+    /// Set (or clear) the hardware sink for the surround output tail. Recreates if enabled.
+    pub fn surround_set_hw_sink(
+        &mut self,
+        hw_sink: Option<String>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.hw_sink = hw_sink;
+        }
+        self.save_config()?;
+        // Recreate the surround sink if enabled (hw_sink is baked into the conf at spawn time).
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            let hrir_path = convert::resolve_hrir_path(&profile.surround)?;
+            let spec = convert::surround_spec(&profile.surround);
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            let handle = surround_be.recreate(&hrir_path)?;
+            if let Some(t) = handle.child {
+                self.children.track(t);
+            }
+        }
+        let hw_sink_snapshot = self.config.active()?.surround.hw_sink.clone();
+        self.emit(crate::state::Event::SurroundHwSinkSet {
+            hw_sink: hw_sink_snapshot,
+        });
+        Ok(())
+    }
 }
 
 impl<R: CommandRunner> Drop for Engine<R> {
@@ -1323,6 +1563,8 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1362,8 +1604,8 @@ mod tests {
             "media eq find_node_id"
         );
 
-        // Total: 3 (up) + 3*(1+10) (apply) + 1 (mic step5 source_exists) = 37
-        assert_eq!(calls.len(), 37, "expected 37 total pw-cli calls");
+        // Total: 3 (up) + 3*(1+10) (apply) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists) = 38
+        assert_eq!(calls.len(), 38, "expected 38 total pw-cli calls");
 
         // No spawned processes (sinks already present)
         assert!(
@@ -1421,6 +1663,8 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "") // media 10 band sets
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls_absent, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1460,11 +1704,11 @@ mod tests {
             "media eq find_node_id"
         );
 
-        // Total: 3 (phase1 ls) + 3*11 (apply) + 1 (mic step5 source_exists) = 37
+        // Total: 3 (phase1 ls) + 3*11 (apply) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists) = 38
         assert_eq!(
             calls.len(),
-            37,
-            "expected 37 total run calls (no spawns in calls)"
+            38,
+            "expected 38 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 3 pipewire -c invocations (channels only)
@@ -1533,6 +1777,8 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls, "");
         // Phase 4: Router::save_persistent writes files — no runner calls.
 
@@ -1650,6 +1896,8 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls_absent, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1701,6 +1949,8 @@ mod tests {
             .with_output(0, &ls_absent, "") // chat
             .with_output(0, &ls_absent, "") // media
             // Phase 5: mic source_exists check
+            .with_output(0, &ls_absent, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls
             .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1724,11 +1974,11 @@ mod tests {
         // 3 tracked tokens
         assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
 
-        // 7 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 1 (mic step5 source_exists)
+        // 8 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists)
         assert_eq!(
             engine.runner.calls.len(),
-            7,
-            "expected 7 run calls: 3 ls-up + 3 ls-find-node + 1 mic source_exists"
+            8,
+            "expected 8 run calls: 3 ls-up + 3 ls-find-node + 1 mic source_exists + 1 surround source_exists"
         );
     }
 
@@ -1753,6 +2003,8 @@ mod tests {
                 }
             }
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls
+            runner = runner.with_output(0, &ls, "");
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls
             runner = runner.with_output(0, &ls, "");
         }
 
@@ -1808,6 +2060,8 @@ mod tests {
         }
         // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node found)
         r = r.with_output(0, &ls_no_mic, "");
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        r = r.with_output(0, &ls, "");
         r
     }
 
@@ -2501,6 +2755,8 @@ mod tests {
         }
         // Phase 5: mic enabled → create() → source_exists() (absent) → spawn
         r = r.with_output(0, &ls_mic_absent, "");
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        r = r.with_output(0, &ls, "");
         r
     }
 
@@ -3238,5 +3494,462 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: resolve_hrir_path + available_hrirs
+    // ─────────────────────────────────────────────
+
+    use crate::convert;
+
+    #[test]
+    fn resolve_hrir_path_with_named_stem_returns_abs_path() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("hrir_named");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        let wav = profiles_dir.join("00-default.wav");
+        std::fs::write(&wav, b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = arctis_config::SurroundConfig {
+            hrir: Some("00-default".into()),
+            ..Default::default()
+        };
+        let path = convert::resolve_hrir_path(&cfg).expect("should resolve named stem");
+        assert_eq!(path, wav);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_hrir_path_named_stem_missing_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("hrir_missing");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = arctis_config::SurroundConfig {
+            hrir: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        let result = convert::resolve_hrir_path(&cfg);
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_stem_picks_first_lexicographic() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("hrir_lex");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("beta.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("alpha.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = arctis_config::SurroundConfig::default(); // hrir = None
+        let path = convert::resolve_hrir_path(&cfg).expect("should pick first lexicographic");
+        assert!(
+            path.ends_with("alpha.wav"),
+            "expected alpha.wav, got {:?}",
+            path
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_stem_no_profiles_fallback_to_hrir_wav() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("hrir_fallback");
+        let base = tmp.join(".local/share/pipewire/hrir_hesuvi");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = arctis_config::SurroundConfig::default();
+        let path = convert::resolve_hrir_path(&cfg).expect("should fall back to hrir.wav");
+        assert!(
+            path.ends_with("hrir.wav"),
+            "expected hrir.wav, got {:?}",
+            path
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_hrir_at_all_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("hrir_none");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = arctis_config::SurroundConfig::default();
+        let result = convert::resolve_hrir_path(&cfg);
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn available_hrirs_returns_sorted_stems() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("avail_hrirs");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("zz-last.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("aa-first.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("mm-middle.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let hrirs = convert::available_hrirs();
+        assert_eq!(hrirs, vec!["aa-first", "mm-middle", "zz-last"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn available_hrirs_empty_when_dir_missing() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("avail_hrirs_empty");
+        // Intentionally don't create the profiles dir.
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let hrirs = convert::available_hrirs();
+        assert!(hrirs.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: reconcile step6 (surround)
+    // ─────────────────────────────────────────────
+
+    /// Build a config with surround enabled, pointing to a real temp HRIR file.
+    fn make_config_surround_enabled(hrir_stem: &str) -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                ],
+                routes: vec![],
+                mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig {
+                    enabled: true,
+                    hrir: Some(hrir_stem.into()),
+                    channels: vec!["game".into(), "media".into()],
+                    hw_sink: None,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn reconcile_step6_disabled_calls_source_exists_noop() {
+        // Surround disabled → remove() is called → source_exists() fires → 1 ls
+        // queue_reconcile_present already adds the surround step6 ls output
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = make_config_no_eq_no_routes(); // surround disabled by default
+        let mut engine = Engine::new(runner, cfg);
+        engine.seed_pw_version((1, 6, 0));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // The last call should be the surround source_exists check (ls Node, step6)
+        let calls = &engine.runner.calls;
+        let last = calls.last().expect("at least one call");
+        assert_eq!(
+            last,
+            &vec!["pw-cli", "ls", "Node"],
+            "step6 must call source_exists"
+        );
+        // No surround spawn (disabled → remove path, source absent → no-op)
+        assert!(
+            !engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "no surround spawn when disabled"
+        );
+        // Total 38 calls
+        assert_eq!(calls.len(), 38, "expected 38 total pw-cli calls");
+    }
+
+    /// Queue outputs for reconcile with surround ENABLED and surround node absent.
+    /// Step6 enabled:
+    ///   1. source_exists() → 1 ls (absent) → spawn (goes to spawned, not calls)
+    ///   2. reroute "game": set_output → ls (source_exists: present) → find_node_id → destroy → pkill + ls (source absent → spawn)
+    ///   3. reroute "media": same
+    fn queue_reconcile_surround_enabled_absent(runner: MockRunner) -> MockRunner {
+        let ls_channels = ls_all_present();
+        let ls_surround_absent = ls_all_absent(); // no surround node
+        let mut r = runner;
+        // Phase 1: 3 ls (all channels present)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls_channels, "");
+        }
+        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls_channels, "");
+            for _ in 0..10 {
+                r = r.with_output(0, "", "");
+            }
+        }
+        // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
+        r = r.with_output(0, &ls_surround_absent, "");
+        // Phase 6 (surround enabled, absent):
+        //   source_exists() → 1 ls absent → spawn (in spawned, not calls)
+        r = r.with_output(0, &ls_surround_absent, "");
+        // reroute "game": set_output → ChannelManager::set_output →
+        //   find existing present node: ls (source_exists present) + find_node_id ls + destroy + pkill
+        //   create absent: ls absent → spawn
+        r = r.with_output(0, &ls_channels, ""); // set_output: source_exists (game present)
+        r = r.with_output(0, &ls_channels, ""); // set_output: find_node_id
+        r = r.with_output(0, "", ""); // set_output: destroy
+        r = r.with_output(0, "", ""); // set_output: pkill
+        r = r.with_output(0, &ls_surround_absent, ""); // set_output: create source_exists (absent → spawn)
+                                                       // reroute "media": same
+        r = r.with_output(0, &ls_channels, "");
+        r = r.with_output(0, &ls_channels, "");
+        r = r.with_output(0, "", "");
+        r = r.with_output(0, "", "");
+        r = r.with_output(0, &ls_surround_absent, "");
+        r
+    }
+
+    #[test]
+    fn reconcile_step6_enabled_spawns_surround_and_reroutes_channels() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_step6_enabled");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let runner = queue_reconcile_surround_enabled_absent(MockRunner::new());
+        let cfg = make_config_surround_enabled("test-hrir");
+        let mut engine = Engine::new(runner, cfg);
+        engine.seed_pw_version((1, 6, 0));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // Surround sink was spawned
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be spawned: {:?}",
+            engine.runner.spawned
+        );
+        // Channel reroutes spawned new instances for game + media
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game"))
+                .unwrap_or(false)),
+            "game channel must be respawned for surround routing"
+        );
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "media channel must be respawned for surround routing"
+        );
+        // Children tracked: surround + game + media
+        assert!(engine.children.len() >= 3, "at least 3 children tracked");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: surround_set_* methods
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn surround_set_enabled_true_without_hrir_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_on_no_hrir");
+        // Don't create any HRIR file → resolve_hrir_path must fail
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.surround_set_enabled(true);
+        assert!(
+            matches!(result, Err(EngineError::BadRequest(_))),
+            "must error when no HRIR exists: {result:?}"
+        );
+        // Config must NOT have been mutated (error before mutation)
+        assert!(
+            !engine.config().active().unwrap().surround.enabled,
+            "surround.enabled must remain false on error"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn surround_set_hrir_persists_and_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_set_hrir_home");
+        let tmp_cfg = unique_cfg_tmp("surr_set_hrir_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("my-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // surround disabled → surround_set_hrir just persists, no recreate
+        let cfg = make_config_no_eq_no_routes(); // surround disabled
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .surround_set_hrir("my-hrir".into())
+            .expect("surround_set_hrir should succeed");
+
+        // Config persisted
+        let saved_path = tmp_cfg.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("my-hrir"),
+            "persisted config must contain hrir stem"
+        );
+
+        // In-memory updated
+        assert_eq!(
+            engine.config().active().unwrap().surround.hrir.as_deref(),
+            Some("my-hrir")
+        );
+
+        // Event emitted
+        let event = rx.try_recv().expect("SurroundHrirSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::SurroundHrirSet {
+                hrir: Some("my-hrir".into())
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_hrir_nonexistent_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_hrir_err");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        // Don't write the file.
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.surround_set_hrir("nonexistent".into());
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        // hrir must remain None (rollback)
+        assert!(engine.config().active().unwrap().surround.hrir.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn surround_set_channels_persists_and_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_ch");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .surround_set_channels(vec!["game".into(), "chat".into(), "media".into()])
+            .expect("surround_set_channels should succeed");
+
+        // Config persisted
+        assert!(tmp.join("config.toml").exists());
+
+        // Event emitted
+        let event = rx
+            .try_recv()
+            .expect("SurroundChannelsSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::SurroundChannelsSet {
+                channels: vec!["game".into(), "chat".into(), "media".into()]
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn state_surround_snapshot_reflects_config() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_state");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("aa-first.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("zz-last.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround = arctis_config::SurroundConfig {
+            enabled: false,
+            hrir: Some("aa-first".into()),
+            channels: vec!["game".into()],
+            hw_sink: Some("alsa_output.pci".into()),
+        };
+        let engine = Engine::new(MockRunner::new(), cfg);
+        let s = engine.state();
+
+        assert!(!s.surround.enabled);
+        assert_eq!(s.surround.hrir.as_deref(), Some("aa-first"));
+        assert_eq!(s.surround.channels, vec!["game"]);
+        assert_eq!(s.surround.hw_sink.as_deref(), Some("alsa_output.pci"));
+        assert_eq!(s.surround.available_hrirs, vec!["aa-first", "zz-last"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
     }
 }
