@@ -11,6 +11,7 @@ pub mod props;
 pub mod pw_version;
 pub mod routing;
 pub mod runner;
+pub mod surround;
 
 pub use backend::{AudioBackend, ConfHandle};
 pub use channels::{ChannelDef, ChannelManager, ChannelSetConfig};
@@ -35,3 +36,4 @@ pub use routing::{
     wireplumber_fragment_path, AppMatch, RouteRule, Router,
 };
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
+pub use surround::{render_surround_conf, SurroundBackend, SurroundSpec};
