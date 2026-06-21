@@ -1,18 +1,22 @@
 /**
- * meter.ts — Pure helpers for the live level-meter display.
+ * meter.ts — Pure helpers for the live signal-peak level-meter display.
  *
- * WHAT THE METERS ACTUALLY SHOW (honesty note)
- * ─────────────────────────────────────────────
- * The `levels` Tauri event carries the *configured software volume* (0.0–1.0
- * linear, averaged across channels) sampled from `pw-dump` Props.channelVolumes
- * for each Arctis virtual sink and the clean-mic source.
+ * WHAT THE METERS ACTUALLY SHOW
+ * ──────────────────────────────
+ * The `levels` Tauri event carries the *real-time signal peak* (0.0–1.0
+ * normalised) captured by `pw-record` PCM capture workers:
  *
- * This is NOT a real-time audio signal peak or RMS — it reflects the volume
- * setting the user (or engine) has applied, not instantaneous signal activity.
+ * - Channel sinks (Arctis_Game / Arctis_Chat / Arctis_Media): captured via
+ *   their PipeWire monitor port (`<name>.monitor`), s16le stereo @ 48 kHz.
+ * - Mic source (arctis_clean_mic): captured directly, s16le mono @ 48 kHz.
  *
- * True real-time peak/RMS metering would require a native pipewire-rs capture
- * stream (a !Send PWConnection on a dedicated thread monitoring the sink-input
- * monitor ports).  That is out of scope for R3 and documented as a follow-up.
+ * Peak is computed over ~40 ms windows (1 920 samples) and emitted at ~25 Hz.
+ * A channel that is silent shows 0.0; a full-scale signal shows 1.0 —
+ * regardless of the configured volume setting.
+ *
+ * When the Arctis virtual nodes are not present (daemon not running), the
+ * worker processes find no target and hold their level at 0.0; the UI shows
+ * an inactive (dim) meter — honest: no signal → no bar.
  *
  * All functions are pure and free of side effects so they can be unit-tested
  * without a DOM or Tauri runtime.
@@ -72,49 +76,26 @@ export function levelToBarStyle(level: number): string {
   return `${pct.toFixed(1)}%`;
 }
 
-// ---------------------------------------------------------------------------
-// pw-dump payload builder
-// ---------------------------------------------------------------------------
-
 /**
- * Parse the JSON array from `pw-dump` and extract the average linear volume
- * for each node whose `node.name` is in `targetNodes`.
+ * Apply a fast-attack / slow-decay envelope to a peak level for display.
  *
- * Returns a LevelsPayload (node.name → [0,1] average channelVolume).
- * Nodes not in `targetNodes`, nodes without Props params, and non-Node entries
- * are silently skipped.
+ * The meter rises instantly to any new peak (attack = 1.0) and decays
+ * exponentially toward 0 when the incoming signal drops.
  *
- * This is used by the src-tauri metering task to parse pw-dump output,
- * but it is exposed here (pure, testable) for unit testing.
+ * @param prev     Previous displayed level (null = first call).
+ * @param incoming Raw peak from the capture worker [0, 1].
+ * @param decay    Decay coefficient per tick in (0, 1]. Lower = slower decay.
+ *                 Default 0.15 gives ~250 ms fall-time at 25 Hz.
+ * @returns New display level, clamped to [0, 1].
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildLevelsPayload(pwDumpData: any[], targetNodes: string[]): LevelsPayload {
-  const targetSet = new Set(targetNodes);
-  const result: LevelsPayload = {};
-
-  for (const entry of pwDumpData) {
-    if (entry?.type !== "PipeWire:Interface:Node") continue;
-
-    const nodeName: string | undefined = entry?.info?.props?.["node.name"];
-    if (!nodeName || !targetSet.has(nodeName)) continue;
-
-    const propsParams: unknown[] | undefined = entry?.info?.params?.Props;
-    if (!Array.isArray(propsParams) || propsParams.length === 0) continue;
-
-    let channelVolumes: number[] | undefined;
-    for (const p of propsParams) {
-      const cv = (p as Record<string, unknown>)?.channelVolumes;
-      if (Array.isArray(cv) && cv.length > 0) {
-        channelVolumes = cv as number[];
-        break;
-      }
-    }
-    if (!channelVolumes) continue;
-
-    // Average all channels to a single scalar (mono or stereo → one value)
-    const avg = channelVolumes.reduce((s, v) => s + v, 0) / channelVolumes.length;
-    result[nodeName] = clampLevel(avg);
-  }
-
-  return result;
+export function peakDecay(
+  prev: number | null,
+  incoming: number,
+  decay = 0.15,
+): number {
+  if (prev === null) return clampLevel(incoming);
+  const p = clampLevel(incoming);
+  const held = prev * (1 - decay);
+  // Fast attack: jump to the incoming peak immediately if higher
+  return clampLevel(Math.max(p, held));
 }

@@ -4,12 +4,11 @@
  * These run in vitest (Node, no DOM / Tauri).  All functions under test are
  * pure transformations so they can be exercised without any runtime.
  *
- * What the meters actually show (honesty note):
- *   The `levels` event carries the *configured software volume* (0.0–1.0
- *   linear) sampled from pw-dump's Props.channelVolumes for each Arctis sink /
- *   source.  This is NOT a real-time audio signal peak or RMS — it reflects
- *   the user's volume setting, not signal activity.  True peak metering
- *   requires a native pipewire-rs capture stream (documented as a follow-up).
+ * What the meters actually show:
+ *   The `levels` event carries the *real-time signal peak* (0.0–1.0
+ *   normalised) captured by `pw-record` PCM capture workers — s16le at
+ *   48 kHz.  This is a genuine signal level, not a configured volume scalar.
+ *   A silent channel shows 0.0 regardless of its volume setting.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -17,8 +16,8 @@ import {
   linearToPercent,
   smoothLevel,
   levelToBarStyle,
+  peakDecay,
   type LevelsPayload,
-  buildLevelsPayload,
 } from "./meter.js";
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,7 @@ describe("linearToPercent", () => {
 });
 
 // ---------------------------------------------------------------------------
-// smoothLevel — exponential smoothing
+// smoothLevel — exponential smoothing (kept for backwards compatibility)
 // ---------------------------------------------------------------------------
 
 describe("smoothLevel", () => {
@@ -122,109 +121,61 @@ describe("levelToBarStyle", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildLevelsPayload — maps node_name → linear volume from pw-dump data
+// peakDecay — fast-attack / slow-decay envelope for VU-style display
 // ---------------------------------------------------------------------------
 
-describe("buildLevelsPayload", () => {
-  // Simulate the JSON structure pw-dump emits for a node with Props.channelVolumes
-  const fakePwDump = [
-    {
-      type: "PipeWire:Interface:Node",
-      id: 101,
-      info: {
-        props: { "node.name": "Arctis_Game" },
-        params: {
-          Props: [{ channelVolumes: [0.75, 0.75] }],
-        },
-      },
-    },
-    {
-      type: "PipeWire:Interface:Node",
-      id: 102,
-      info: {
-        props: { "node.name": "Arctis_Chat" },
-        params: {
-          Props: [{ channelVolumes: [0.5] }],
-        },
-      },
-    },
-    {
-      type: "PipeWire:Interface:Node",
-      id: 103,
-      info: {
-        props: { "node.name": "Arctis_Media" },
-        params: {
-          Props: [{ channelVolumes: [1.0, 1.0] }],
-        },
-      },
-    },
-    {
-      type: "PipeWire:Interface:Node",
-      id: 104,
-      info: {
-        props: { "node.name": "arctis_clean_mic" },
-        params: {
-          Props: [{ channelVolumes: [0.9] }],
-        },
-      },
-    },
-    {
-      // Non-Arctis node — must be ignored
-      type: "PipeWire:Interface:Node",
-      id: 50,
-      info: {
-        props: { "node.name": "alsa_output.pci-0000" },
-        params: {
-          Props: [{ channelVolumes: [0.3, 0.3] }],
-        },
-      },
-    },
-    {
-      // Non-node entry — must be ignored
-      type: "PipeWire:Interface:Link",
-      id: 200,
-    },
-  ];
-
-  const TARGET_NODES = ["Arctis_Game", "Arctis_Chat", "Arctis_Media", "arctis_clean_mic"];
-
-  it("extracts levels for all target Arctis nodes", () => {
-    const payload = buildLevelsPayload(fakePwDump, TARGET_NODES);
-    expect(Object.keys(payload).sort()).toEqual(TARGET_NODES.slice().sort());
+describe("peakDecay", () => {
+  it("returns incoming level when there is no previous value", () => {
+    expect(peakDecay(null, 0.8)).toBeCloseTo(0.8);
   });
 
-  it("averages multi-channel volumes to a single scalar", () => {
-    const payload = buildLevelsPayload(fakePwDump, TARGET_NODES);
-    expect(payload["Arctis_Game"]).toBeCloseTo(0.75);
-    expect(payload["Arctis_Media"]).toBeCloseTo(1.0);
+  it("returns 0 when incoming is 0 and prev is null", () => {
+    expect(peakDecay(null, 0.0)).toBe(0);
   });
 
-  it("passes through single-channel volumes unchanged", () => {
-    const payload = buildLevelsPayload(fakePwDump, TARGET_NODES);
-    expect(payload["Arctis_Chat"]).toBeCloseTo(0.5);
-    expect(payload["arctis_clean_mic"]).toBeCloseTo(0.9);
+  it("jumps instantly to a higher incoming peak (fast attack)", () => {
+    // Previous display: 0.2; new incoming peak: 0.9 → must jump to 0.9
+    const result = peakDecay(0.2, 0.9);
+    expect(result).toBeCloseTo(0.9);
   });
 
-  it("omits non-target nodes from the payload", () => {
-    const payload = buildLevelsPayload(fakePwDump, TARGET_NODES);
-    expect("alsa_output.pci-0000" in payload).toBe(false);
+  it("decays toward 0 when incoming signal drops to 0", () => {
+    // With default decay=0.15: held = 1.0 * (1 - 0.15) = 0.85
+    const result = peakDecay(1.0, 0.0);
+    expect(result).toBeCloseTo(0.85);
   });
 
-  it("returns empty object when no target nodes are found", () => {
-    const payload = buildLevelsPayload([], TARGET_NODES);
-    expect(payload).toEqual({});
+  it("decays all the way to 0 after many ticks of silence", () => {
+    let v: number | null = 1.0;
+    for (let i = 0; i < 200; i++) {
+      v = peakDecay(v, 0.0);
+    }
+    expect(v).toBeLessThan(0.001);
   });
 
-  it("returns empty object for node without Props params", () => {
-    const noProps = [
-      {
-        type: "PipeWire:Interface:Node",
-        id: 101,
-        info: { props: { "node.name": "Arctis_Game" }, params: {} },
-      },
-    ];
-    const payload = buildLevelsPayload(noProps, TARGET_NODES);
-    expect(payload).toEqual({});
+  it("holds the higher of decay and incoming", () => {
+    // If incoming is higher than the decayed hold, use incoming
+    const result = peakDecay(0.5, 0.9);
+    // decayed hold = 0.5 * 0.85 = 0.425; incoming = 0.9 → result = 0.9
+    expect(result).toBeCloseTo(0.9);
+  });
+
+  it("uses decayed hold when incoming is lower", () => {
+    // prev=1.0, incoming=0.2, decay=0.15
+    // decayed_hold = 1.0 * 0.85 = 0.85; incoming = 0.2 → result = 0.85
+    const result = peakDecay(1.0, 0.2);
+    expect(result).toBeCloseTo(0.85);
+  });
+
+  it("clamps returned level to [0, 1]", () => {
+    expect(peakDecay(0.5, 1.5)).toBeLessThanOrEqual(1);
+    expect(peakDecay(0.5, -0.5)).toBeGreaterThanOrEqual(0);
+  });
+
+  it("supports a custom decay coefficient", () => {
+    // decay=0.5: held = 1.0 * (1 - 0.5) = 0.5
+    const result = peakDecay(1.0, 0.0, 0.5);
+    expect(result).toBeCloseTo(0.5);
   });
 });
 

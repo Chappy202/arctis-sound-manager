@@ -1,17 +1,18 @@
 <script lang="ts">
   /**
-   * LevelMeter.svelte — A small horizontal or vertical level bar driven by
-   * the `levels` Tauri event.
+   * LevelMeter.svelte — Real signal-peak level bar driven by the `levels`
+   * Tauri event.
    *
-   * NOTE: The meter shows the *configured software volume* (0.0–1.0 linear
-   * scalar from `pw-dump` Props.channelVolumes), NOT a real-time audio signal
-   * peak or RMS.  It updates when the engine's volume for this node changes.
-   * True peak metering requires a native pipewire-rs capture stream
-   * (documented follow-up).
+   * The `levels` event carries genuine PCM peak values (0.0–1.0) captured
+   * by `pw-record` workers in src-tauri/src/meters.rs.  A silent signal
+   * shows 0.0 regardless of volume setting; a full-scale signal shows 1.0.
+   *
+   * Display uses a fast-attack / slow-decay envelope (peakDecay) so brief
+   * transients are visible and the bar falls smoothly after loud passages.
    */
   import { onMount, onDestroy } from "svelte";
   import { onLevels, type LevelsPayload } from "../ipc.js";
-  import { smoothLevel, levelToBarStyle } from "../meter.js";
+  import { peakDecay, levelToBarStyle } from "../meter.js";
 
   interface Props {
     /** PipeWire node.name to show the level for (e.g. "Arctis_Game"). */
@@ -39,7 +40,7 @@
   function handleLevels(payload: LevelsPayload) {
     const raw = payload[nodeName];
     if (typeof raw === "number") {
-      smoothed = smoothLevel(smoothed, raw);
+      smoothed = peakDecay(smoothed, raw);
       hasData = true;
     }
   }
@@ -66,8 +67,8 @@
   aria-valuemin={0}
   aria-valuemax={100}
   title={hasData
-    ? `Volume: ${Math.round((smoothed ?? 0) * 100)}%`
-    : "Waiting for level data…"}
+    ? `Signal peak: ${Math.round((smoothed ?? 0) * 100)}%`
+    : "Waiting for signal data…"}
 >
   <div
     class="meter-track"
@@ -118,7 +119,8 @@
     height: 100%;
     background: var(--ss-accent);
     border-radius: var(--ss-radius-pill);
-    transition: width 0.35s ease-out;
+    /* Short CSS transition — decay is handled in peakDecay() JS logic */
+    transition: width 0.04s linear;
   }
 
   /* ── Vertical — fills bottom → top ── */
@@ -142,7 +144,8 @@
     width: 100%;
     background: var(--ss-accent);
     border-radius: var(--ss-radius-pill);
-    transition: height 0.35s ease-out;
+    /* Short CSS transition — decay is handled in peakDecay() JS logic */
+    transition: height 0.04s linear;
   }
 
   /* No-data state — very dim, static */

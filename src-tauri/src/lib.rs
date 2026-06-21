@@ -81,34 +81,34 @@ pub fn run() {
                 });
             }
 
-            // ── Level-meter task (every 2 s) ─────────────────────────────────
-            // Samples configured software volume for Arctis channel sinks + the
-            // clean-mic source via `pw-dump`.  Emits a `levels` event carrying a
-            // JSON object { node_name: 0.0..1.0 }.
+            // ── Real signal-peak meter task (~25 Hz) ────────────────────────
+            // Spawns pw-record capture workers for each Arctis channel sink
+            // (via its .monitor port) and the clean-mic source.  Collects
+            // PCM peaks from the workers every 40 ms and emits a `levels`
+            // event with { node_name: 0.0..1.0 } real signal peak values.
             //
-            // NOTE: This reflects the *configured volume scalar* (from PipeWire's
-            // Props.channelVolumes), NOT a real-time audio signal peak or RMS.
-            // True peak metering requires a native pipewire-rs capture stream
-            // (follow-up task).  This is intentionally honest: no fake data.
+            // Workers that fail (node absent, pw-record not found) hold their
+            // last level at 0.0 — honest: no data = silence.  MeterTask Drop
+            // kills all pw-record children cleanly.
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+                    // start_meter_task spawns OS threads + pw-record children;
+                    // run it on a blocking thread so we don't block the async
+                    // executor.
+                    let mut task = tauri::async_runtime::spawn_blocking(meters::start_meter_task)
+                        .await
+                        .expect("meter task spawn failed");
+
+                    // Emit at ~25 Hz (every 40 ms).
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(40));
                     loop {
                         ticker.tick().await;
-                        let result =
-                            tauri::async_runtime::spawn_blocking(meters::sample_levels).await;
-                        match result {
-                            Ok(Some(payload)) => {
-                                let _ = handle.emit("levels", &payload);
-                            }
-                            Ok(None) => {
-                                // pw-dump unavailable or no target nodes found — skip tick.
-                            }
-                            Err(_) => {
-                                // spawn_blocking join error — skip tick, never crash.
-                            }
-                        }
+                        let payload = task.current_levels();
+                        // Only emit if at least one node has reported a level.
+                        // (When no Arctis nodes exist all entries are 0.0 from
+                        // the watch channel default — still honest to emit.)
+                        let _ = handle.emit("levels", &payload);
                     }
                 });
             }

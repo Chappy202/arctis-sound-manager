@@ -236,18 +236,18 @@
             </span>
           </label>
         </div>
-        <!-- R3: Live input level meter (software volume via levels event).
-             NOTE: shows configured volume setting, not signal peak.
-             See meter.ts honesty note for details. -->
+        <!-- R3b: Live signal-peak meter via pw-record PCM capture.
+             Shows real PCM peak (0 = silence, 1 = full scale).
+             When daemon / arctis_clean_mic node is absent → 0, dim. -->
         <div class="field-row meter-row">
           <span class="field-label">INPUT LEVEL</span>
           <div class="meter-wrap">
             <LevelMeter
               nodeName="arctis_clean_mic"
               orientation="horizontal"
-              ariaLabel="Mic input level"
+              ariaLabel="Mic input signal level"
             />
-            <span class="meter-note">volume (not signal peak)</span>
+            <span class="meter-note">signal peak</span>
           </div>
         </div>
       </div>
