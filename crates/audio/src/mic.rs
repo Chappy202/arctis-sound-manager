@@ -133,11 +133,12 @@ pub enum StageKind {
     Gain,
     /// Builtin `bq_highpass` node (always available).
     Highpass,
-    /// LADSPA RNNoise `noise_suppressor_mono` (requires plugin .so).
-    Rnnoise,
+    /// Noise suppression stage — DeepFilterNet or RNNoise (requires plugin .so).
+    Suppression,
     /// LADSPA swh sc4m compressor (requires plugin .so).
     Compressor,
-    /// Builtin `noisegate` (always available).
+    /// Gate stage — builtin noisegate (≥1.6) or LADSPA gate_1410 fallback.
+    /// Availability computed in `convert::mic_chain_nodes` based on PW version.
     Gate,
     /// Builtin biquad mic-EQ bands (always available).
     MicEq,
@@ -145,17 +146,19 @@ pub enum StageKind {
 
 impl StageKind {
     /// True when this stage is a PipeWire builtin (no external .so needed).
+    /// Note: Gate may be either builtin or LADSPA depending on PW version —
+    /// this returns false; convert.rs decides at chain-build time.
     pub fn is_builtin(self) -> bool {
         matches!(
             self,
-            StageKind::Gain | StageKind::Highpass | StageKind::Gate | StageKind::MicEq
+            StageKind::Gain | StageKind::Highpass | StageKind::MicEq
         )
     }
 
-    /// Return the LADSPA plugin basename for LADSPA stages; None for builtins.
+    /// Return the LADSPA plugin basename for LADSPA stages; None for builtins or
+    /// stages whose basename is determined at chain-build time (Suppression, Gate).
     pub fn plugin_basename(self) -> Option<&'static str> {
         match self {
-            StageKind::Rnnoise => Some(RNNOISE_PLUGIN_BASENAME),
             StageKind::Compressor => Some(SC4M_PLUGIN_BASENAME),
             _ => None,
         }
@@ -384,7 +387,7 @@ id 40, type PipeWire:Interface:Node/3
                 controls: vec![("Mult".to_string(), 1.0_f32), ("Add".to_string(), 0.0_f32)],
             },
             FilterNode {
-                name: "mic_rnnoise".into(),
+                name: "mic_suppression".into(),
                 node_type: NodeType::Ladspa,
                 label: RNNOISE_LABEL_MONO.into(),
                 plugin: Some(RNNOISE_PLUGIN_BASENAME.into()),
@@ -475,7 +478,7 @@ id 40, type PipeWire:Interface:Node/3
             .with_output(0, "", ""); // the set
         let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
         let mut be = MicBackend::new(runner, probe, mic_spec());
-        be.apply_control("mic_rnnoise", "VAD Threshold (%)", 40.0)
+        be.apply_control("mic_suppression", "VAD Threshold (%)", 40.0)
             .unwrap();
 
         let last = be.runner().last_call().unwrap();
@@ -486,7 +489,7 @@ id 40, type PipeWire:Interface:Node/3
                 "s".to_string(),
                 "71".to_string(),
                 "Props".to_string(),
-                "{ params = [ \"mic_rnnoise:VAD Threshold (%)\" 40.0 ] }".to_string(),
+                "{ params = [ \"mic_suppression:VAD Threshold (%)\" 40.0 ] }".to_string(),
             ]
         );
     }
@@ -523,7 +526,7 @@ id 40, type PipeWire:Interface:Node/3
         let stages = vec![
             StageKind::Gain,
             StageKind::Highpass,
-            StageKind::Rnnoise,
+            StageKind::Suppression,
             StageKind::Gate,
             StageKind::MicEq,
             StageKind::Compressor,
@@ -533,8 +536,8 @@ id 40, type PipeWire:Interface:Node/3
         assert_eq!(avail.len(), 6);
         assert_eq!(avail[0], (StageKind::Gain, true)); // builtin
         assert_eq!(avail[1], (StageKind::Highpass, true)); // builtin
-        assert_eq!(avail[2], (StageKind::Rnnoise, false)); // LADSPA, probe says absent
-        assert_eq!(avail[3], (StageKind::Gate, true)); // builtin
+        assert_eq!(avail[2], (StageKind::Suppression, false)); // LADSPA, probe says absent (plugin_basename=None → false)
+        assert_eq!(avail[3], (StageKind::Gate, false)); // no longer always builtin, plugin_basename=None → false
         assert_eq!(avail[4], (StageKind::MicEq, true)); // builtin
         assert_eq!(avail[5], (StageKind::Compressor, false)); // LADSPA, probe says absent
     }
@@ -544,8 +547,10 @@ id 40, type PipeWire:Interface:Node/3
         let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME, SC4M_PLUGIN_BASENAME]);
         let be = MicBackend::new(MockRunner::new(), probe, mic_spec());
 
-        let avail = be.availability(&[StageKind::Rnnoise, StageKind::Compressor]);
-        assert_eq!(avail[0], (StageKind::Rnnoise, true));
+        // Suppression uses plugin_basename() = None, so probe is not consulted → false
+        // Compressor uses plugin_basename() = SC4M → probe consulted → true
+        let avail = be.availability(&[StageKind::Suppression, StageKind::Compressor]);
+        assert_eq!(avail[0], (StageKind::Suppression, false)); // None basename → false
         assert_eq!(avail[1], (StageKind::Compressor, true));
     }
 

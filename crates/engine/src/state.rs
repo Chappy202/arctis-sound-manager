@@ -1,6 +1,16 @@
 use arctis_audio::StageKind;
 use serde::{Deserialize, Serialize};
 
+/// Which noise-suppression backend is in use (mirrors config's SuppressionBackend but
+/// defined here to avoid a config→state or state→config dep cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionBackend {
+    #[default]
+    DeepFilter,
+    Rnnoise,
+}
+
 /// Tunable mic DSP parameters. Used by `Engine::mic_set_param`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MicParam {
@@ -10,6 +20,7 @@ pub enum MicParam {
     VadGraceMs,
     VadRetroGraceMs,
     GateThreshold,
+    AttenuationLimitDb,
     CompThresholdDb,
     CompRatio,
     CompMakeupDb,
@@ -59,7 +70,7 @@ pub struct StageAvailability {
 pub enum StageName {
     Gain,
     Highpass,
-    Rnnoise,
+    Suppression,
     Compressor,
     Gate,
     MicEq,
@@ -70,7 +81,7 @@ impl From<StageKind> for StageName {
         match k {
             StageKind::Gain => StageName::Gain,
             StageKind::Highpass => StageName::Highpass,
-            StageKind::Rnnoise => StageName::Rnnoise,
+            StageKind::Suppression => StageName::Suppression,
             StageKind::Compressor => StageName::Compressor,
             StageKind::Gate => StageName::Gate,
             StageKind::MicEq => StageName::MicEq,
@@ -94,6 +105,12 @@ pub struct MicSnapshot {
     pub enabled: bool,
     pub stages: Vec<MicStageSnapshot>,
     pub eq_bands: Vec<EqBandSnapshot>,
+    /// The active suppression backend (DeepFilter by default).
+    #[serde(default)]
+    pub suppression_backend: SuppressionBackend,
+    /// Backends whose LADSPA .so was found by the last probe.
+    #[serde(default)]
+    pub available_suppression_backends: Vec<SuppressionBackend>,
 }
 
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
@@ -169,5 +186,8 @@ pub enum Event {
     },
     MicEnabledSet {
         enabled: bool,
+    },
+    MicSuppressionBackendSet {
+        backend: SuppressionBackend,
     },
 }

@@ -327,7 +327,7 @@ fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
     match kind {
         StageName::Gain => "gain",
         StageName::Highpass => "highpass",
-        StageName::Rnnoise => "rnnoise",
+        StageName::Suppression => "suppression",
         StageName::Compressor => "compressor",
         StageName::Gate => "gate",
         StageName::MicEq => "eq",
@@ -1407,11 +1407,11 @@ mod tests {
 
     #[test]
     fn mic_enable_parses() {
-        let cmd = parse(&["mic", "enable", "rnnoise"]).expect("mic enable should parse");
+        let cmd = parse(&["mic", "enable", "suppression"]).expect("mic enable should parse");
         match cmd {
             super::Command::Mic {
                 action: super::MicAction::Enable { stage },
-            } => assert_eq!(stage, "rnnoise"),
+            } => assert_eq!(stage, "suppression"),
             other => panic!("unexpected: {other:?}"),
         }
     }

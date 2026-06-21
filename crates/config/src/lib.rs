@@ -7,5 +7,6 @@ pub mod store;
 pub use error::ConfigError;
 pub use schema::{
     ChannelConfig, Config, EqBandConfig, MicChainConfig, MicCompressorStage, MicGainStage,
-    MicGateStage, MicHighpassStage, MicRnnoiseStage, Profile, RouteConfig, CURRENT_VERSION,
+    MicGateStage, MicHighpassStage, MicSuppressionStage, Profile, RouteConfig, SuppressionBackend,
+    CURRENT_VERSION,
 };

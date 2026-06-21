@@ -48,3 +48,7 @@ pub const MIC_COMP_RATIO_MAX: f32 = 20.0;
 /// sc4m LADSPA compressor makeup gain (dB).
 pub const MIC_COMP_MAKEUP_MIN_DB: f32 = 0.0;
 pub const MIC_COMP_MAKEUP_MAX_DB: f32 = 24.0;
+
+/// DeepFilterNet attenuation limit (dB). 0 = no suppression, 100 = maximum suppression.
+pub const MIC_ATTEN_LIMIT_MIN_DB: f32 = 0.0;
+pub const MIC_ATTEN_LIMIT_MAX_DB: f32 = 100.0;

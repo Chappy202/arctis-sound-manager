@@ -12,12 +12,13 @@ fn parse_mic_stage(s: &str) -> Result<StageKind, EngineError> {
     match s {
         "gain" => Ok(StageKind::Gain),
         "highpass" => Ok(StageKind::Highpass),
-        "rnnoise" => Ok(StageKind::Rnnoise),
+        // "rnnoise" kept as backward-compat alias; canonical name is "suppression"
+        "suppression" | "rnnoise" => Ok(StageKind::Suppression),
         "compressor" => Ok(StageKind::Compressor),
         "gate" => Ok(StageKind::Gate),
         "eq" => Ok(StageKind::MicEq),
         other => Err(EngineError::BadRequest(format!(
-            "unknown mic stage '{other}' (use: gain|highpass|rnnoise|compressor|gate|eq)"
+            "unknown mic stage '{other}' (use: gain|highpass|suppression|compressor|gate|eq)"
         ))),
     }
 }
@@ -28,6 +29,7 @@ fn parse_mic_param(s: &str) -> Result<MicParam, EngineError> {
     match s {
         "gain_db" => Ok(MicParam::GainDb),
         "highpass_freq" => Ok(MicParam::HighpassFreq),
+        "attenuation_limit_db" => Ok(MicParam::AttenuationLimitDb),
         "vad_threshold" => Ok(MicParam::VadThreshold),
         "vad_grace_ms" => Ok(MicParam::VadGraceMs),
         "vad_retro_grace_ms" => Ok(MicParam::VadRetroGraceMs),
@@ -36,7 +38,7 @@ fn parse_mic_param(s: &str) -> Result<MicParam, EngineError> {
         "comp_ratio" => Ok(MicParam::CompRatio),
         "comp_makeup_db" => Ok(MicParam::CompMakeupDb),
         other => Err(EngineError::BadRequest(format!(
-            "unknown mic param '{other}' (use: gain_db|highpass_freq|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db)"
+            "unknown mic param '{other}' (use: gain_db|highpass_freq|attenuation_limit_db|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db)"
         ))),
     }
 }
@@ -709,8 +711,13 @@ mod tests {
             Ok(StageKind::Highpass)
         ));
         assert!(matches!(
+            super::parse_mic_stage("suppression"),
+            Ok(StageKind::Suppression)
+        ));
+        // "rnnoise" is kept as a backward-compat alias
+        assert!(matches!(
             super::parse_mic_stage("rnnoise"),
-            Ok(StageKind::Rnnoise)
+            Ok(StageKind::Suppression)
         ));
         assert!(matches!(
             super::parse_mic_stage("compressor"),
@@ -748,6 +755,10 @@ mod tests {
         assert!(matches!(
             super::parse_mic_param("highpass_freq"),
             Ok(MicParam::HighpassFreq)
+        ));
+        assert!(matches!(
+            super::parse_mic_param("attenuation_limit_db"),
+            Ok(MicParam::AttenuationLimitDb)
         ));
         assert!(matches!(
             super::parse_mic_param("vad_threshold"),

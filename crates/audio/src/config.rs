@@ -425,17 +425,13 @@ mod tests {
                 ],
             },
             FilterNode {
-                name: "mic_rnnoise".into(),
+                name: "mic_suppression".into(),
                 node_type: NodeType::Ladspa,
-                label: "noise_suppressor_mono".into(),
-                plugin: Some("librnnoise_ladspa".into()),
-                port_in: "Input".into(),
-                port_out: "Output".into(),
-                controls: vec![
-                    ("VAD Threshold (%)".to_string(), 40.0),
-                    ("VAD Grace Period (ms)".to_string(), 800.0),
-                    ("Retroactive VAD Grace (ms)".to_string(), 100.0),
-                ],
+                label: "deep_filter_mono".into(),
+                plugin: Some("libdeep_filter_ladspa".into()),
+                port_in: "Audio In".into(),
+                port_out: "Audio Out".into(),
+                controls: vec![("Attenuation Limit (dB)".to_string(), 100.0)],
             },
             FilterNode {
                 name: "mic_gate".into(),
@@ -445,9 +441,11 @@ mod tests {
                 port_in: "In".into(),
                 port_out: "Out".into(),
                 controls: vec![
-                    ("Threshold".to_string(), 0.003),
-                    ("Attack".to_string(), 5.0),
-                    ("Release".to_string(), 150.0),
+                    ("Open Threshold".to_string(), 0.003),
+                    ("Close Threshold".to_string(), 0.0027),
+                    ("Attack (s)".to_string(), 0.005),
+                    ("Hold (s)".to_string(), 0.05),
+                    ("Release (s)".to_string(), 0.1),
                 ],
             },
             FilterNode {
@@ -519,7 +517,7 @@ mod tests {
         let got = render_chain_conf(&passthrough_spec(), &full_chain_nodes()).unwrap();
         assert!(got.contains("type = ladspa"));
         assert!(
-            got.contains("plugin = \"librnnoise_ladspa\""),
+            got.contains("plugin = \"libdeep_filter_ladspa\""),
             "plugin field must be basename, got: {got}"
         );
         // Must NOT contain an absolute path
