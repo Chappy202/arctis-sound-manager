@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "com.oxibux.arctis-sound-manager",
   "build": {
-    "beforeDevCommand": "pnpm --dir ../frontend dev",
-    "beforeBuildCommand": "pnpm --dir ../frontend build",
+    "beforeDevCommand": "pnpm --dir frontend dev",
+    "beforeBuildCommand": "pnpm --dir frontend build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../frontend/dist"
   },

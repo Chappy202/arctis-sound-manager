@@ -11,3 +11,4 @@
 # But allow the public key to be committed if placed in the repo
 !*.key.pub
 .signing/
+/node_modules/
