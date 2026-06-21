@@ -1,5 +1,6 @@
 mod commands;
 mod error;
+mod meters;
 mod state;
 
 use state::DaemonState;
@@ -48,31 +49,70 @@ pub fn run() {
             commands::coexist_disable,
         ])
         .setup(|app| {
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
-                loop {
-                    ticker.tick().await;
-                    let socket = {
-                        let st = handle.state::<Mutex<DaemonState>>();
-                        let guard = st.lock().await;
-                        guard.socket.clone()
-                    };
-                    let result = tauri::async_runtime::spawn_blocking(move || {
-                        arctis_client::send_request_to(&socket, &arctis_client::Request::GetState)
-                    })
-                    .await;
-                    if let Ok(Ok(resp)) = result {
-                        if resp.ok {
-                            if let Some(engine_state) = resp.state {
-                                let _ = handle.emit("state-changed", &engine_state);
+            // ── State-poll task (every 2 s) ─────────────────────────────────
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+                    loop {
+                        ticker.tick().await;
+                        let socket = {
+                            let st = handle.state::<Mutex<DaemonState>>();
+                            let guard = st.lock().await;
+                            guard.socket.clone()
+                        };
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            arctis_client::send_request_to(
+                                &socket,
+                                &arctis_client::Request::GetState,
+                            )
+                        })
+                        .await;
+                        if let Ok(Ok(resp)) = result {
+                            if resp.ok {
+                                if let Some(engine_state) = resp.state {
+                                    let _ = handle.emit("state-changed", &engine_state);
+                                }
+                            }
+                        }
+                        // Daemon-down ticks are silently ignored;
+                        // the UI keeps its last known good state.
+                    }
+                });
+            }
+
+            // ── Level-meter task (every 2 s) ─────────────────────────────────
+            // Samples configured software volume for Arctis channel sinks + the
+            // clean-mic source via `pw-dump`.  Emits a `levels` event carrying a
+            // JSON object { node_name: 0.0..1.0 }.
+            //
+            // NOTE: This reflects the *configured volume scalar* (from PipeWire's
+            // Props.channelVolumes), NOT a real-time audio signal peak or RMS.
+            // True peak metering requires a native pipewire-rs capture stream
+            // (follow-up task).  This is intentionally honest: no fake data.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+                    loop {
+                        ticker.tick().await;
+                        let result =
+                            tauri::async_runtime::spawn_blocking(meters::sample_levels).await;
+                        match result {
+                            Ok(Some(payload)) => {
+                                let _ = handle.emit("levels", &payload);
+                            }
+                            Ok(None) => {
+                                // pw-dump unavailable or no target nodes found — skip tick.
+                            }
+                            Err(_) => {
+                                // spawn_blocking join error — skip tick, never crash.
                             }
                         }
                     }
-                    // Daemon-down ticks are silently ignored;
-                    // the UI keeps its last known good state.
-                }
-            });
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -31,6 +31,7 @@
   } from "../mic.js";
   import EqCanvas from "./EqCanvas.svelte";
   import BandList from "./BandList.svelte";
+  import LevelMeter from "./LevelMeter.svelte";
   import { type Band } from "../eq.js";
 
   // ---------------------------------------------------------------------------
@@ -235,13 +236,19 @@
             </span>
           </label>
         </div>
-        <!-- E8: Live input meter placeholder (no level data in EngineState) -->
-        <div class="field-row meter-placeholder">
+        <!-- R3: Live input level meter (software volume via levels event).
+             NOTE: shows configured volume setting, not signal peak.
+             See meter.ts honesty note for details. -->
+        <div class="field-row meter-row">
           <span class="field-label">INPUT LEVEL</span>
-          <div class="meter-bar-wrap" aria-hidden="true">
-            <div class="meter-bar meter-bar--static"></div>
+          <div class="meter-wrap">
+            <LevelMeter
+              nodeName="arctis_clean_mic"
+              orientation="horizontal"
+              ariaLabel="Mic input level"
+            />
+            <span class="meter-note">volume (not signal peak)</span>
           </div>
-          <span class="meter-coming-soon">level metering coming soon</span>
         </div>
       </div>
     </div>
@@ -1129,31 +1136,22 @@
     cursor: not-allowed;
   }
 
-  /* ===== Input meter placeholder (E8) ===== */
-  .meter-placeholder {
+  /* ===== Input level meter (R3) ===== */
+  .meter-row {
     flex-direction: column;
     align-items: flex-start;
     gap: var(--ss-space-2);
     padding: var(--ss-space-3) var(--ss-space-4);
   }
 
-  .meter-bar-wrap {
+  .meter-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-1);
     width: 100%;
-    height: 8px;
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-pill);
-    overflow: hidden;
-    opacity: 0.35;
   }
 
-  .meter-bar--static {
-    width: 0%;
-    height: 100%;
-    background: var(--ss-accent);
-    border-radius: var(--ss-radius-pill);
-  }
-
-  .meter-coming-soon {
+  .meter-note {
     font-family: var(--ss-font-mono);
     font-size: var(--ss-type-caption-size);
     color: var(--ss-text-disabled);

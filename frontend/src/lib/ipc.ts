@@ -390,3 +390,29 @@ export const coexistDisable = (dryRun: boolean = false): Promise<CoexistDisableR
  */
 export const onStateChanged = (cb: (s: EngineState) => void): Promise<UnlistenFn> =>
   listen<EngineState>("state-changed", (e) => cb(e.payload));
+
+// ---------------------------------------------------------------------------
+// R3: Level-meter event (levels)
+// ---------------------------------------------------------------------------
+
+/**
+ * Payload of the `levels` Tauri event emitted by the src-tauri metering task.
+ *
+ * Keys are PipeWire `node.name` strings for the Arctis virtual sinks and the
+ * clean-mic source (e.g. "Arctis_Game", "Arctis_Chat", "Arctis_Media",
+ * "arctis_clean_mic").  Values are linear volume scalars in [0.0, 1.0].
+ *
+ * IMPORTANT: These values represent the *configured software volume* sampled
+ * from `pw-dump` Props.channelVolumes — NOT real-time audio signal peaks or
+ * RMS.  They reflect what the engine has set, not signal activity.  True peak
+ * metering requires a native pipewire-rs capture stream (follow-up task).
+ */
+export type LevelsPayload = Record<string, number>;
+
+/**
+ * Subscribe to live level updates from the metering task.
+ * Emitted every ~2 s; the payload maps node_name → linear volume [0, 1].
+ * Returns an unlisten function to clean up the subscription.
+ */
+export const onLevels = (cb: (levels: LevelsPayload) => void): Promise<UnlistenFn> =>
+  listen<LevelsPayload>("levels", (e) => cb(e.payload));

@@ -3,6 +3,7 @@
   import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
+  import LevelMeter from "./LevelMeter.svelte";
 
   // Domain bounds — mirror crates/domain/src/eq_bounds.rs CHANNEL_VOLUME_MIN/MAX_DB
   const VOLUME_MIN_DB = -60;
@@ -192,6 +193,14 @@
     />
 
     <div class="fader-readout">{formatDb(channel.volume_db)}</div>
+
+    <!-- R3: Level meter — shows configured volume via levels event.
+         Note: reflects volume setting, not signal peak. See meter.ts. -->
+    <LevelMeter
+      nodeName={channel.node_name}
+      orientation="vertical"
+      ariaLabel="Volume level for {channel.id.toUpperCase()}"
+    />
 
     <button
       class="mute-btn"

@@ -2817,8 +2817,8 @@ mod tests {
 
     #[test]
     fn coexist_disable_with_dry_run_parses() {
-        let cmd =
-            parse(&["coexist", "disable", "--dry-run"]).expect("coexist disable --dry-run should parse");
+        let cmd = parse(&["coexist", "disable", "--dry-run"])
+            .expect("coexist disable --dry-run should parse");
         match cmd {
             super::Command::Coexist {
                 action: super::CoexistAction::Disable { dry_run },
