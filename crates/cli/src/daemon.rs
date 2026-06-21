@@ -155,6 +155,23 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             },
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SurroundStatus => Response::ok_with_state(engine.state()),
+        Request::SurroundEnable { enabled } => match engine.surround_set_enabled(enabled) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetHrir { name } => match engine.surround_set_hrir(name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetChannels { channels } => match engine.surround_set_channels(channels) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetHwSink { hw_sink } => match engine.surround_set_hw_sink(hw_sink) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
     }
 }
 
@@ -957,6 +974,129 @@ mod tests {
         );
         assert!(!resp.ok, "unknown stage must return ok:false");
         assert!(resp.error.is_some());
+    }
+
+    // ── F1.4: surround dispatch tests ────────────────────────────────────────
+
+    #[test]
+    fn handle_surround_status_returns_ok_with_surround_snapshot() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::SurroundStatus);
+        assert!(resp.ok, "SurroundStatus must return ok:true");
+        let state = resp.state.expect("state must be present");
+        // surround snapshot is always present (default disabled, no HRIR)
+        assert!(!state.surround.enabled, "default surround must be disabled");
+    }
+
+    #[test]
+    fn handle_surround_enable_false_returns_ok() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        // disable (already disabled by default) — must return ok
+        let resp = handle_request(&mut engine, Request::SurroundEnable { enabled: false });
+        assert!(
+            resp.ok,
+            "SurroundEnable false must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(!state.surround.enabled);
+    }
+
+    #[test]
+    fn handle_surround_set_hrir_unknown_name_returns_error() {
+        // No HRIR profiles dir → requesting any specific stem returns an error.
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetHrir {
+                name: "nonexistent-hrir".into(),
+            },
+        );
+        // The engine returns BadRequest (no profiles dir / stem not found) → Response::err.
+        assert!(
+            !resp.ok,
+            "SurroundSetHrir with unknown stem must return ok:false"
+        );
+        assert!(resp.error.is_some(), "error must be present");
+    }
+
+    #[test]
+    fn handle_surround_set_channels_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_sc_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetChannels {
+                channels: vec!["game".into()],
+            },
+        );
+        assert!(
+            resp.ok,
+            "SurroundSetChannels must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.surround.channels, vec!["game".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_hw_sink_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_hs_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetHwSink {
+                hw_sink: Some("alsa_output.usb-SteelSeries".into()),
+            },
+        );
+        assert!(
+            resp.ok,
+            "SurroundSetHwSink must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(
+            state.surround.hw_sink,
+            Some("alsa_output.usb-SteelSeries".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_hw_sink_none_clears_pin() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_hsn_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::SurroundSetHwSink { hw_sink: None });
+        assert!(
+            resp.ok,
+            "SurroundSetHwSink None must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.surround.hw_sink, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]

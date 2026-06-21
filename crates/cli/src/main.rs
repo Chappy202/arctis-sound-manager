@@ -72,6 +72,11 @@ enum Command {
         #[command(subcommand)]
         action: MicAction,
     },
+    /// Virtual surround / HRIR (spatial audio via PipeWire convolver).
+    Surround {
+        #[command(subcommand)]
+        action: SurroundAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -259,6 +264,43 @@ enum MicAction {
     Backend {
         /// Backend name: deep_filter|rnnoise
         backend: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SurroundAction {
+    /// Print the virtual surround status (enabled, HRIR, channels, hw_sink).
+    Status,
+    /// Enable virtual surround (master switch on).
+    On,
+    /// Disable virtual surround (master switch off).
+    Off,
+    /// HRIR profile management (list or set).
+    Hrir {
+        #[command(subcommand)]
+        action: HrirAction,
+    },
+    /// Set which channels are routed through surround (comma-separated, e.g. game,media).
+    Channels {
+        /// Channel ids, comma-separated: game,media (or a single id).
+        #[arg(value_delimiter = ',')]
+        channels: Vec<String>,
+    },
+    /// Pin (or clear) the surround output to a specific hardware sink node.name.
+    HwSink {
+        /// Hardware sink node.name; omit to clear the pin.
+        device: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HrirAction {
+    /// List available HRIR profiles from ~/.local/share/pipewire/hrir_hesuvi/profiles/.
+    List,
+    /// Set the active HRIR profile by stem (filename without .wav).
+    Set {
+        /// Profile stem, e.g. 02-dh-dolby-headphone
+        name: String,
     },
 }
 
@@ -551,6 +593,82 @@ fn dispatch_device(action: DeviceAction) -> ExitCode {
     }
 }
 
+fn dispatch_surround(action: SurroundAction) -> ExitCode {
+    if !daemon::socket_path().exists() {
+        eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+        eprintln!(
+            "note: surround commands require the daemon (single worker enforces PipeWire serialisation)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let is_status = matches!(
+        action,
+        SurroundAction::Status
+            | SurroundAction::Hrir {
+                action: HrirAction::List
+            }
+    );
+    let req = match action {
+        SurroundAction::Status => daemon::Request::SurroundStatus,
+        SurroundAction::On => daemon::Request::SurroundEnable { enabled: true },
+        SurroundAction::Off => daemon::Request::SurroundEnable { enabled: false },
+        SurroundAction::Hrir {
+            action: HrirAction::List,
+        } => daemon::Request::SurroundStatus,
+        SurroundAction::Hrir {
+            action: HrirAction::Set { name },
+        } => daemon::Request::SurroundSetHrir { name },
+        SurroundAction::Channels { channels } => daemon::Request::SurroundSetChannels { channels },
+        SurroundAction::HwSink { device } => daemon::Request::SurroundSetHwSink { hw_sink: device },
+    };
+
+    match daemon::send_request(&req) {
+        Ok(resp) if resp.ok => {
+            if is_status {
+                if let Some(state) = resp.state {
+                    let s = &state.surround;
+                    println!(
+                        "surround: {}",
+                        if s.enabled { "enabled" } else { "disabled" }
+                    );
+                    match &s.hrir {
+                        Some(h) => println!("  hrir: {h}"),
+                        None => println!("  hrir: (default)"),
+                    }
+                    if s.available_hrirs.is_empty() {
+                        println!(
+                            "  available_hrirs: none found in ~/.local/share/pipewire/hrir_hesuvi/profiles/"
+                        );
+                    } else {
+                        println!("  available_hrirs:");
+                        for h in &s.available_hrirs {
+                            println!("    {h}");
+                        }
+                    }
+                    println!("  channels: {}", s.channels.join(", "));
+                    match &s.hw_sink {
+                        Some(sink) => println!("  hw_sink: {sink}"),
+                        None => println!("  hw_sink: (auto-detected)"),
+                    }
+                }
+            } else {
+                println!("ok");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(resp) => {
+            let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error communicating with daemon: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -828,6 +946,7 @@ fn main() -> ExitCode {
         },
         Command::Device { action } => dispatch_device(action),
         Command::Mic { action } => dispatch_mic(action),
+        Command::Surround { action } => dispatch_surround(action),
         Command::Profile { action } => dispatch_profile(action),
         Command::Apply => dispatch_apply(),
         Command::Daemon { foreground: _ } => {
@@ -1581,6 +1700,117 @@ mod tests {
                 assert_eq!(param, "attenuation_limit_db");
                 assert!((value - 24.0).abs() < f32::EPSILON);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── F1.4: surround subcommand parsing tests ──────────────────────────────
+
+    #[test]
+    fn surround_status_parses() {
+        let cmd = parse(&["surround", "status"]).expect("surround status should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_on_parses() {
+        let cmd = parse(&["surround", "on"]).expect("surround on should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::On
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_off_parses() {
+        let cmd = parse(&["surround", "off"]).expect("surround off should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Off
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_hrir_list_parses() {
+        let cmd = parse(&["surround", "hrir", "list"]).expect("surround hrir list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Hrir {
+                    action: super::HrirAction::List
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_hrir_set_parses() {
+        let cmd = parse(&["surround", "hrir", "set", "02-dh-dolby-headphone"])
+            .expect("surround hrir set should parse");
+        match cmd {
+            super::Command::Surround {
+                action:
+                    super::SurroundAction::Hrir {
+                        action: super::HrirAction::Set { name },
+                    },
+            } => assert_eq!(name, "02-dh-dolby-headphone"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_channels_parses_comma_separated() {
+        let cmd = parse(&["surround", "channels", "game,media"])
+            .expect("surround channels game,media should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::Channels { channels },
+            } => assert_eq!(channels, vec!["game".to_string(), "media".to_string()]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_channels_parses_single() {
+        let cmd =
+            parse(&["surround", "channels", "game"]).expect("surround channels game should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::Channels { channels },
+            } => assert_eq!(channels, vec!["game".to_string()]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_hw_sink_with_device_parses() {
+        let cmd = parse(&["surround", "hw-sink", "alsa_output.usb-SteelSeries"])
+            .expect("surround hw-sink with device should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::HwSink { device },
+            } => assert_eq!(device, Some("alsa_output.usb-SteelSeries".into())),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_hw_sink_no_device_parses() {
+        let cmd =
+            parse(&["surround", "hw-sink"]).expect("surround hw-sink (no device) should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::HwSink { device },
+            } => assert_eq!(device, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

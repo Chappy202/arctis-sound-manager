@@ -76,6 +76,24 @@ pub enum Request {
     MicSuppressionBackend {
         backend: String,
     },
+    /// Enable or disable virtual surround (master switch).
+    SurroundEnable {
+        enabled: bool,
+    },
+    /// Set the active HRIR profile stem (bare filename without .wav).
+    SurroundSetHrir {
+        name: String,
+    },
+    /// Set which channels are routed through surround (e.g. ["game","media"]).
+    SurroundSetChannels {
+        channels: Vec<String>,
+    },
+    /// Pin (or clear) the surround output to a specific hardware sink.
+    SurroundSetHwSink {
+        hw_sink: Option<String>,
+    },
+    /// Return the current surround snapshot (EngineState.surround).
+    SurroundStatus,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -564,6 +582,167 @@ mod tests {
         assert!(
             json.contains("mic-suppression-backend"),
             "cmd tag must be mic-suppression-backend, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── F1.4: surround verb wire-tag parse tests ─────────────────────────────
+
+    #[test]
+    fn parse_surround_enable_true_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-enable","enabled":true}"#).unwrap();
+        assert_eq!(req, Request::SurroundEnable { enabled: true });
+    }
+
+    #[test]
+    fn parse_surround_enable_false_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-enable","enabled":false}"#).unwrap();
+        assert_eq!(req, Request::SurroundEnable { enabled: false });
+    }
+
+    #[test]
+    fn parse_surround_set_hrir_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-hrir","name":"02-dh-dolby-headphone"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetHrir {
+                name: "02-dh-dolby-headphone".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_channels_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-channels","channels":["game","media"]}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetChannels {
+                channels: vec!["game".into(), "media".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_hw_sink_some_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"surround-set-hw-sink","hw_sink":"alsa_output.usb-SteelSeries"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetHwSink {
+                hw_sink: Some("alsa_output.usb-SteelSeries".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_hw_sink_none_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-hw-sink","hw_sink":null}"#).unwrap();
+        assert_eq!(req, Request::SurroundSetHwSink { hw_sink: None });
+    }
+
+    #[test]
+    fn parse_surround_status_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"surround-status"}"#).unwrap();
+        assert_eq!(req, Request::SurroundStatus);
+    }
+
+    // ── F1.4: surround verb round-trip tests ─────────────────────────────────
+
+    #[test]
+    fn request_surround_enable_true_round_trips() {
+        let req = Request::SurroundEnable { enabled: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-enable"),
+            "cmd tag must be surround-enable, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_enable_false_round_trips() {
+        let req = Request::SurroundEnable { enabled: false };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-enable"),
+            "cmd tag must be surround-enable, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hrir_round_trips() {
+        let req = Request::SurroundSetHrir {
+            name: "02-dh-dolby-headphone".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hrir"),
+            "cmd tag must be surround-set-hrir, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_channels_round_trips() {
+        let req = Request::SurroundSetChannels {
+            channels: vec!["game".into(), "media".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-channels"),
+            "cmd tag must be surround-set-channels, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hw_sink_some_round_trips() {
+        let req = Request::SurroundSetHwSink {
+            hw_sink: Some("alsa_output.usb-SteelSeries".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hw-sink"),
+            "cmd tag must be surround-set-hw-sink, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hw_sink_none_round_trips() {
+        let req = Request::SurroundSetHwSink { hw_sink: None };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hw-sink"),
+            "cmd tag must be surround-set-hw-sink, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_status_round_trips() {
+        let req = Request::SurroundStatus;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-status"),
+            "cmd tag must be surround-status, got: {json}"
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
