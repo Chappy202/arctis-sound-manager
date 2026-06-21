@@ -179,7 +179,7 @@
     </div>
 
     <!-- Stage cards — dimmed when master is off -->
-    <div class="controls-layout" class:controls-layout--dimmed={!masterEnabled} aria-hidden={!masterEnabled}>
+    <div class="controls-layout" class:controls-layout--dimmed={!masterEnabled} inert={!masterEnabled || undefined}>
 
       <!-- ─── GAIN card ─────────────────────────────────────────────────── -->
       {#if gainStage}
@@ -480,6 +480,7 @@
         class="device-card device-card--live mic-eq-card"
         class:device-card--disabled={isStageDisabled(micEqStage)}
         class:controls-layout--dimmed={!masterEnabled}
+        inert={!masterEnabled || undefined}
         title={stageUnavailableTooltip(micEqStage)}
       >
         <div class="card-header">

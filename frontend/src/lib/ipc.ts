@@ -92,7 +92,9 @@ export function buildDeviceSetArgs(
   return { control, value };
 }
 
-/** Builds the camelCase arg object for the mic_eq_band command. */
+/** Builds the camelCase arg object for the mic_eq_band command.
+ * Tauri v2 converts these camelCase keys back to the Rust command's snake_case params
+ * at the invoke boundary — the same round-trip as buildSetEqBandArgs; this is intentional. */
 export function buildMicEqBandArgs(
   band: number,
   kind: string,
