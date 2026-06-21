@@ -85,6 +85,7 @@ pub fn mic_chain_spec(cfg: &MicChainConfig) -> ChainSpec {
         playback_passive: false,
         playback_target: None,
         playback_node_name: "arctis_clean_mic".to_string(),
+        capture_is_source_stream: true,
     }
 }
 

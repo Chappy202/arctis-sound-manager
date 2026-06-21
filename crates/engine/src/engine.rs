@@ -675,8 +675,10 @@ impl<R: CommandRunner> Engine<R> {
         }
         self.save_config()?;
 
-        // Recreate: remove then create with new node list.
-        {
+        // Only perform live graph I/O when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
             let profile = self.config.active()?.clone();
             let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
             self.mic_availability = availability;
@@ -804,14 +806,17 @@ impl<R: CommandRunner> Engine<R> {
         }
         self.save_config()?;
 
-        // Apply live: use MicBackend::apply_control.
-        // For the gain stage, value needs to be converted to linear.
-        let apply_value = if param == MicParam::GainDb {
-            convert::db_to_linear(value)
-        } else {
-            value
-        };
-        {
+        // Only perform live apply_control when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
+            // Apply live: use MicBackend::apply_control.
+            // For the gain stage, value needs to be converted to linear.
+            let apply_value = if param == MicParam::GainDb {
+                convert::db_to_linear(value)
+            } else {
+                value
+            };
             let profile = self.config.active()?.clone();
             let spec = convert::mic_chain_spec(&profile.mic);
             let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
@@ -846,8 +851,10 @@ impl<R: CommandRunner> Engine<R> {
         }
         self.save_config()?;
 
-        // Apply live via apply_control (3 controls per band node).
-        {
+        // Only perform live apply_control when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
             let profile = self.config.active()?.clone();
             let spec = convert::mic_chain_spec(&profile.mic);
             let node_name = convert::mic_eq_band_node_name(band);
@@ -922,8 +929,11 @@ impl<R: CommandRunner> Engine<R> {
         }
         self.save_config()?;
 
-        // Recreate
-        let hw_mic_snapshot = {
+        // Only perform live graph I/O (recreate) when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        let hw_mic_snapshot = self.config.active()?.mic.hw_mic.clone();
+        if self.config.active()?.mic.enabled {
             let profile = self.config.active()?.clone();
             let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
             self.mic_availability = availability;
@@ -933,8 +943,7 @@ impl<R: CommandRunner> Engine<R> {
             if let Some(token) = handle.child {
                 self.children.track(token);
             }
-            profile.mic.hw_mic.clone()
-        };
+        }
         self.emit(Event::MicHwMicSet {
             hw_mic: hw_mic_snapshot,
         });
@@ -2754,6 +2763,108 @@ mod tests {
                 .mic
                 .enabled,
             "reloaded config must show mic.enabled = false"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Fix 2+3 test A: mic_set_stage_enabled while master is OFF → config persisted, no spawn,
+    /// children unchanged, event emitted.
+    #[test]
+    fn mic_set_stage_enabled_when_master_off_persists_only_no_spawn() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("stage_master_off");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Master switch is OFF; gain stage starts OFF.
+        let cfg = make_config_mic_disabled();
+
+        // No runner outputs needed — master off path skips all graph I/O.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine =
+            Engine::with_probe(MockRunner::new(), cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_stage_enabled(StageKind::Gain, true)
+            .expect("mic_set_stage_enabled should succeed when master is off");
+
+        // Config persisted with gain.enabled = true
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("enabled = true"),
+            "persisted config must show gain enabled"
+        );
+
+        // No spawn: master off → no recreate
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "no spawn when master is off"
+        );
+        // No graph I/O calls (no pw-cli destroy / no create ls)
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no pw-cli calls when master is off"
+        );
+        // No child tokens tracked
+        assert_eq!(engine.children.len(), 0, "no children when master is off");
+
+        // Event must still be emitted
+        let event = rx.try_recv().expect("MicStageSet event must be emitted");
+        assert_eq!(
+            event,
+            crate::state::Event::MicStageSet {
+                stage: crate::state::StageName::Gain,
+                enabled: true,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Fix 2+3 test B: mic_set_param while master is OFF → config persisted, no pw-cli s Props call,
+    /// event emitted.
+    #[test]
+    fn mic_set_param_when_master_off_persists_only_no_props() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("param_master_off");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_mic_disabled(); // master off
+        cfg.profiles[0].mic.highpass.enabled = true;
+        cfg.profiles[0].mic.highpass.freq_hz = 80.0;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine =
+            Engine::with_probe(MockRunner::new(), cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_param(MicParam::HighpassFreq, 120.0)
+            .expect("mic_set_param should succeed when master is off");
+
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+
+        // No pw-cli s ... Props call
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no pw-cli calls (no apply_control) when master is off"
+        );
+
+        // Event must still be emitted
+        let event = rx.try_recv().expect("MicParamSet event must be emitted");
+        assert_eq!(
+            event,
+            crate::state::Event::MicParamSet {
+                param: MicParam::HighpassFreq,
+                value: 120.0,
+            }
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

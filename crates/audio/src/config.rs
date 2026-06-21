@@ -81,6 +81,9 @@ pub struct ChainSpec {
     /// The playback node.name; EQ sink uses "<name>.output", the mic
     /// source uses the bare "<name>" (the source IS the playback side).
     pub playback_node_name: String,
+    /// true for the Clean Mic source (capture.props needs `stream.capture.sink = false`);
+    /// false for EQ sinks.
+    pub capture_is_source_stream: bool,
 }
 
 // ─── Identity + routing for one virtual EQ sink ─────────────────────────────
@@ -246,18 +249,7 @@ pub fn render_chain_conf(spec: &ChainSpec, nodes: &[FilterNode]) -> Result<Strin
         spec.capture_media_class
     ));
     out.push_str(&capture_target_line);
-    // EQ sink: no stream.capture.sink line; mic source: added via capture_extra
-    // (handled by caller by convention — the spec doesn't carry a free-form
-    // extra line; the mic-source adapter adds it directly before calling us)
-    // Actually: the mic source fixture has `stream.capture.sink = false` in
-    // capture.props. We handle this via a dedicated field on ChainSpec — but
-    // the plan's ChainSpec doesn't include it.  Looking at the fixture we need
-    // it for the mic source. The plan says the mic source capture.props has
-    // `stream.capture.sink = false`. We'll add it only when capture_media_class
-    // is Audio/Source AND capture_target is Some (the mic source case).
-    // NOTE: This is inferred from the fixture — capture.props for mic source
-    // includes stream.capture.sink = false.
-    if spec.capture_media_class == "Audio/Source" && spec.capture_target.is_some() {
+    if spec.capture_is_source_stream {
         out.push_str("                stream.capture.sink = false\n");
     }
     out.push_str("            }\n");
@@ -310,6 +302,7 @@ pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String,
         playback_passive: true,
         playback_target: spec.playback_target.clone(),
         playback_node_name: format!("{}.output", spec.node_name),
+        capture_is_source_stream: false,
     };
 
     render_chain_conf(&chain_spec, &nodes)
@@ -378,6 +371,7 @@ mod tests {
             playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
+            capture_is_source_stream: true,
         }
     }
 
@@ -490,5 +484,52 @@ mod tests {
         let got = render_chain_conf(&passthrough_spec(), &full_chain_nodes()).unwrap();
         assert!(got.contains("type = ladspa"));
         assert!(got.contains("plugin = \"/usr/lib64/ladspa/librnnoise_ladspa.so\""));
+    }
+
+    /// Mic ChainSpec with `capture_target: None` (unpinned hw mic) and
+    /// `capture_is_source_stream: true` → output MUST still contain `stream.capture.sink = false`.
+    #[test]
+    fn render_chain_conf_emits_capture_sink_when_source_stream_unpinned() {
+        let spec = ChainSpec {
+            node_name: "arctis_clean_mic".into(),
+            description: "Clean Mic".into(),
+            channels: ChainChannels::Mono,
+            capture_media_class: "Audio/Source".into(),
+            capture_node_name: "arctis_clean_mic.capture".into(),
+            capture_target: None, // unpinned — no hw_mic set
+            playback_media_class: Some("Audio/Source".into()),
+            playback_passive: false,
+            playback_target: None,
+            playback_node_name: "arctis_clean_mic".into(),
+            capture_is_source_stream: true,
+        };
+        let got = render_chain_conf(&spec, &passthrough_nodes()).unwrap();
+        assert!(
+            got.contains("stream.capture.sink = false"),
+            "unpinned mic source must still emit stream.capture.sink = false"
+        );
+    }
+
+    /// EQ sink ChainSpec (`capture_is_source_stream: false`) → output MUST NOT contain
+    /// `stream.capture.sink = false`.
+    #[test]
+    fn render_chain_conf_omits_capture_sink_for_eq_sink() {
+        use crate::eq::{BandKind, EqBand};
+        let spec = SinkSpec {
+            node_name: "arctis_eq".into(),
+            description: "Arctis EQ Sink".into(),
+            playback_target: Some("alsa_output.hw0".into()),
+        };
+        let got = render_filter_chain_conf(
+            &spec,
+            &EqModel {
+                bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 0.0)],
+            },
+        )
+        .unwrap();
+        assert!(
+            !got.contains("stream.capture.sink"),
+            "EQ sink must not emit stream.capture.sink"
+        );
     }
 }

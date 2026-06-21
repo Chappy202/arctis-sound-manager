@@ -310,6 +310,7 @@ id 40, type PipeWire:Interface:Node/3
             playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
+            capture_is_source_stream: true,
         }
     }
 
