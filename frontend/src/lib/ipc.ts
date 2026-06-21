@@ -46,6 +46,14 @@ export interface MicSnapshot {
   available_suppression_backends: string[];
 }
 
+export interface SurroundSnapshot {
+  enabled: boolean;
+  hrir: string | null;
+  available_hrirs: string[];
+  channels: string[];
+  hw_sink: string | null;
+}
+
 export interface EngineState {
   active_profile: string;
   profiles: string[];
@@ -55,6 +63,7 @@ export interface EngineState {
   device_present: boolean;
   device_fields: Record<string, string>;
   mic: MicSnapshot;
+  surround: SurroundSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +194,24 @@ export const micHwMic = (device: string | null): Promise<EngineState> =>
 /** Switch the noise-suppression backend ("deep_filter" | "rnnoise"). */
 export const micSuppressionBackend = (backend: string): Promise<EngineState> =>
   invoke<EngineState>("mic_suppression_backend", { backend });
+
+// ── F1.5: Surround / HRIR commands ──────────────────────────────────────────
+
+/** Enable or disable virtual surround (master switch). */
+export const surroundEnable = (enabled: boolean): Promise<EngineState> =>
+  invoke<EngineState>("surround_enable", { enabled });
+
+/** Set the active HRIR profile by stem name (e.g. "02-dh-dolby-headphone"). */
+export const surroundSetHrir = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_hrir", { name });
+
+/** Set which channels are routed through surround (e.g. ["game", "media"]). */
+export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_channels", { channels });
+
+/** Pin (or clear) the surround output to a specific hardware sink. */
+export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_hw_sink", { hwSink });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

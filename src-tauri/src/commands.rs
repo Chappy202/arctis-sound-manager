@@ -168,3 +168,37 @@ pub async fn mic_suppression_backend(
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::MicSuppressionBackend { backend }).await
 }
+
+// ── F1.5: Surround / HRIR commands ──────────────────────────────────────────
+
+#[tauri::command]
+pub async fn surround_enable(
+    enabled: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundEnable { enabled }).await
+}
+
+#[tauri::command]
+pub async fn surround_set_hrir(
+    name: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundSetHrir { name }).await
+}
+
+#[tauri::command]
+pub async fn surround_set_channels(
+    channels: Vec<String>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundSetChannels { channels }).await
+}
+
+#[tauri::command]
+pub async fn surround_set_hw_sink(
+    hw_sink: Option<String>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundSetHwSink { hw_sink }).await
+}

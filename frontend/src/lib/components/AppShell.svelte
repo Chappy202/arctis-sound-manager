@@ -22,7 +22,7 @@
     { id: 'mixer',   label: 'MIXER',   icon: '⊞' },
     { id: 'eq',      label: 'EQ',      icon: '〰' },
     { id: 'device',  label: 'DEVICE',  icon: '◉' },
-    { id: 'spatial', label: 'SPATIAL', icon: '◎', disabled: true },
+    { id: 'spatial', label: 'SPATIAL', icon: '◎' },
     { id: 'mic',     label: 'MIC',     icon: '⏺' },
   ];
 

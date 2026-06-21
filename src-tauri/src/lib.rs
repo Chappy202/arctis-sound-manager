@@ -24,6 +24,10 @@ pub fn run() {
             commands::mic_eq_band,
             commands::mic_hw_mic,
             commands::mic_suppression_backend,
+            commands::surround_enable,
+            commands::surround_set_hrir,
+            commands::surround_set_channels,
+            commands::surround_set_hw_sink,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
