@@ -366,10 +366,124 @@ pub fn mic_eq_band_node_name(index: usize) -> String {
     format!("mic_eq_band_{index}")
 }
 
+// ─── Surround convert helpers ────────────────────────────────────────────────
+
+use arctis_audio::SurroundSpec;
+use arctis_config::SurroundConfig;
+use std::path::PathBuf;
+
+pub const HRIR_BASE_SUBPATH: &str = ".local/share/pipewire/hrir_hesuvi";
+
+/// Return the HRIR base directory derived from the `HOME` environment variable.
+///
+/// Call sites (engine::state, engine methods) call this ONCE and pass the
+/// resulting `PathBuf` down into `resolve_hrir_path` / `available_hrirs`, which
+/// are fully injected (no env reads inside).  Tests bypass this function entirely
+/// and pass a temp dir directly — eliminating the `$HOME` read from
+/// parallel-raced test paths.
+pub fn hrir_base_dir() -> Result<PathBuf, crate::error::EngineError> {
+    let home = std::env::var("HOME")
+        .map_err(|_| crate::error::EngineError::BadRequest("HOME env var not set".into()))?;
+    Ok(PathBuf::from(home).join(HRIR_BASE_SUBPATH))
+}
+
+/// Resolve the absolute HRIR .wav path from surround config.
+///
+/// `base_dir` is the HRIR base directory (e.g. `~/.local/share/pipewire/hrir_hesuvi`).
+/// Callers supply it via `hrir_base_dir()` in production; tests pass a temp path.
+///
+/// - If cfg.hrir == Some(stem) → <base_dir>/profiles/<stem>.wav  (error if missing)
+/// - If cfg.hrir == None → first *.wav in <base_dir>/profiles/ sorted lexicographically
+///   (fallback: <base_dir>/hrir.wav if it exists; else BadRequest error)
+pub fn resolve_hrir_path(
+    cfg: &SurroundConfig,
+    base_dir: &std::path::Path,
+) -> Result<PathBuf, crate::error::EngineError> {
+    let profiles_dir = base_dir.join("profiles");
+
+    match &cfg.hrir {
+        Some(stem) => {
+            let path = profiles_dir.join(format!("{stem}.wav"));
+            if path.exists() {
+                Ok(path)
+            } else {
+                Err(crate::error::EngineError::BadRequest(format!(
+                    "HRIR profile not found: {}",
+                    path.display()
+                )))
+            }
+        }
+        None => {
+            // Try profiles dir first (sorted lexicographically)
+            if profiles_dir.is_dir() {
+                let mut wavs: Vec<PathBuf> = std::fs::read_dir(&profiles_dir)
+                    .map_err(|e| {
+                        crate::error::EngineError::BadRequest(format!(
+                            "cannot read HRIR profiles dir: {e}"
+                        ))
+                    })?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wav"))
+                    .collect();
+                wavs.sort();
+                if let Some(first) = wavs.into_iter().next() {
+                    return Ok(first);
+                }
+            }
+            // Fallback: <base_dir>/hrir.wav
+            let fallback = base_dir.join("hrir.wav");
+            if fallback.exists() {
+                return Ok(fallback);
+            }
+            Err(crate::error::EngineError::BadRequest(
+                "no HRIR profiles found — install a .wav file in ~/.local/share/pipewire/hrir_hesuvi/profiles/".into()
+            ))
+        }
+    }
+}
+
+/// Return sorted HRIR stems (no .wav) from the profiles directory. Empty if dir missing.
+///
+/// `base_dir` is the HRIR base directory. Callers supply it via `hrir_base_dir()` in
+/// production; tests pass a temp path directly to avoid env reads.
+pub fn available_hrirs(base_dir: &std::path::Path) -> Vec<String> {
+    let profiles_dir = base_dir.join("profiles");
+    if !profiles_dir.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&profiles_dir) else {
+        return Vec::new();
+    };
+    let mut stems: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("wav"))
+        .filter_map(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    stems.sort();
+    stems
+}
+
+/// Build a SurroundSpec from a SurroundConfig.
+pub fn surround_spec(cfg: &SurroundConfig) -> SurroundSpec {
+    SurroundSpec {
+        node_name_base: "arctis_surround".into(),
+        description: "Arctis Surround Sink".into(),
+        hw_sink: cfg.hw_sink.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, Profile, RouteConfig};
+    use arctis_config::{
+        ChannelConfig, EqBandConfig, MicChainConfig, Profile, RouteConfig, SurroundConfig,
+    };
 
     fn profile_default() -> Profile {
         Profile {
@@ -381,6 +495,8 @@ mod tests {
                     description: "Game".to_string(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "chat".to_string(),
@@ -388,10 +504,13 @@ mod tests {
                     description: "Chat".to_string(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
             ],
             routes: vec![],
             mic: MicChainConfig::default(),
+            surround: SurroundConfig::default(),
         }
     }
 
@@ -442,6 +561,8 @@ mod tests {
             description: "Game".into(),
             output_device: None,
             eq: vec![],
+            volume_db: 0.0,
+            muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
         assert_eq!(model, EqModel::default_10band());
@@ -460,6 +581,8 @@ mod tests {
                 q: 1.0,
                 gain_db: 2.0,
             }],
+            volume_db: 0.0,
+            muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
         assert_eq!(model.bands.len(), 1);
@@ -475,6 +598,8 @@ mod tests {
             description: "Media".into(),
             output_device: Some("speakers".into()),
             eq: vec![],
+            volume_db: 0.0,
+            muted: false,
         };
         let def = channel_def_from_cfg(&ch);
         assert_eq!(def.id, "media");

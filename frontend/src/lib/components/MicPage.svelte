@@ -16,6 +16,7 @@
     micStage,
     micSet,
     micEqBand,
+    micHwMic,
     micSuppressionBackend,
     type MicStageSnapshot,
   } from "../ipc.js";
@@ -55,6 +56,21 @@
   // Suppression backend state from the snapshot
   const suppressionBackend    = $derived(mic?.suppression_backend ?? "deep_filter");
   const availableBackends     = $derived(mic?.available_suppression_backends ?? []);
+
+  // Pinned hardware mic source (null = auto)
+  const hwMic = $derived(mic?.hw_mic ?? null);
+
+  // hw_mic picker local state
+  let hwMicInput = $state("");
+  let settingHwMic = $state(false);
+  let hwMicError = $state<string | null>(null);
+
+  $effect(() => {
+    // Keep local input in sync when state arrives (only if not currently editing)
+    if (!settingHwMic) {
+      hwMicInput = hwMic ?? "";
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Mic EQ bands (mirroring EqPage pattern)
@@ -115,6 +131,43 @@
     micSuppressionBackend(backend).then(applyState).catch((err) => {
       console.warn(`[MicPage] micSuppressionBackend(${backend}) failed:`, err);
     });
+  }
+
+  async function onHwMicSet() {
+    const device = hwMicInput.trim() || null;
+    if (settingHwMic) return;
+    settingHwMic = true;
+    hwMicError = null;
+    try {
+      const next = await micHwMic(device);
+      applyState(next);
+    } catch (e) {
+      hwMicError = e instanceof Error ? e.message : "Failed to set hw mic";
+    } finally {
+      settingHwMic = false;
+    }
+  }
+
+  async function onHwMicClear() {
+    if (settingHwMic) return;
+    settingHwMic = true;
+    hwMicError = null;
+    hwMicInput = "";
+    try {
+      const next = await micHwMic(null);
+      applyState(next);
+    } catch (e) {
+      hwMicError = e instanceof Error ? e.message : "Failed to clear hw mic";
+    } finally {
+      settingHwMic = false;
+    }
+  }
+
+  function onHwMicKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onHwMicSet();
+    }
   }
 
   function handleMicEqBandChange(index: number, band: Band) {
@@ -189,6 +242,64 @@
             <div class="meter-bar meter-bar--static"></div>
           </div>
           <span class="meter-coming-soon">level metering coming soon</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Hardware mic source picker ===== -->
+    <div class="device-card device-card--live">
+      <div class="card-header">
+        <span class="card-icon" aria-hidden="true">◈</span>
+        <h2 class="card-title">HARDWARE MIC SOURCE</h2>
+        {#if hwMic}
+          <span class="pill pill--live">PINNED</span>
+        {:else}
+          <span class="pill pill--coming">AUTO</span>
+        {/if}
+      </div>
+      <div class="card-body">
+        <div class="control-row">
+          <span class="field-label">NODE NAME</span>
+          <div class="hw-mic-group">
+            <input
+              type="text"
+              class="route-input"
+              placeholder="auto (leave blank)"
+              value={hwMicInput}
+              oninput={(e) => { hwMicInput = (e.target as HTMLInputElement).value; }}
+              disabled={settingHwMic}
+              onkeydown={onHwMicKeydown}
+              aria-label="Hardware mic capture source node name"
+              autocomplete="off"
+              spellcheck={false}
+            />
+            <button
+              class="hw-mic-set-btn"
+              disabled={settingHwMic}
+              onclick={onHwMicSet}
+              aria-label="Pin hardware mic source"
+            >
+              {settingHwMic ? "…" : "Set"}
+            </button>
+            {#if hwMic}
+              <button
+                class="hw-mic-clear-btn"
+                disabled={settingHwMic}
+                onclick={onHwMicClear}
+                aria-label="Clear pinned hardware mic source (use auto)"
+              >
+                Clear
+              </button>
+            {/if}
+          </div>
+        </div>
+        {#if hwMicError}
+          <div class="hw-mic-error" role="alert">{hwMicError}</div>
+        {/if}
+        <div class="field-row">
+          <span class="field-label--hint">
+            Pin to a specific PipeWire capture source node.name (e.g. <code>alsa_input.usb-SteelSeries_Arctis_Nova_Pro_Wireless_Game-00.mono-fallback</code>). Leave blank for auto.
+          </span>
         </div>
       </div>
     </div>
@@ -402,10 +513,27 @@
                   <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_grace_ms"))} ms</span>
                 </div>
               </div>
+              <div class="control-row">
+                <span class="field-label">VAD RETRO GRACE (ms)</span>
+                <div class="slider-group">
+                  <input
+                    type="range"
+                    class="ss-slider"
+                    min="0"
+                    max="200"
+                    step="10"
+                    value={paramVal(suppressionStage, "vad_retro_grace_ms")}
+                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                    onchange={(e) => onParamChange("vad_retro_grace_ms", e)}
+                    aria-label="VAD retro grace period ms"
+                  />
+                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_retro_grace_ms"))} ms</span>
+                </div>
+              </div>
               <div class="field-row">
                 <span class="field-label--hint">
                   RNNoise can sound tinnier (no attenuation cap). Prefer DeepFilterNet for clean voice.
-                  VAD affects word-clipping, not timbral tinniness.
+                  VAD affects word-clipping, not timbral tinniness. Retro grace pads audio before speech detection onset.
                 </span>
               </div>
             {/if}
@@ -1030,6 +1158,123 @@
     font-size: var(--ss-type-caption-size);
     color: var(--ss-text-disabled);
     font-style: italic;
+  }
+
+  /* ===== HW mic picker ===== */
+  .hw-mic-group {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-2);
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .route-input {
+    height: var(--ss-field-h);
+    padding: 0 var(--ss-space-3);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text-primary);
+    font-family: var(--ss-font-mono);
+    font-size: var(--ss-type-body-size);
+    flex: 1;
+    min-width: 0;
+    transition:
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .route-input:focus {
+    outline: none;
+    border-color: var(--ss-accent-border);
+    background: var(--ss-surface-2);
+  }
+
+  .route-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .route-input::placeholder {
+    color: var(--ss-text-disabled);
+  }
+
+  .hw-mic-set-btn {
+    height: var(--ss-field-h);
+    padding: 0 var(--ss-space-4);
+    background: var(--ss-gradient-primary);
+    border: none;
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text-bright);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-button-size);
+    font-weight: var(--ss-type-button-weight);
+    letter-spacing: var(--ss-type-button-letter-spacing);
+    text-transform: uppercase;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .hw-mic-set-btn:hover:not(:disabled) {
+    filter: brightness(1.1);
+  }
+
+  .hw-mic-set-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .hw-mic-set-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .hw-mic-clear-btn {
+    height: var(--ss-field-h);
+    padding: 0 var(--ss-space-3);
+    background: transparent;
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text-secondary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-button-size);
+    font-weight: var(--ss-type-button-weight);
+    letter-spacing: var(--ss-type-button-letter-spacing);
+    text-transform: uppercase;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition:
+      color var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .hw-mic-clear-btn:hover:not(:disabled) {
+    color: var(--ss-danger);
+    border-color: var(--ss-danger);
+  }
+
+  .hw-mic-clear-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .hw-mic-clear-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .hw-mic-error {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    margin: 0;
+    padding: var(--ss-space-2) var(--ss-space-4);
+    background: var(--ss-danger-soft);
+    border-top: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
   }
 
   /* ===== Mic EQ full-width card ===== */

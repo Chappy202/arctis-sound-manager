@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { setRoute } from "../ipc.js";
+  import { setRoute, clearRoute } from "../ipc.js";
   import { engineState } from "../stores.js";
 
   let routes = $derived($engineState?.routes ?? []);
@@ -8,6 +8,24 @@
   let newSink = $state("");
   let adding = $state(false);
   let addError = $state<string | null>(null);
+
+  // Per-row remove state: set of app binaries currently being removed
+  let removing = $state(new Set<string>());
+  let removeError = $state<string | null>(null);
+
+  async function handleRemove(app: string) {
+    if (removing.has(app)) return;
+    removing = new Set([...removing, app]);
+    removeError = null;
+    try {
+      const next = await clearRoute(app);
+      engineState.set(next);
+    } catch (e) {
+      removeError = e instanceof Error ? e.message : "Failed to remove route";
+    } finally {
+      removing = new Set([...removing].filter((a) => a !== app));
+    }
+  }
 
   async function handleAdd() {
     const app = newApp.trim();
@@ -50,14 +68,27 @@
         <span>APP BINARY</span>
         <span>→</span>
         <span>TARGET SINK</span>
+        <span></span>
       </li>
-      {#each routes as [app, sink], i}
+      {#each routes as [app, sink]}
         <li class="route-row" aria-label="{app} routed to {sink}">
           <span class="route-app" title={app}>{app}</span>
           <span class="route-arrow" aria-hidden="true">→</span>
           <span class="route-sink" title={sink}>{sink}</span>
+          <button
+            class="route-remove-btn"
+            disabled={removing.has(app)}
+            onclick={() => handleRemove(app)}
+            aria-label="Remove route for {app}"
+            title="Remove route for {app}"
+          >
+            {removing.has(app) ? "…" : "✕"}
+          </button>
         </li>
       {/each}
+      {#if removeError}
+        <li class="route-remove-error" role="alert">{removeError}</li>
+      {/if}
     </ul>
   {/if}
 
@@ -169,7 +200,7 @@
 
   .route-table-head {
     display: grid;
-    grid-template-columns: 1fr auto 1fr;
+    grid-template-columns: 1fr auto 1fr auto;
     gap: var(--ss-space-3);
     padding: 0 var(--ss-space-2) var(--ss-space-1);
     font-family: var(--ss-font-ui);
@@ -182,7 +213,7 @@
 
   .route-row {
     display: grid;
-    grid-template-columns: 1fr auto 1fr;
+    grid-template-columns: 1fr auto 1fr auto;
     gap: var(--ss-space-3);
     align-items: center;
     padding: var(--ss-space-2);
@@ -193,6 +224,53 @@
 
   .route-row:hover {
     background: var(--ss-surface-3);
+  }
+
+  .route-remove-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    background: transparent;
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-tertiary);
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition:
+      color var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .route-remove-btn:hover:not(:disabled) {
+    color: var(--ss-danger);
+    border-color: var(--ss-danger);
+    background: var(--ss-danger-soft);
+  }
+
+  .route-remove-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .route-remove-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .route-remove-error {
+    list-style: none;
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    padding: var(--ss-space-2) var(--ss-space-3);
+    background: var(--ss-danger-soft);
+    border-radius: var(--ss-radius-xs);
+    border: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
   }
 
   .route-app,

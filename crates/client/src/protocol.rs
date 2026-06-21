@@ -76,6 +76,81 @@ pub enum Request {
     MicSuppressionBackend {
         backend: String,
     },
+    /// Enable or disable virtual surround (master switch).
+    SurroundEnable {
+        enabled: bool,
+    },
+    /// Set the active HRIR profile stem (bare filename without .wav).
+    SurroundSetHrir {
+        name: String,
+    },
+    /// Set which channels are routed through surround (e.g. ["game","media"]).
+    SurroundSetChannels {
+        channels: Vec<String>,
+    },
+    /// Pin (or clear) the surround output to a specific hardware sink.
+    SurroundSetHwSink {
+        hw_sink: Option<String>,
+    },
+    /// Return the current surround snapshot (EngineState.surround).
+    SurroundStatus,
+    /// Set the software volume (dB) for a single channel. Range: -60..=+6.
+    SetChannelVolume {
+        channel: String,
+        volume_db: f32,
+    },
+    /// Set the mute state for a single channel.
+    SetChannelMute {
+        channel: String,
+        muted: bool,
+    },
+    /// Rename an existing profile.
+    ProfileRename {
+        old: String,
+        new: String,
+    },
+    /// Delete a profile. The active profile and the last profile cannot be deleted.
+    ProfileDelete {
+        name: String,
+    },
+    /// Export a profile as a standalone TOML string. Returns Response with text payload.
+    ProfileExport {
+        name: String,
+    },
+    /// Import a profile from a TOML string. Resolves name collisions automatically.
+    ProfileImport {
+        toml: String,
+    },
+    /// Save the current EQ bands of a channel as a named preset.
+    EqPresetSave {
+        name: String,
+        channel: String,
+    },
+    /// Apply a named EQ preset to a channel's EQ bands.
+    EqPresetApply {
+        preset: String,
+        channel: String,
+    },
+    /// Delete a named EQ preset.
+    EqPresetDelete {
+        name: String,
+    },
+    /// Remove a routing rule for an app by binary name.
+    /// Drops the rule from persistent config + best-effort live clear (moves the
+    /// stream back to the default sink if it is currently running).
+    RouteClear {
+        app_binary: String,
+    },
+    /// Add a new channel to the active profile by id.
+    /// The engine derives node_name and description from the id.
+    ChannelAdd {
+        id: String,
+    },
+    /// Remove a channel from the active profile by id.
+    /// Errors if the channel does not exist or is the last remaining channel.
+    ChannelRemove {
+        id: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -85,6 +160,9 @@ pub struct Response {
     pub state: Option<EngineState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Export payload (profile TOML string). Populated only for ProfileExport responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl Response {
@@ -93,6 +171,16 @@ impl Response {
             ok: true,
             state: Some(state),
             error: None,
+            text: None,
+        }
+    }
+
+    pub fn ok_with_text(text: String) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: Some(text),
         }
     }
 
@@ -101,6 +189,7 @@ impl Response {
             ok: false,
             state: None,
             error: Some(msg),
+            text: None,
         }
     }
 }
@@ -174,6 +263,7 @@ mod tests {
             ok: true,
             state: None,
             error: None,
+            text: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -569,6 +659,167 @@ mod tests {
         assert_eq!(req, back);
     }
 
+    // ── F1.4: surround verb wire-tag parse tests ─────────────────────────────
+
+    #[test]
+    fn parse_surround_enable_true_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-enable","enabled":true}"#).unwrap();
+        assert_eq!(req, Request::SurroundEnable { enabled: true });
+    }
+
+    #[test]
+    fn parse_surround_enable_false_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-enable","enabled":false}"#).unwrap();
+        assert_eq!(req, Request::SurroundEnable { enabled: false });
+    }
+
+    #[test]
+    fn parse_surround_set_hrir_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-hrir","name":"02-dh-dolby-headphone"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetHrir {
+                name: "02-dh-dolby-headphone".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_channels_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-channels","channels":["game","media"]}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetChannels {
+                channels: vec!["game".into(), "media".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_hw_sink_some_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"surround-set-hw-sink","hw_sink":"alsa_output.usb-SteelSeries"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::SurroundSetHwSink {
+                hw_sink: Some("alsa_output.usb-SteelSeries".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parse_surround_set_hw_sink_none_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"surround-set-hw-sink","hw_sink":null}"#).unwrap();
+        assert_eq!(req, Request::SurroundSetHwSink { hw_sink: None });
+    }
+
+    #[test]
+    fn parse_surround_status_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"surround-status"}"#).unwrap();
+        assert_eq!(req, Request::SurroundStatus);
+    }
+
+    // ── F1.4: surround verb round-trip tests ─────────────────────────────────
+
+    #[test]
+    fn request_surround_enable_true_round_trips() {
+        let req = Request::SurroundEnable { enabled: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-enable"),
+            "cmd tag must be surround-enable, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_enable_false_round_trips() {
+        let req = Request::SurroundEnable { enabled: false };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-enable"),
+            "cmd tag must be surround-enable, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hrir_round_trips() {
+        let req = Request::SurroundSetHrir {
+            name: "02-dh-dolby-headphone".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hrir"),
+            "cmd tag must be surround-set-hrir, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_channels_round_trips() {
+        let req = Request::SurroundSetChannels {
+            channels: vec!["game".into(), "media".into()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-channels"),
+            "cmd tag must be surround-set-channels, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hw_sink_some_round_trips() {
+        let req = Request::SurroundSetHwSink {
+            hw_sink: Some("alsa_output.usb-SteelSeries".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hw-sink"),
+            "cmd tag must be surround-set-hw-sink, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_set_hw_sink_none_round_trips() {
+        let req = Request::SurroundSetHwSink { hw_sink: None };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-set-hw-sink"),
+            "cmd tag must be surround-set-hw-sink, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_surround_status_round_trips() {
+        let req = Request::SurroundStatus;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("surround-status"),
+            "cmd tag must be surround-status, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
     // ── Task 5b: MicEnable wire-tag parse test ───────────────────────────────
 
     #[test]
@@ -597,6 +848,348 @@ mod tests {
         let req = Request::MicEnable { enabled: false };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── F3a: new verb wire-tag parse tests ──────────────────────────────────
+
+    #[test]
+    fn parse_profile_rename_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-rename","old":"default","new":"gaming"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileRename {
+                old: "default".into(),
+                new: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_delete_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-delete","name":"gaming"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileDelete {
+                name: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_export_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-export","name":"gaming"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileExport {
+                name: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_import_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-import","toml":"name = \"test\""}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileImport {
+                toml: "name = \"test\"".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_save_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"eq-preset-save","name":"my-preset","channel":"game"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_apply_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"eq-preset-apply","preset":"my-preset","channel":"game"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "game".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_delete_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"eq-preset-delete","name":"my-preset"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetDelete {
+                name: "my-preset".into()
+            }
+        );
+    }
+
+    // ── F3a: new verb round-trip tests ────────────────────────────────────────
+
+    #[test]
+    fn request_profile_rename_round_trips() {
+        let req = Request::ProfileRename {
+            old: "default".into(),
+            new: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-rename"),
+            "cmd tag must be profile-rename, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_delete_round_trips() {
+        let req = Request::ProfileDelete {
+            name: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-delete"),
+            "cmd tag must be profile-delete, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_export_round_trips() {
+        let req = Request::ProfileExport {
+            name: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-export"),
+            "cmd tag must be profile-export, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_import_round_trips() {
+        let req = Request::ProfileImport {
+            toml: "name = \"test\"".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-import"),
+            "cmd tag must be profile-import, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_save_round_trips() {
+        let req = Request::EqPresetSave {
+            name: "gaming-boost".into(),
+            channel: "game".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-save"),
+            "cmd tag must be eq-preset-save, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_apply_round_trips() {
+        let req = Request::EqPresetApply {
+            preset: "gaming-boost".into(),
+            channel: "game".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-apply"),
+            "cmd tag must be eq-preset-apply, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_delete_round_trips() {
+        let req = Request::EqPresetDelete {
+            name: "gaming-boost".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-delete"),
+            "cmd tag must be eq-preset-delete, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn response_ok_with_text_round_trips() {
+        let resp = Response::ok_with_text("profile TOML here".into());
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.text.as_deref(), Some("profile TOML here"));
+        assert!(back.state.is_none());
+        assert!(back.error.is_none());
+    }
+
+    #[test]
+    fn response_ok_with_text_has_no_state_field() {
+        let resp = Response::ok_with_text("exported".into());
+        let json = serde_json::to_string(&resp).unwrap();
+        // `state` should not appear (skip_serializing_if = None)
+        assert!(!json.contains("\"state\""), "state must be absent: {json}");
+    }
+
+    // ── F5a: RouteClear wire-tag + round-trip tests ──────────────────────────
+
+    #[test]
+    fn parse_route_clear_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"route-clear","app_binary":"firefox"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::RouteClear {
+                app_binary: "firefox".into()
+            }
+        );
+    }
+
+    #[test]
+    fn request_route_clear_round_trips() {
+        let req = Request::RouteClear {
+            app_binary: "firefox".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("route-clear"),
+            "cmd tag must be route-clear, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── F4: ChannelAdd / ChannelRemove wire-tag parse tests ──────────────────
+
+    #[test]
+    fn parse_channel_add_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"channel-add","id":"aux"}"#).unwrap();
+        assert_eq!(req, Request::ChannelAdd { id: "aux".into() });
+    }
+
+    #[test]
+    fn parse_channel_remove_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"channel-remove","id":"aux"}"#).unwrap();
+        assert_eq!(req, Request::ChannelRemove { id: "aux".into() });
+    }
+
+    #[test]
+    fn request_channel_add_round_trips() {
+        let req = Request::ChannelAdd { id: "aux".into() };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("channel-add"),
+            "cmd tag must be channel-add, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_channel_remove_round_trips() {
+        let req = Request::ChannelRemove { id: "aux".into() };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("channel-remove"),
+            "cmd tag must be channel-remove, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──
+
+    #[test]
+    fn parse_set_channel_volume_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"set-channel-volume","channel":"game","volume_db":-6.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: -6.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_set_channel_mute_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"set-channel-mute","channel":"chat","muted":true}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelMute {
+                channel: "chat".into(),
+                muted: true,
+            }
+        );
+    }
+
+    #[test]
+    fn request_set_channel_volume_round_trips() {
+        let req = Request::SetChannelVolume {
+            channel: "game".into(),
+            volume_db: -6.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("set-channel-volume"),
+            "cmd tag must be set-channel-volume, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_set_channel_mute_round_trips() {
+        let req = Request::SetChannelMute {
+            channel: "chat".into(),
+            muted: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("set-channel-mute"),
+            "cmd tag must be set-channel-mute, got: {json}"
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

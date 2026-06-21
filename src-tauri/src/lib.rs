@@ -15,6 +15,7 @@ pub fn run() {
             commands::switch_profile,
             commands::set_eq_band,
             commands::set_route,
+            commands::clear_route,
             commands::set_channel_output,
             commands::profile_new,
             commands::device_set,
@@ -24,6 +25,24 @@ pub fn run() {
             commands::mic_eq_band,
             commands::mic_hw_mic,
             commands::mic_suppression_backend,
+            commands::set_channel_volume,
+            commands::set_channel_mute,
+            commands::surround_enable,
+            commands::surround_set_hrir,
+            commands::surround_set_channels,
+            commands::surround_set_hw_sink,
+            // F3b: profile management
+            commands::profile_rename,
+            commands::profile_delete,
+            commands::profile_export,
+            commands::profile_import,
+            // F3b: EQ presets
+            commands::eq_preset_save,
+            commands::eq_preset_apply,
+            commands::eq_preset_delete,
+            // F4: Channel add / remove
+            commands::channel_add,
+            commands::channel_remove,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

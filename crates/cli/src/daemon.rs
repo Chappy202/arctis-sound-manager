@@ -88,6 +88,10 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::RouteClear { app_binary } => match engine.clear_route(&app_binary) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::SetChannelOutput { channel, device } => {
             match engine.set_channel_output(&channel, device) {
                 Ok(()) => Response::ok_with_state(engine.state()),
@@ -153,6 +157,73 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 Ok(()) => Response::ok_with_state(engine.state()),
                 Err(e) => Response::err(e.to_string()),
             },
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundStatus => Response::ok_with_state(engine.state()),
+        Request::SurroundEnable { enabled } => match engine.surround_set_enabled(enabled) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetHrir { name } => match engine.surround_set_hrir(name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetChannels { channels } => match engine.surround_set_channels(channels) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundSetHwSink { hw_sink } => match engine.surround_set_hw_sink(hw_sink) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SetChannelVolume { channel, volume_db } => {
+            match engine.set_channel_volume(&channel, volume_db) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::SetChannelMute { channel, muted } => {
+            match engine.set_channel_mute(&channel, muted) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::ProfileRename { old, new } => match engine.rename_profile(&old, &new) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ProfileDelete { name } => match engine.delete_profile(&name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ProfileExport { name } => match engine.export_profile(&name) {
+            Ok(toml) => Response::ok_with_text(toml),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ProfileImport { toml } => match engine.import_profile(&toml) {
+            Ok(_name) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::EqPresetSave { name, channel } => match engine.save_eq_preset(&name, &channel) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::EqPresetApply { preset, channel } => {
+            match engine.apply_eq_preset(&preset, &channel) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::EqPresetDelete { name } => match engine.delete_eq_preset(&name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ChannelAdd { id } => match engine.add_channel(&id) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ChannelRemove { id } => match engine.remove_channel(&id) {
+            Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
     }
@@ -362,6 +433,8 @@ mod tests {
                 description: "Game".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "chat".into(),
@@ -369,6 +442,8 @@ mod tests {
                 description: "Chat".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "media".into(),
@@ -376,6 +451,8 @@ mod tests {
                 description: "Media".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
         ];
         Config {
@@ -387,14 +464,17 @@ mod tests {
                     channels: channels.clone(),
                     routes: vec![],
                     mic: MicChainConfig::default(),
+                    surround: arctis_config::SurroundConfig::default(),
                 },
                 Profile {
                     name: "gaming".into(),
                     channels,
                     routes: vec![],
                     mic: MicChainConfig::default(),
+                    surround: arctis_config::SurroundConfig::default(),
                 },
             ],
+            eq_presets: vec![],
         }
     }
 
@@ -420,6 +500,11 @@ mod tests {
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+        }
+        // Phase 2b: 3 channels × (1 ls + 1 Props set for volume/mute)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+            r = r.with_output(0, "", "");
         }
         r
     }
@@ -957,6 +1042,224 @@ mod tests {
         assert!(resp.error.is_some());
     }
 
+    // ── F1.4: surround dispatch tests ────────────────────────────────────────
+
+    #[test]
+    fn handle_surround_status_returns_ok_with_surround_snapshot() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::SurroundStatus);
+        assert!(resp.ok, "SurroundStatus must return ok:true");
+        let state = resp.state.expect("state must be present");
+        // surround snapshot is always present (default disabled, no HRIR)
+        assert!(!state.surround.enabled, "default surround must be disabled");
+    }
+
+    #[test]
+    fn handle_surround_enable_false_returns_ok() {
+        // surround_set_enabled(false) calls save_config() which reads ASM_CONFIG_HOME.
+        // Without ENV_MUTEX + a valid temp dir, a parallel test could have set
+        // ASM_CONFIG_HOME to a now-deleted temp dir, causing save_config to fail and
+        // resp.ok to be false (flake).  Hold the lock and give config a valid home.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_surr_en_false_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        // disable (already disabled by default) — must return ok
+        let resp = handle_request(&mut engine, Request::SurroundEnable { enabled: false });
+        assert!(
+            resp.ok,
+            "SurroundEnable false must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(!state.surround.enabled);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_hrir_unknown_name_returns_error() {
+        // No HRIR profiles dir → requesting any specific stem returns an error.
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetHrir {
+                name: "nonexistent-hrir".into(),
+            },
+        );
+        // The engine returns BadRequest (no profiles dir / stem not found) → Response::err.
+        assert!(
+            !resp.ok,
+            "SurroundSetHrir with unknown stem must return ok:false"
+        );
+        assert!(resp.error.is_some(), "error must be present");
+    }
+
+    #[test]
+    fn handle_surround_set_channels_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_sc_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetChannels {
+                channels: vec!["game".into()],
+            },
+        );
+        assert!(
+            resp.ok,
+            "SurroundSetChannels must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.surround.channels, vec!["game".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_hw_sink_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_hs_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetHwSink {
+                hw_sink: Some("alsa_output.usb-SteelSeries".into()),
+            },
+        );
+        assert!(
+            resp.ok,
+            "SurroundSetHwSink must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(
+            state.surround.hw_sink,
+            Some("alsa_output.usb-SteelSeries".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_hw_sink_none_clears_pin() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_hsn_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::SurroundSetHwSink { hw_sink: None });
+        assert!(
+            resp.ok,
+            "SurroundSetHwSink None must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.surround.hw_sink, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ── F5a: RouteClear dispatch test ────────────────────────────────────────
+
+    #[test]
+    fn handle_route_clear_removes_rule_and_returns_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_rc_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Seed config with a route for "firefox".
+        let mut cfg = two_profile_config();
+        cfg.profiles[0].routes.push(arctis_config::RouteConfig {
+            app_binary: "firefox".into(),
+            target_sink: "Arctis_Media".into(),
+        });
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify route exists in state before clear.
+        let state_before = engine.state();
+        assert!(
+            state_before.routes.iter().any(|(app, _)| app == "firefox"),
+            "firefox route must exist before clear"
+        );
+
+        let resp = handle_request(
+            &mut engine,
+            Request::RouteClear {
+                app_binary: "firefox".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "RouteClear must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.routes.iter().any(|(app, _)| app == "firefox"),
+            "firefox route must be absent after clear: {:?}",
+            state.routes
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ── F5a: MicSnapshot.hw_mic surfaced in state ────────────────────────────
+
+    #[test]
+    fn mic_status_includes_hw_mic_when_pinned() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_hwmic_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = two_profile_config();
+        cfg.profiles[0].mic.hw_mic = Some("alsa_input.usb-SteelSeries".into());
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::MicStatus);
+        assert!(resp.ok, "MicStatus must return ok:true");
+        let state = resp.state.expect("state must be present");
+        assert_eq!(
+            state.mic.hw_mic.as_deref(),
+            Some("alsa_input.usb-SteelSeries"),
+            "hw_mic must be surfaced in MicSnapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn mic_status_hw_mic_none_when_not_pinned() {
+        let cfg = two_profile_config(); // hw_mic defaults to None
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::MicStatus);
+        assert!(resp.ok);
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.mic.hw_mic.is_none(),
+            "hw_mic must be None when not configured"
+        );
+    }
+
     #[test]
     fn handle_mic_set_unknown_param_returns_error() {
         let cfg = two_profile_config();
@@ -998,6 +1301,495 @@ mod tests {
 
         drop(engine);
         worker.join().expect("fake worker must not panic");
+    }
+
+    // ── F3a: profile rename/delete/export/import dispatch tests ─────────────
+
+    #[test]
+    fn handle_profile_rename_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_ren_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileRename {
+                old: "gaming".into(),
+                new: "competitive".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "profile rename must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.profiles.contains(&"competitive".to_string()),
+            "renamed profile must appear in state"
+        );
+        assert!(
+            !state.profiles.contains(&"gaming".to_string()),
+            "old name must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_rename_unknown_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileRename {
+                old: "nonexistent".into(),
+                new: "new_name".into(),
+            },
+        );
+        assert!(
+            !resp.ok,
+            "rename of nonexistent profile must return ok:false"
+        );
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_profile_delete_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_del_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileDelete {
+                name: "gaming".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "profile delete must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.profiles.contains(&"gaming".to_string()),
+            "deleted profile must not appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_delete_active_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileDelete {
+                name: "default".into(), // active profile
+            },
+        );
+        assert!(!resp.ok, "deleting active profile must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_profile_export_returns_toml_text() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileExport {
+                name: "gaming".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "profile export must return ok:true, got: {:?}",
+            resp.error
+        );
+        assert!(
+            resp.state.is_none(),
+            "export response must not include state"
+        );
+        let text = resp.text.expect("export must return text payload");
+        assert!(
+            text.contains("gaming"),
+            "exported TOML must mention the profile name"
+        );
+    }
+
+    #[test]
+    fn handle_profile_export_unknown_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileExport {
+                name: "nonexistent".into(),
+            },
+        );
+        assert!(
+            !resp.ok,
+            "export of nonexistent profile must return ok:false"
+        );
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_profile_import_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_imp_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // First export an existing profile to get valid TOML
+        let export_resp = handle_request(
+            &mut engine,
+            Request::ProfileExport {
+                name: "gaming".into(),
+            },
+        );
+        assert!(export_resp.ok);
+        let gaming_toml = export_resp.text.unwrap();
+
+        // Modify the TOML to rename it so there's no collision
+        let renamed_toml = gaming_toml.replace("gaming", "imported_profile");
+
+        let resp = handle_request(&mut engine, Request::ProfileImport { toml: renamed_toml });
+        assert!(
+            resp.ok,
+            "profile import must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state
+                .profiles
+                .iter()
+                .any(|n| n.contains("imported_profile")),
+            "imported profile must appear in state: {:?}",
+            state.profiles
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_import_invalid_toml_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileImport {
+                toml: "this is not valid toml !!!".into(),
+            },
+        );
+        assert!(!resp.ok, "invalid TOML import must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    // ── F3a: EQ preset dispatch tests ──────────────────────────────────────
+
+    #[test]
+    fn handle_eq_preset_save_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_prsave_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "eq preset save must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.eq_presets.iter().any(|p| p.name == "my-preset"),
+            "saved preset must appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_eq_preset_save_unknown_channel_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "nonexistent".into(),
+            },
+        );
+        assert!(!resp.ok, "unknown channel must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_eq_preset_delete_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_prdel_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // First save a preset
+        let save_resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(save_resp.ok);
+
+        // Then delete it
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetDelete {
+                name: "my-preset".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "eq preset delete must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.eq_presets.iter().any(|p| p.name == "my-preset"),
+            "deleted preset must not appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_eq_preset_delete_unknown_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetDelete {
+                name: "nonexistent-preset".into(),
+            },
+        );
+        assert!(!resp.ok, "deleting nonexistent preset must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_eq_preset_apply_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_apply_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // apply_eq_preset calls apply_all for the channel: 1 ls (find_node_id) + 10 band sets
+        let mut runner = MockRunner::new();
+        // save_eq_preset: no runner calls needed
+        // apply_eq_preset → apply_all → find_node_id ls + 10 band set calls
+        runner = runner.with_output(0, &ls, ""); // find_node_id
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", ""); // band set Props
+        }
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        // First save a preset from the game channel
+        let save_resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(save_resp.ok, "save must succeed before apply");
+
+        // Then apply the preset to the chat channel
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "chat".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "eq preset apply must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present after apply");
+        // Preset still visible in state
+        assert!(
+            state.eq_presets.iter().any(|p| p.name == "my-preset"),
+            "applied preset must still appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_eq_preset_apply_unknown_preset_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "nonexistent-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(!resp.ok, "applying nonexistent preset must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_eq_preset_apply_unknown_channel_errors() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_applych_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Save a preset first
+        let save_resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(save_resp.ok);
+
+        // Apply to nonexistent channel
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "nonexistent".into(),
+            },
+        );
+        assert!(
+            !resp.ok,
+            "applying to nonexistent channel must return ok:false"
+        );
+        assert!(resp.error.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ── F2.1: SetChannelVolume / SetChannelMute dispatch tests ───────────────
+
+    #[test]
+    fn handle_set_channel_volume_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_vol_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // set_channel_volume calls apply_volume_mute: 1 ls (find_node_id) + 1 Props set
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // pw-cli s ... Props ...
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: -6.0,
+            },
+        );
+        assert!(
+            resp.ok,
+            "set_channel_volume must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.unwrap();
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game.volume_db, -6.0, "volume_db must be updated in state");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_mute_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_mute_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // set_channel_mute calls apply_volume_mute: 1 ls + 1 Props set
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelMute {
+                channel: "chat".into(),
+                muted: true,
+            },
+        );
+        assert!(
+            resp.ok,
+            "set_channel_mute must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.unwrap();
+        let chat = state.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert!(chat.muted, "muted must be true in state");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_volume_out_of_range_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: 99.0, // out of range
+            },
+        );
+        assert!(!resp.ok, "out-of-range volume must return ok:false");
+        assert!(resp.error.is_some());
     }
 
     // ── Integration test: shutdown breaks accept loop ─────────────────────────
@@ -1093,5 +1885,103 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_cfg);
+    }
+
+    // ── F4: channel add/remove dispatch tests ────────────────────────────────
+
+    #[test]
+    fn handle_channel_add_returns_state_with_new_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f4_add_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // add_channel → create sink:
+        //   1. sink_exists() → pw-cli ls Node (Arctis_Aux not in output → absent)
+        //   2. std::fs::write conf (real file in /tmp — OK in tests)
+        //   3. spawn_owned "pipewire -c <conf>" (MockRunner records, returns token)
+        // Queue one ls output that does NOT contain Arctis_Aux so create() spawns.
+        let ls = ls_all_present(); // has Game/Chat/Media but not Aux
+        let runner = MockRunner::new().with_output(0, &ls, ""); // sink_exists ls for Arctis_Aux
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "aux".into() });
+        assert!(
+            resp.ok,
+            "channel-add must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.channels.iter().any(|c| c.id == "aux"),
+            "new channel must appear in state: {:?}",
+            state.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_channel_add_duplicate_id_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "game".into() });
+        assert!(!resp.ok, "duplicate id must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_channel_add_empty_id_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "".into() });
+        assert!(!resp.ok, "empty id must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_channel_remove_returns_state_without_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f4_rem_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // remove_channel → AudioBackend::remove:
+        //   1. sink_exists() → pw-cli ls Node (returns present)
+        //   2. find_node_id() → pw-cli ls Node (returns node with id)
+        //   3. pw-cli destroy <id>
+        //   4. pkill -f <conf_path> (best-effort — ignored; still consumes a queue slot)
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // sink_exists ls
+            .with_output(0, &ls, "") // find_node_id ls
+            .with_output(0, "", "") // pw-cli destroy
+            .with_output(1, "", ""); // pkill (exit 1 = nothing matched — ignored)
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "game".into() });
+        assert!(
+            resp.ok,
+            "channel-remove must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.channels.iter().any(|c| c.id == "game"),
+            "removed channel must not appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_channel_remove_nonexistent_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "aux".into() });
+        assert!(!resp.ok, "nonexistent channel must return ok:false");
+        assert!(resp.error.is_some());
     }
 }

@@ -1,11 +1,11 @@
 use arctis_domain::eq_bounds::{
-    EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
-    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
-    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
-    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
-    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
-    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
-    MIC_VAD_THRESHOLD_MIN,
+    CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB,
+    EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -240,6 +240,12 @@ pub struct ChannelConfig {
     pub output_device: Option<String>, // hardware sink node.name, or None = default
     #[serde(default)]
     pub eq: Vec<EqBandConfig>, // empty => flat 10-band default at apply time
+    /// Software volume in dB. 0.0 = unity gain. Range: -60..=+6.
+    #[serde(default)]
+    pub volume_db: f32,
+    /// Whether the channel is muted.
+    #[serde(default)]
+    pub muted: bool,
 }
 
 /// Application-level routing rule.
@@ -247,6 +253,46 @@ pub struct ChannelConfig {
 pub struct RouteConfig {
     pub app_binary: String,
     pub target_sink: String,
+}
+
+// ── Surround / HRIR config ────────────────────────────────────────────────────
+
+fn default_surround_channels() -> Vec<String> {
+    vec!["game".into(), "media".into()]
+}
+
+/// Per-profile virtual-surround (HRIR) configuration.
+/// Default = **disabled** — no surround processing, passthrough to hardware sink.
+/// Old configs lacking a `[surround]` block deserialize cleanly to the default
+/// via `#[serde(default)]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurroundConfig {
+    /// Master switch. false => no surround sink is spawned. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HRIR profile stem (bare filename without `.wav`), e.g. `"00-default-asm"`.
+    /// None = first available profile lexicographically. Engine resolves to abs path.
+    #[serde(default)]
+    pub hrir: Option<String>,
+    /// Channel ids whose output is routed through the surround sink.
+    /// Defaults to `["game", "media"]`. Chat bypasses surround by default.
+    #[serde(default = "default_surround_channels")]
+    pub channels: Vec<String>,
+    /// Pinned hardware sink node.name for the surround output tail.
+    /// None = follow the Arctis hardware sink discovered at runtime.
+    #[serde(default)]
+    pub hw_sink: Option<String>,
+}
+
+impl Default for SurroundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hrir: None,
+            channels: default_surround_channels(),
+            hw_sink: None,
+        }
+    }
 }
 
 /// Named collection of channel configs and routing rules.
@@ -260,6 +306,20 @@ pub struct Profile {
     /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
     #[serde(default)]
     pub mic: MicChainConfig,
+    /// Virtual-surround (HRIR) config. Defaults to disabled.
+    /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub surround: SurroundConfig,
+}
+
+/// A named, reusable set of EQ bands (shared library across all profiles).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqPreset {
+    pub name: String,
+    /// Optional hint about what kind of audio this preset suits (e.g. "gaming", "music").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_hint: Option<String>,
+    pub bands: Vec<EqBandConfig>,
 }
 
 /// Root configuration object. Versioned for forward-compatibility checking.
@@ -268,6 +328,10 @@ pub struct Config {
     pub version: u32,
     pub active_profile: String,
     pub profiles: Vec<Profile>,
+    /// Shared EQ preset library (not per-profile — presets are reusable across profiles).
+    /// Defaults to empty (back-compat: old configs without this field load correctly).
+    #[serde(default)]
+    pub eq_presets: Vec<EqPreset>,
 }
 
 impl Config {
@@ -281,6 +345,8 @@ impl Config {
                 description: "Game audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "chat".to_string(),
@@ -288,6 +354,8 @@ impl Config {
                 description: "Chat audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "media".to_string(),
@@ -295,6 +363,8 @@ impl Config {
                 description: "Media audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
         ];
 
@@ -306,7 +376,9 @@ impl Config {
                 channels,
                 routes: Vec::new(),
                 mic: MicChainConfig::default(),
+                surround: SurroundConfig::default(),
             }],
+            eq_presets: Vec::new(),
         }
     }
 
@@ -375,6 +447,12 @@ impl Config {
                             band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, channel.id
                         )));
                     }
+                }
+                if !(CHANNEL_VOLUME_MIN_DB..=CHANNEL_VOLUME_MAX_DB).contains(&channel.volume_db) {
+                    return Err(ConfigError::Invalid(format!(
+                        "volume_db {} dB out of range {}..={} in channel '{}'",
+                        channel.volume_db, CHANNEL_VOLUME_MIN_DB, CHANNEL_VOLUME_MAX_DB, channel.id
+                    )));
                 }
             }
 
@@ -503,6 +581,23 @@ impl Config {
                             band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, profile.name
                         )));
                     }
+                }
+            }
+
+            // Surround validation: pure, no I/O. File existence is the engine's job (F1.3).
+            // hrir must be a bare stem — no path separators, no empty string.
+            if let Some(stem) = &profile.surround.hrir {
+                if stem.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "surround.hrir must not be empty in profile '{}'; use None to select the first available",
+                        profile.name
+                    )));
+                }
+                if stem.contains('/') || stem.contains('\\') {
+                    return Err(ConfigError::Invalid(format!(
+                        "surround.hrir '{}' must be a bare stem (no path separators) in profile '{}'",
+                        stem, profile.name
+                    )));
                 }
             }
         }
@@ -984,6 +1079,208 @@ description = "Chat"
         assert!(
             cfg.validate().is_ok(),
             "attenuation_limit_db=100.0 (max) should be accepted"
+        );
+    }
+
+    // ── Task F1.1: SurroundConfig tests ──────────────────────────────────────
+
+    /// 1. `SurroundConfig::default()` matches the documented defaults.
+    #[test]
+    fn surround_default_values() {
+        let s = SurroundConfig::default();
+        assert!(!s.enabled, "surround must default to disabled");
+        assert_eq!(s.hrir, None, "hrir must default to None");
+        assert_eq!(
+            s.channels,
+            vec!["game".to_string(), "media".to_string()],
+            "channels must default to [game, media]"
+        );
+        assert_eq!(s.hw_sink, None, "hw_sink must default to None");
+    }
+
+    /// 2. A profile TOML without any surround block deserializes to default (back-compat).
+    #[test]
+    fn old_config_without_surround_block_deserializes_to_default() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("should deserialize old config");
+        let profile = cfg.active().expect("active profile");
+        assert_eq!(
+            profile.surround,
+            SurroundConfig::default(),
+            "old config without surround block must deserialize to default"
+        );
+    }
+
+    /// 3. A fully-populated surround config round-trips via TOML.
+    #[test]
+    fn surround_toml_round_trips() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround = SurroundConfig {
+            enabled: true,
+            hrir: Some("00-default-asm".to_string()),
+            channels: vec!["game".to_string(), "chat".to_string(), "media".to_string()],
+            hw_sink: Some("alsa_output.usb_headset".to_string()),
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            cfg, deserialized,
+            "surround TOML round-trip must preserve config"
+        );
+    }
+
+    /// 4. Validation rejects hrir with a forward slash (path separator).
+    #[test]
+    fn validate_rejects_surround_hrir_with_forward_slash() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("foo/bar".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("hrir with '/' should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 5. Validation rejects hrir with a backslash (path separator).
+    #[test]
+    fn validate_rejects_surround_hrir_with_backslash() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("foo\\bar".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("hrir with '\\' should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 6. Validation rejects an empty hrir string.
+    #[test]
+    fn validate_rejects_surround_hrir_empty() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some(String::new());
+        let err = cfg.validate().expect_err("empty hrir should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 7. Validation accepts a valid bare-stem hrir.
+    #[test]
+    fn validate_accepts_surround_hrir_valid_stem() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("00-default-asm".to_string());
+        assert!(
+            cfg.validate().is_ok(),
+            "valid bare stem '00-default-asm' should be accepted"
+        );
+    }
+
+    /// 8. Validation accepts hrir = None.
+    #[test]
+    fn validate_accepts_surround_hrir_none() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = None;
+        assert!(cfg.validate().is_ok(), "hrir=None should be accepted");
+    }
+
+    /// 9. default_config() surround field is the default (disabled).
+    #[test]
+    fn default_config_includes_surround_disabled() {
+        let cfg = Config::default_config();
+        assert!(cfg.validate().is_ok(), "default_config must be valid");
+        for profile in &cfg.profiles {
+            assert_eq!(
+                profile.surround,
+                SurroundConfig::default(),
+                "profile '{}' surround should be default (disabled)",
+                profile.name
+            );
+        }
+    }
+
+    // ── F2.1: per-channel volume/mute config tests ────────────────────────────
+
+    /// volume_db=0.0 (default) passes validation.
+    #[test]
+    fn default_channel_volume_is_valid() {
+        let cfg = Config::default_config();
+        assert!(cfg.validate().is_ok(), "default config must be valid");
+        let profile = cfg.active().unwrap();
+        for ch in &profile.channels {
+            assert!(
+                (ch.volume_db - 0.0).abs() < f32::EPSILON,
+                "default volume_db must be 0.0"
+            );
+            assert!(!ch.muted, "default muted must be false");
+        }
+    }
+
+    /// volume_db at max boundary (+6.0) passes.
+    #[test]
+    fn validate_accepts_channel_volume_at_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = 6.0;
+        assert!(cfg.validate().is_ok(), "+6.0 dB must be accepted");
+    }
+
+    /// volume_db at min boundary (-60.0) passes.
+    #[test]
+    fn validate_accepts_channel_volume_at_min() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -60.0;
+        assert!(cfg.validate().is_ok(), "-60.0 dB must be accepted");
+    }
+
+    /// volume_db just above max (+6.01) is rejected.
+    #[test]
+    fn validate_rejects_channel_volume_above_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = 6.01;
+        let err = cfg.validate().expect_err("+6.01 dB should be rejected");
+        assert!(matches!(err, ConfigError::Invalid(_)), "expected Invalid");
+    }
+
+    /// volume_db just below min (-60.01) is rejected.
+    #[test]
+    fn validate_rejects_channel_volume_below_min() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -60.01;
+        let err = cfg.validate().expect_err("-60.01 dB should be rejected");
+        assert!(matches!(err, ConfigError::Invalid(_)), "expected Invalid");
+    }
+
+    /// Config without volume_db/muted in TOML round-trips correctly (backward compat).
+    #[test]
+    fn channel_config_toml_round_trips_with_volume_fields() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -3.5;
+        cfg.profiles[0].channels[0].muted = true;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            cfg, deserialized,
+            "TOML round-trip must preserve volume fields"
         );
     }
 

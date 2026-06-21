@@ -1,6 +1,6 @@
 <script lang="ts">
   import { engineState } from "../stores.js";
-  import { switchProfile, profileNew } from "../ipc.js";
+  import { switchProfile, profileNew, profileRename, profileDelete, profileExport, profileImport } from "../ipc.js";
 
   /** Controlled open state for the dropdown menu. */
   let open = $state(false);
@@ -12,6 +12,26 @@
   let newProfileName = $state("");
   let newProfileInput: HTMLInputElement | undefined = $state();
   let switching = $state(false);
+
+  /** Inline rename state. */
+  let renamingProfile = $state<string | null>(null);
+  let renameValue = $state("");
+  let renameInput: HTMLInputElement | undefined = $state();
+
+  /** Import state — paste TOML inline. */
+  let importingProfile = $state(false);
+  let importToml = $state("");
+  let importTextarea: HTMLTextAreaElement | undefined = $state();
+
+  /** Error/info feedback (transient). */
+  let feedbackMsg = $state<string | null>(null);
+  let feedbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function showFeedback(msg: string) {
+    feedbackMsg = msg;
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    feedbackTimer = setTimeout(() => { feedbackMsg = null; }, 3500);
+  }
 
   function toggleOpen() {
     open = !open;
@@ -28,6 +48,10 @@
     open = false;
     creatingNew = false;
     newProfileName = "";
+    renamingProfile = null;
+    renameValue = "";
+    importingProfile = false;
+    importToml = "";
     triggerEl?.focus();
   }
 
@@ -57,6 +81,91 @@
       engineState.set(next);
     } catch (e) {
       console.error("[ProfilesDropdown] profileNew failed:", e);
+    } finally {
+      switching = false;
+    }
+  }
+
+  function startRename(profile: string) {
+    renamingProfile = profile;
+    renameValue = profile;
+  }
+
+  async function commitRename() {
+    const old = renamingProfile;
+    const newName = renameValue.trim();
+    if (!old || !newName || switching) return;
+    if (newName === old) { renamingProfile = null; renameValue = ""; return; }
+    switching = true;
+    renamingProfile = null;
+    renameValue = "";
+    try {
+      const next = await profileRename(old, newName);
+      engineState.set(next);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showFeedback(`Rename failed: ${msg}`);
+      console.error("[ProfilesDropdown] profileRename failed:", e);
+    } finally {
+      switching = false;
+    }
+  }
+
+  async function deleteProfile(name: string) {
+    if (switching) return;
+    const confirmed = window.confirm(`Delete profile "${name}"? This cannot be undone.`);
+    if (!confirmed) return;
+    switching = true;
+    try {
+      const next = await profileDelete(name);
+      engineState.set(next);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showFeedback(`Delete failed: ${msg}`);
+      console.error("[ProfilesDropdown] profileDelete failed:", e);
+    } finally {
+      switching = false;
+    }
+  }
+
+  async function exportProfile(name: string) {
+    if (switching) return;
+    try {
+      const toml = await profileExport(name);
+      // Trigger a browser file download of the TOML text.
+      const blob = new Blob([toml], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${name}.toml`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showFeedback(`Export failed: ${msg}`);
+      console.error("[ProfilesDropdown] profileExport failed:", e);
+    }
+  }
+
+  function startImport() {
+    importingProfile = true;
+    importToml = "";
+  }
+
+  async function commitImport() {
+    const toml = importToml.trim();
+    if (!toml || switching) return;
+    switching = true;
+    importingProfile = false;
+    importToml = "";
+    try {
+      const next = await profileImport(toml);
+      engineState.set(next);
+      showFeedback("Profile imported successfully");
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showFeedback(`Import failed: ${msg}`);
+      console.error("[ProfilesDropdown] profileImport failed:", e);
     } finally {
       switching = false;
     }
@@ -113,8 +222,29 @@
     }
   });
 
+  $effect(() => {
+    if (renamingProfile && renameInput) {
+      requestAnimationFrame(() => {
+        renameInput?.focus();
+        renameInput?.select();
+      });
+    }
+  });
+
+  $effect(() => {
+    if (importingProfile && importTextarea) {
+      requestAnimationFrame(() => importTextarea?.focus());
+    }
+  });
+
   const displayName = $derived($engineState?.active_profile ?? "—");
   const profiles = $derived($engineState?.profiles ?? []);
+  const activeProfile = $derived($engineState?.active_profile ?? "");
+
+  /** A profile can be deleted only if it is not active AND there are 2+ profiles. */
+  function canDelete(name: string): boolean {
+    return name !== activeProfile && profiles.length > 1;
+  }
 </script>
 
 <div class="profiles-wrapper">
@@ -139,6 +269,10 @@
     {/if}
   </button>
 
+  {#if feedbackMsg}
+    <div class="profiles-feedback" role="status" aria-live="polite">{feedbackMsg}</div>
+  {/if}
+
   {#if open}
     <div class="profiles-menu-container" role="presentation">
       <ul
@@ -150,18 +284,79 @@
       >
         {#each profiles as profile}
           <li role="presentation">
-            <button
-              role="option"
-              aria-selected={profile === $engineState?.active_profile}
-              class="profile-option"
-              class:active={profile === $engineState?.active_profile}
-              onclick={() => selectProfile(profile)}
-            >
-              <span class="option-check" aria-hidden="true">
-                {#if profile === $engineState?.active_profile}✓{/if}
-              </span>
-              <span class="option-name">{profile}</span>
-            </button>
+            {#if renamingProfile === profile}
+              <!-- Inline rename form for this profile -->
+              <div class="rename-row" role="presentation">
+                <input
+                  bind:this={renameInput}
+                  bind:value={renameValue}
+                  class="rename-input"
+                  type="text"
+                  placeholder="New name…"
+                  maxlength={48}
+                  aria-label="Rename profile {profile}"
+                  onkeydown={(e) => {
+                    if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+                    else if (e.key === "Escape") { renamingProfile = null; renameValue = ""; }
+                  }}
+                />
+                <button
+                  class="rename-confirm"
+                  onclick={commitRename}
+                  disabled={!renameValue.trim() || renameValue.trim() === profile}
+                  aria-label="Confirm rename"
+                >
+                  OK
+                </button>
+                <button
+                  class="rename-cancel"
+                  onclick={() => { renamingProfile = null; renameValue = ""; }}
+                  aria-label="Cancel rename"
+                >
+                  ✕
+                </button>
+              </div>
+            {:else}
+              <div class="profile-row" role="presentation">
+                <button
+                  role="option"
+                  aria-selected={profile === activeProfile}
+                  class="profile-option"
+                  class:active={profile === activeProfile}
+                  onclick={() => selectProfile(profile)}
+                >
+                  <span class="option-check" aria-hidden="true">
+                    {#if profile === activeProfile}✓{/if}
+                  </span>
+                  <span class="option-name">{profile}</span>
+                </button>
+                <!-- Per-profile action buttons -->
+                <div class="profile-row-actions" aria-label="Actions for {profile}">
+                  <button
+                    class="profile-icon-btn"
+                    title="Rename"
+                    aria-label="Rename {profile}"
+                    onclick={(e) => { e.stopPropagation(); startRename(profile); }}
+                    disabled={switching}
+                  >✎</button>
+                  <button
+                    class="profile-icon-btn"
+                    title="Export TOML"
+                    aria-label="Export {profile}"
+                    onclick={(e) => { e.stopPropagation(); exportProfile(profile); }}
+                    disabled={switching}
+                  >↓</button>
+                  <button
+                    class="profile-icon-btn danger"
+                    title={canDelete(profile) ? "Delete" : profile === activeProfile ? "Can't delete active profile" : "Can't delete last profile"}
+                    aria-label="Delete {profile}"
+                    onclick={(e) => { e.stopPropagation(); deleteProfile(profile); }}
+                    disabled={switching || !canDelete(profile)}
+                    aria-disabled={!canDelete(profile)}
+                  >✕</button>
+                </div>
+              </div>
+            {/if}
           </li>
         {/each}
 
@@ -193,6 +388,37 @@
               Create
             </button>
           </li>
+        {:else if importingProfile}
+          <li class="import-row" role="presentation">
+            <textarea
+              bind:this={importTextarea}
+              bind:value={importToml}
+              class="import-textarea"
+              placeholder="Paste profile TOML here…"
+              rows={4}
+              aria-label="Paste profile TOML to import"
+              onkeydown={(e) => {
+                if (e.key === "Escape") { importingProfile = false; importToml = ""; }
+              }}
+            ></textarea>
+            <div class="import-actions">
+              <button
+                class="new-profile-confirm"
+                onclick={commitImport}
+                disabled={!importToml.trim() || switching}
+                aria-label="Import profile"
+              >
+                Import
+              </button>
+              <button
+                class="profile-action cancel-btn"
+                onclick={() => { importingProfile = false; importToml = ""; }}
+                aria-label="Cancel import"
+              >
+                Cancel
+              </button>
+            </div>
+          </li>
         {:else}
           <li role="presentation">
             <button
@@ -203,6 +429,17 @@
             >
               <span class="action-icon" aria-hidden="true">+</span>
               New profile…
+            </button>
+          </li>
+          <li role="presentation">
+            <button
+              role="menuitem"
+              data-action="import"
+              class="profile-action"
+              onclick={() => startImport()}
+            >
+              <span class="action-icon" aria-hidden="true">↑</span>
+              Import from TOML…
             </button>
           </li>
         {/if}
@@ -473,5 +710,193 @@
     .profile-spinner {
       animation: none;
     }
+  }
+
+  /* ===== Feedback banner ===== */
+  .profiles-feedback {
+    position: absolute;
+    top: calc(100% + var(--ss-space-1));
+    right: 0;
+    z-index: 201;
+    min-width: 180px;
+    padding: var(--ss-space-2) var(--ss-space-3);
+    background: var(--ss-surface-3);
+    border: var(--ss-border-width) solid var(--ss-border-strong);
+    border-radius: var(--ss-radius-sm);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-secondary);
+    box-shadow: var(--ss-e2);
+  }
+
+  /* ===== Profile row with inline action buttons ===== */
+  .profile-row {
+    display: flex;
+    align-items: center;
+    width: 100%;
+  }
+
+  .profile-row .profile-option {
+    flex: 1;
+  }
+
+  .profile-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding-right: var(--ss-space-2);
+    opacity: 0;
+    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .profile-row:hover .profile-row-actions,
+  .profile-row:focus-within .profile-row-actions {
+    opacity: 1;
+  }
+
+  .profile-icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: var(--ss-radius-xs);
+    background: transparent;
+    color: var(--ss-text-tertiary);
+    font-size: 11px;
+    cursor: pointer;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard);
+    flex-shrink: 0;
+  }
+
+  .profile-icon-btn:hover:not(:disabled) {
+    background: var(--ss-surface-2);
+    color: var(--ss-text-secondary);
+  }
+
+  .profile-icon-btn.danger:hover:not(:disabled) {
+    background: rgba(229, 72, 77, 0.15);
+    color: var(--ss-danger, #e5484d);
+  }
+
+  .profile-icon-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+
+  .profile-icon-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 1px;
+  }
+
+  /* ===== Inline rename form ===== */
+  .rename-row {
+    display: flex;
+    gap: var(--ss-space-1);
+    align-items: center;
+    padding: var(--ss-space-1) var(--ss-space-2);
+  }
+
+  .rename-input {
+    flex: 1;
+    height: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-accent-border);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-primary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-body-size);
+    min-width: 0;
+  }
+
+  .rename-input:focus {
+    outline: none;
+    border-color: var(--ss-accent);
+  }
+
+  .rename-confirm {
+    height: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: var(--ss-gradient-primary);
+    border: none;
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-bright);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-button-size);
+    font-weight: var(--ss-type-button-weight);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .rename-confirm:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .rename-confirm:hover:not(:disabled) {
+    filter: brightness(1.1);
+  }
+
+  .rename-cancel {
+    height: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: transparent;
+    border: var(--ss-border-width) solid var(--ss-border-strong);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-tertiary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-body-size);
+    cursor: pointer;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .rename-cancel:hover {
+    background: var(--ss-surface-2);
+    color: var(--ss-text-secondary);
+  }
+
+  /* ===== Import TOML form ===== */
+  .import-row {
+    padding: var(--ss-space-2) var(--ss-space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-2);
+  }
+
+  .import-textarea {
+    width: 100%;
+    min-width: 0;
+    padding: var(--ss-space-2);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border-strong);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-primary);
+    font-family: var(--ss-font-mono);
+    font-size: var(--ss-type-caption-size);
+    resize: vertical;
+    box-sizing: border-box;
+  }
+
+  .import-textarea:focus {
+    outline: none;
+    border-color: var(--ss-accent-border);
+  }
+
+  .import-actions {
+    display: flex;
+    gap: var(--ss-space-2);
+    align-items: center;
+  }
+
+  .cancel-btn {
+    color: var(--ss-text-tertiary);
+    font-size: var(--ss-type-body-size);
   }
 </style>

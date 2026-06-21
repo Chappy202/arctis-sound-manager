@@ -2,16 +2,16 @@ use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
     query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
     CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
-    DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
+    SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
-    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
-    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
-    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
-    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
-    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
-    MIC_VAD_THRESHOLD_MIN,
+    CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use std::sync::Arc;
 
@@ -87,6 +87,10 @@ pub struct Engine<R: CommandRunner> {
     builtin_noisegate: bool,
     /// Cached PipeWire version (queried once, then cached).
     pw_version: Option<(u32, u32, u32)>,
+    /// Tracks which channel IDs are currently routed to the surround node.
+    /// Used by apply_surround to restore channels removed from the surround list (C1)
+    /// and channels whose output_device is None when surround is disabled (C2).
+    surround_routed: std::collections::HashSet<String>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -104,6 +108,7 @@ impl<R: CommandRunner> Engine<R> {
             mic_availability: Vec::new(),
             builtin_noisegate: false,
             pw_version: None,
+            surround_routed: std::collections::HashSet::new(),
         }
     }
 
@@ -124,6 +129,7 @@ impl<R: CommandRunner> Engine<R> {
             mic_availability: Vec::new(),
             builtin_noisegate: false,
             pw_version: None,
+            surround_routed: std::collections::HashSet::new(),
         }
     }
 
@@ -201,8 +207,8 @@ impl<R: CommandRunner> Engine<R> {
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&self) -> crate::state::EngineState {
         use crate::state::{
-            ChannelSnapshot, EngineState, EqBandSnapshot, MicSnapshot, MicStageSnapshot, StageName,
-            SuppressionBackend,
+            ChannelSnapshot, EngineState, EqBandSnapshot, EqPresetSnapshot, MicSnapshot,
+            MicStageSnapshot, StageName, SuppressionBackend,
         };
         let active = self.config.active().ok();
         let channels = active
@@ -223,6 +229,8 @@ impl<R: CommandRunner> Engine<R> {
                                 gain_db: b.gain_db,
                             })
                             .collect(),
+                        volume_db: ch.volume_db,
+                        muted: ch.muted,
                     })
                     .collect()
             })
@@ -378,10 +386,36 @@ impl<R: CommandRunner> Engine<R> {
                 eq_bands,
                 suppression_backend,
                 available_suppression_backends,
+                hw_mic: mc.hw_mic.clone(),
             }
         } else {
             MicSnapshot::default()
         };
+
+        let surround = if let Ok(p) = self.config.active() {
+            let sc = &p.surround;
+            crate::state::SurroundSnapshot {
+                enabled: sc.enabled,
+                hrir: sc.hrir.clone(),
+                available_hrirs: convert::hrir_base_dir()
+                    .map(|base| convert::available_hrirs(&base))
+                    .unwrap_or_default(),
+                channels: sc.channels.clone(),
+                hw_sink: sc.hw_sink.clone(),
+            }
+        } else {
+            crate::state::SurroundSnapshot::default()
+        };
+
+        let eq_presets = self
+            .config
+            .eq_presets
+            .iter()
+            .map(|p| EqPresetSnapshot {
+                name: p.name.clone(),
+                band_count: p.bands.len(),
+            })
+            .collect();
 
         EngineState {
             active_profile: self.config.active_profile.clone(),
@@ -391,6 +425,8 @@ impl<R: CommandRunner> Engine<R> {
             device_present: dev.present,
             device_fields: dev.fields,
             mic,
+            surround,
+            eq_presets,
         }
     }
 
@@ -511,6 +547,39 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Remove the routing rule for `app_binary`.
+    ///
+    /// Drops the rule from in-memory config + persists, removes the WirePlumber
+    /// fragment entry, and attempts a best-effort live clear (moves the stream back
+    /// to the default sink by deleting its `target.object` metadata key).
+    pub fn clear_route(&mut self, app_binary: &str) -> Result<(), EngineError> {
+        // Update in-memory config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            profile.routes.retain(|r| r.app_binary != app_binary);
+        }
+        // Persist unified config
+        self.save_config()?;
+        // Update Router (remove from persistent fragment)
+        {
+            let mut router = Router::new(&mut self.runner);
+            router.remove_rule(app_binary);
+            router.save_persistent()?;
+            // Best-effort live clear (ignore error if app not running)
+            let _ = router.clear_live(&AppMatch::Binary(app_binary.to_string()));
+        }
+        // Emit event
+        self.emit(Event::RouteCleared {
+            app_binary: app_binary.to_string(),
+        });
+        Ok(())
+    }
+
     /// Set (or clear) the output device for a single channel in the active profile.
     ///
     /// Updates the in-memory config, persists it atomically, rebuilds that
@@ -566,6 +635,99 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Set the software volume for a single channel. Validates range, persists, applies live, emits.
+    pub fn set_channel_volume(
+        &mut self,
+        channel_id: &str,
+        volume_db: f32,
+    ) -> Result<(), EngineError> {
+        if !(CHANNEL_VOLUME_MIN_DB..=CHANNEL_VOLUME_MAX_DB).contains(&volume_db) {
+            return Err(EngineError::BadRequest(format!(
+                "volume_db {volume_db} out of range {CHANNEL_VOLUME_MIN_DB}..={CHANNEL_VOLUME_MAX_DB}"
+            )));
+        }
+        // Mutate config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.volume_db = volume_db;
+        }
+        self.save_config()?;
+        // Apply live
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_volume_mute(volume_db, channel.muted)?;
+        }
+        self.emit(Event::ChannelVolumeSet {
+            channel_id: channel_id.to_string(),
+            volume_db,
+        });
+        Ok(())
+    }
+
+    /// Set the mute state for a single channel. Persists, applies live, emits.
+    pub fn set_channel_mute(&mut self, channel_id: &str, muted: bool) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.muted = muted;
+        }
+        self.save_config()?;
+        // Apply live
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_volume_mute(channel.volume_db, muted)?;
+        }
+        self.emit(Event::ChannelMuteSet {
+            channel_id: channel_id.to_string(),
+            muted,
+        });
+        Ok(())
+    }
+
     /// Create a new profile by cloning the currently active one under `name`,
     /// make it active, persist the config, reconcile the graph to it, and emit
     /// a `ProfileCreated` event.
@@ -582,6 +744,312 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::ProfileCreated {
             name: name.to_string(),
         });
+        Ok(())
+    }
+
+    /// Rename a profile. If it was the active profile, also updates `active_profile`.
+    /// Saves config and emits `ProfileRenamed`.
+    pub fn rename_profile(&mut self, old: &str, new: &str) -> Result<(), EngineError> {
+        // Delegate validation to config layer
+        self.config.rename_profile(old, new)?;
+        // If the renamed profile was active, keep active_profile in sync
+        if self.config.active_profile == old {
+            self.config.active_profile = new.to_string();
+        }
+        self.save_config()?;
+        self.emit(Event::ProfileRenamed {
+            old: old.to_string(),
+            new: new.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Delete a profile. Saves config and emits `ProfileDeleted`.
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), EngineError> {
+        self.config.delete_profile(name)?;
+        self.save_config()?;
+        self.emit(Event::ProfileDeleted {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Export a profile by name as a TOML string. Read-only — no persist, no event.
+    pub fn export_profile(&self, name: &str) -> Result<String, EngineError> {
+        let profile = self
+            .config
+            .profile(name)
+            .ok_or_else(|| EngineError::BadRequest(format!("profile not found: {name}")))?;
+        toml::to_string(profile)
+            .map_err(|e| EngineError::BadRequest(format!("serialize profile: {e}")))
+    }
+
+    /// Import a profile from a TOML string. Resolves name collisions by appending
+    /// "-imported", then "-imported(2)", "-imported(3)", etc. until unique.
+    /// Validates the config after insertion. Returns the resolved name.
+    pub fn import_profile(&mut self, toml_str: &str) -> Result<String, EngineError> {
+        let mut profile: arctis_config::Profile = toml::from_str(toml_str)
+            .map_err(|e| EngineError::BadRequest(format!("invalid profile TOML: {e}")))?;
+
+        // Resolve name collision
+        let base_name = profile.name.clone();
+        let resolved_name = if self.config.profile(&base_name).is_none() {
+            base_name.clone()
+        } else {
+            let candidate = format!("{base_name}-imported");
+            if self.config.profile(&candidate).is_none() {
+                candidate
+            } else {
+                let mut n = 2u32;
+                loop {
+                    if n > 1000 {
+                        return Err(EngineError::BadRequest(
+                            "too many name collisions for imported profile".to_string(),
+                        ));
+                    }
+                    let candidate = format!("{base_name}-imported({n})");
+                    if self.config.profile(&candidate).is_none() {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+
+        profile.name = resolved_name.clone();
+        self.config.upsert_profile(profile);
+        // Validate the config after insertion
+        self.config.validate()?;
+        self.save_config()?;
+        self.emit(Event::ProfileImported {
+            name: resolved_name.clone(),
+        });
+        Ok(resolved_name)
+    }
+
+    /// Save the current EQ bands of `channel_id` in the active profile as a named preset.
+    /// Overwrites if a preset with that name already exists.
+    pub fn save_eq_preset(&mut self, name: &str, channel_id: &str) -> Result<(), EngineError> {
+        // Find channel in active profile
+        let bands = {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| EngineError::BadRequest(format!("channel not found: {channel_id}")))?
+                .eq
+                .clone()
+        };
+
+        let preset = arctis_config::EqPreset {
+            name: name.to_string(),
+            kind_hint: None,
+            bands,
+        };
+
+        // Overwrite if name exists, otherwise push
+        if let Some(existing) = self.config.eq_presets.iter_mut().find(|p| p.name == name) {
+            *existing = preset;
+        } else {
+            self.config.eq_presets.push(preset);
+        }
+
+        self.save_config()?;
+        self.emit(Event::EqPresetSaved {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Apply a named preset's bands to `channel_id` in the active profile. Live-applies via AudioBackend.
+    pub fn apply_eq_preset(&mut self, preset: &str, channel_id: &str) -> Result<(), EngineError> {
+        // Find preset
+        let preset_bands = self
+            .config
+            .eq_presets
+            .iter()
+            .find(|p| p.name == preset)
+            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {preset}")))?
+            .bands
+            .clone();
+
+        // Mutate channel EQ in active profile
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.eq = preset_bands;
+        }
+
+        self.save_config()?;
+
+        // Live-apply all bands (same pattern as reconcile step 2)
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.apply_all(&eq_model) {
+                eprintln!(
+                    "warning: apply_eq_preset apply_all for channel '{channel_id}' failed (ignoring): {e}"
+                );
+            }
+        }
+
+        self.emit(Event::EqPresetApplied {
+            name: preset.to_string(),
+            channel_id: channel_id.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Delete a named EQ preset. Errors if not found.
+    pub fn delete_eq_preset(&mut self, name: &str) -> Result<(), EngineError> {
+        let pos = self
+            .config
+            .eq_presets
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {name}")))?;
+        self.config.eq_presets.remove(pos);
+        self.save_config()?;
+        self.emit(Event::EqPresetDeleted {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Add a new channel to the active profile with sane defaults.
+    ///
+    /// `id` must be non-empty, contain no whitespace or path separators, and not
+    /// already exist in the active profile. `node_name` is derived as `"Arctis_<Title>"`
+    /// and `description` as `"<id> audio channel"`. After adding to config and persisting,
+    /// the new channel sink is brought up (reusing AudioBackend::create). Emits `ChannelAdded`.
+    pub fn add_channel(&mut self, id: &str) -> Result<(), EngineError> {
+        // Derive node_name and description from id
+        let title = {
+            let mut c = id.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        };
+        let node_name = format!("Arctis_{title}");
+        let description = format!("{id} audio channel");
+
+        // Mutate config (validates id constraints)
+        self.config
+            .add_channel(id, &node_name, &description)
+            .map_err(EngineError::Config)?;
+
+        // Persist
+        self.save_config()?;
+
+        // Bring the new channel sink up (reuse channel-up path)
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found after add: {id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            match be.create(&eq_model) {
+                Ok(handle) => {
+                    if let Some(token) = handle.child {
+                        self.children.track(token);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: add_channel create sink for '{id}' failed (post-spawn race?): {e}"
+                    );
+                }
+            }
+        }
+
+        self.emit(Event::ChannelAdded { id: id.to_string() });
+        Ok(())
+    }
+
+    /// Remove a channel from the active profile.
+    ///
+    /// Errors if the channel does not exist or if it is the last remaining channel.
+    /// Any channel may be removed, including game/chat/media.
+    /// Routes referencing the removed channel become inert (no automatic cleanup).
+    ///
+    /// Tears down the channel's PipeWire sink (reusing AudioBackend::remove).
+    /// Emits `ChannelRemoved`.
+    pub fn remove_channel(&mut self, id: &str) -> Result<(), EngineError> {
+        // Snapshot the channel def before removal (needed for teardown)
+        let channel_def = {
+            let profile = self.config.active()?;
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == id)
+                .ok_or_else(|| EngineError::BadRequest(format!("channel not found: {id}")))?;
+            convert::channel_def_from_cfg(channel)
+        };
+
+        // Mutate config (validates last-channel guard)
+        self.config
+            .remove_channel(id)
+            .map_err(EngineError::Config)?;
+
+        // Prune the removed channel from surround.channels so config doesn't reference a
+        // deleted channel. Do this after the last-channel guard passes (above).
+        {
+            let active_name = self.config.active_profile.clone();
+            if let Some(profile) = self.config.profile_mut(&active_name) {
+                profile.surround.channels.retain(|ch| ch != id);
+            }
+        }
+
+        // Persist
+        self.save_config()?;
+
+        // Tear down the channel's PipeWire sink (reuse channel-down path)
+        {
+            let spec = channel_def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.remove() {
+                eprintln!(
+                    "warning: remove_channel sink teardown for '{id}' failed (ignoring): {e}"
+                );
+            }
+        }
+
+        self.emit(Event::ChannelRemoved { id: id.to_string() });
         Ok(())
     }
 
@@ -634,18 +1102,30 @@ impl<R: CommandRunner> Engine<R> {
             let eq_model = convert::eq_model_for(ch)?;
             let def = convert::channel_def_from_cfg(ch);
             let spec = def.sink_spec();
-            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
-            if let Err(e) = be.apply_all(&eq_model) {
-                let freshness = if freshly_spawned.contains(&ch.id) {
-                    "freshly-spawned"
-                } else {
-                    "already-present"
-                };
-                eprintln!(
-                    "warning: reconcile apply_all for channel '{}' ({freshness}) failed \
-                     (EQ is conf-baked; ignoring): {e}",
-                    ch.id
-                );
+            {
+                let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec.clone());
+                if let Err(e) = be.apply_all(&eq_model) {
+                    let freshness = if freshly_spawned.contains(&ch.id) {
+                        "freshly-spawned"
+                    } else {
+                        "already-present"
+                    };
+                    eprintln!(
+                        "warning: reconcile apply_all for channel '{}' ({freshness}) failed \
+                         (EQ is conf-baked; ignoring): {e}",
+                        ch.id
+                    );
+                }
+            }
+            // Volume/mute apply
+            {
+                let mut be2 = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+                if let Err(e) = be2.apply_volume_mute(ch.volume_db, ch.muted) {
+                    eprintln!(
+                        "warning: reconcile apply_volume_mute for channel '{}' failed (ignoring): {e}",
+                        ch.id
+                    );
+                }
             }
         }
 
@@ -700,6 +1180,12 @@ impl<R: CommandRunner> Engine<R> {
                     eprintln!("warning: reconcile mic create failed (post-spawn race?): {e}");
                 }
             }
+        }
+
+        // Step 6: surround sink create/teardown + channel re-routing (surround channels → effect_input.arctis_surround).
+        // AFTER step 3/4 so that surround re-routing overrides any output-device set in step 3.
+        if let Err(e) = self.apply_surround(&profile) {
+            eprintln!("warning: reconcile surround step failed (ignoring): {e}");
         }
 
         Ok(())
@@ -1086,6 +1572,291 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::MicSuppressionBackendSet { backend });
         Ok(())
     }
+
+    /// Apply the surround config to the live graph (self-correcting, non-thrashing).
+    ///
+    /// Tracks which channels are currently routed to the surround node via
+    /// `self.surround_routed`. On each call:
+    ///
+    /// **Disabled path**: removes the surround sink (idempotent), then restores ALL
+    ///   channels in `surround_routed` to their configured `output_device` (fixes C2:
+    ///   channels with `output_device=None` were left with a stale pointer to the
+    ///   destroyed node). Drains `surround_routed` on completion.
+    ///
+    /// **Enabled path**: recreates the surround sink (so HRIR/hw_sink changes take
+    ///   effect), then computes:
+    ///   - `to_restore`: channels previously routed to surround but no longer in the
+    ///     desired set → restore to their configured `output_device` (fixes C1).
+    ///   - `to_route`: channels in the desired set not yet tracked → route to surround.
+    ///
+    ///   Channels already in `surround_routed` ∩ `desired` are left untouched (no thrash).
+    ///
+    /// Warn-and-continue on transient errors (mirrors reconcile step pattern).
+    fn apply_surround(
+        &mut self,
+        profile: &arctis_config::Profile,
+    ) -> Result<(), crate::error::EngineError> {
+        let sc = &profile.surround;
+        let spec = convert::surround_spec(sc);
+
+        if !sc.enabled {
+            // Remove surround sink (idempotent).
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            if let Err(e) = surround_be.remove() {
+                eprintln!("warning: apply_surround remove failed (ignoring): {e}");
+            }
+            // Restore ALL channels that were surround-routed (fixes C2).
+            // Drain first so the set is empty regardless of errors below.
+            let previously_routed: Vec<String> = self.surround_routed.drain().collect();
+            if !previously_routed.is_empty() {
+                let channel_set = convert::channel_set_from_profile(profile);
+                for ch_id in &previously_routed {
+                    if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                        let eq_model = convert::eq_model_for(ch)?;
+                        // M1: create ChannelManager per iteration; drop before track to release borrow.
+                        let handle = {
+                            let mut mgr =
+                                ChannelManager::new(&mut self.runner, channel_set.clone());
+                            mgr.set_output(ch_id, ch.output_device.clone(), &eq_model)
+                        };
+                        match handle {
+                            Ok(h) => {
+                                if let Some(t) = h.child {
+                                    self.children.track(t);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: apply_surround restore channel '{ch_id}' failed (ignoring): {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Enabled path: resolve HRIR first.
+        let hrir_path = match convert::hrir_base_dir()
+            .and_then(|base| convert::resolve_hrir_path(sc, &base))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: apply_surround HRIR resolve failed (skipping surround): {e}");
+                return Ok(());
+            }
+        };
+
+        // Recreate surround sink (handles both first-time and HRIR/hw_sink change).
+        {
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            match surround_be.recreate(&hrir_path) {
+                Ok(handle) => {
+                    if let Some(t) = handle.child {
+                        self.children.track(t);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: apply_surround recreate failed (ignoring): {e}");
+                }
+            }
+        }
+
+        // Compute desired surround-channel set (from new config).
+        let desired: std::collections::HashSet<String> = sc.channels.iter().cloned().collect();
+
+        // Channels to restore: were surround-routed, no longer in desired set (fixes C1).
+        let to_restore: Vec<String> = self
+            .surround_routed
+            .iter()
+            .filter(|id| !desired.contains(*id))
+            .cloned()
+            .collect();
+
+        // Channels to route to surround: in desired set, not already tracked (avoid thrash).
+        let to_route: Vec<String> = desired
+            .iter()
+            .filter(|id| !self.surround_routed.contains(*id))
+            .cloned()
+            .collect();
+
+        let channel_set = convert::channel_set_from_profile(profile);
+        let surround_target = "effect_input.arctis_surround".to_string();
+
+        // Restore removed channels to their configured output_device.
+        for ch_id in &to_restore {
+            if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                let eq_model = convert::eq_model_for(ch)?;
+                let handle = {
+                    let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                    mgr.set_output(ch_id, ch.output_device.clone(), &eq_model)
+                };
+                match handle {
+                    Ok(h) => {
+                        if let Some(t) = h.child {
+                            self.children.track(t);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: apply_surround restore channel '{ch_id}' failed (ignoring): {e}"
+                        );
+                    }
+                }
+            }
+            self.surround_routed.remove(ch_id);
+        }
+
+        // Route new channels to surround.
+        for ch_id in &to_route {
+            if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                let eq_model = convert::eq_model_for(ch)?;
+                let handle = {
+                    let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                    mgr.set_output(ch_id, Some(surround_target.clone()), &eq_model)
+                };
+                match handle {
+                    Ok(h) => {
+                        if let Some(t) = h.child {
+                            self.children.track(t);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: apply_surround reroute channel '{ch_id}' failed (ignoring): {e}"
+                        );
+                    }
+                }
+                self.surround_routed.insert(ch_id.clone());
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Surround engine methods ──────────────────────────────────────────────────
+
+    /// Enable or disable virtual surround. When enabling, resolves HRIR first (errors if none found).
+    pub fn surround_set_enabled(&mut self, on: bool) -> Result<(), crate::error::EngineError> {
+        // When enabling, validate HRIR exists first (before mutating config).
+        if on {
+            let profile = self.config.active()?.clone();
+            let base = convert::hrir_base_dir()?;
+            convert::resolve_hrir_path(&profile.surround, &base)?;
+        }
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.enabled = on;
+        }
+        self.save_config()?;
+        // Apply via the canonical path (handles sink create/remove AND channel routing).
+        // When enabling: apply_surround recreates sink + routes desired channels → surround_routed.
+        // When disabling: apply_surround removes sink + restores all surround_routed channels.
+        {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        self.emit(crate::state::Event::SurroundEnabledSet { enabled: on });
+        Ok(())
+    }
+
+    /// Set the HRIR profile stem. Validates file exists, persists, recreates if enabled.
+    pub fn surround_set_hrir(&mut self, stem: String) -> Result<(), crate::error::EngineError> {
+        // Validate: update config temporarily to check path existence.
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            let old = profile.surround.hrir.clone();
+            profile.surround.hrir = Some(stem.clone());
+            // Validate the resolved path exists.
+            let base = convert::hrir_base_dir()?;
+            if let Err(e) = convert::resolve_hrir_path(&profile.surround, &base) {
+                // Roll back mutation.
+                profile.surround.hrir = old;
+                return Err(e);
+            }
+        }
+        self.save_config()?;
+        // Apply via the canonical path (recreates sink with new HRIR if enabled;
+        // no-op remove if disabled; channel routing is a no-op since channels are
+        // already tracked in surround_routed).
+        {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        let hrir_snapshot = self.config.active()?.surround.hrir.clone();
+        self.emit(crate::state::Event::SurroundHrirSet {
+            hrir: hrir_snapshot,
+        });
+        Ok(())
+    }
+
+    /// Set the channels routed through surround. Persists, recreates routing if enabled.
+    pub fn surround_set_channels(
+        &mut self,
+        channels: Vec<String>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.channels = channels;
+        }
+        self.save_config()?;
+        // Reapply routing if enabled.
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        let channels_snapshot = self.config.active()?.surround.channels.clone();
+        self.emit(crate::state::Event::SurroundChannelsSet {
+            channels: channels_snapshot,
+        });
+        Ok(())
+    }
+
+    /// Set (or clear) the hardware sink for the surround output tail. Recreates if enabled.
+    pub fn surround_set_hw_sink(
+        &mut self,
+        hw_sink: Option<String>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.hw_sink = hw_sink;
+        }
+        self.save_config()?;
+        // Apply via the canonical path (recreates sink with new hw_sink baked into conf if
+        // enabled; no-op remove if disabled; channel routing is a no-op since channels are
+        // already tracked in surround_routed).
+        {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        let hw_sink_snapshot = self.config.active()?.surround.hw_sink.clone();
+        self.emit(crate::state::Event::SurroundHwSinkSet {
+            hw_sink: hw_sink_snapshot,
+        });
+        Ok(())
+    }
 }
 
 impl<R: CommandRunner> Drop for Engine<R> {
@@ -1122,6 +1893,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1129,6 +1902,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1136,11 +1911,15 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -1158,6 +1937,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1165,6 +1946,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1172,6 +1955,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: Some("alsa_output.speakers".into()),
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![RouteConfig {
@@ -1179,7 +1964,9 @@ mod tests {
                     target_sink: "Arctis_Media".into(),
                 }],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -1271,57 +2058,66 @@ mod tests {
     #[test]
     fn reconcile_emits_expected_argv_sinks_already_present() {
         // Channels already present → no spawns for sink creation.
-        // Each channel: 1 ls for create (present, skip), then apply_all: 1 ls (find_node_id) + 10 set-band calls.
+        // Per channel: Phase 2 (1 ls + 10 bands) then Phase 2b (1 ls + 1 Props), interleaved.
+        // Reconcile processes each channel fully before moving to the next.
         let ls = ls_all_present();
 
-        // Queue outputs:
-        // Phase 1 (channels up): 3 channels × 1 ls-Node (sinks present, no spawn)
-        // Phase 2 (apply_all per channel): 3 channels × (1 ls-Node + 10 pw-cli s <id> Props)
-        // Phase 3 (no output devices)
-        // Phase 4 (no routes)
+        // Queue outputs (interleaved per channel):
+        // Phase 1 (channels up): 3 × 1 ls-Node
+        // Per channel: (1 ls + 10 bands) + (1 ls + 1 Props)
+        // Phase 5: 1 ls (mic disabled)
+        // Phase 6: 1 ls (surround disabled)
         let runner = MockRunner::new()
             // Phase 1: channel up — game (present), chat (present), media (present)
-            .with_output(0, &ls, "")
-            .with_output(0, &ls, "")
-            .with_output(0, &ls, "")
-            // Phase 2: apply_all game — find_node_id + 10 bands
-            .with_output(0, &ls, "") // game ls Node
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // 10 band sets
-            // Phase 2: apply_all chat — find_node_id + 10 bands
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            // Phase 2: apply_all media — find_node_id + 10 bands
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
+            .with_output(0, &ls, "") // [0]
+            .with_output(0, &ls, "") // [1]
+            .with_output(0, &ls, "") // [2]
+            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [3] game EQ ls
+            .with_output(0, "", "") // [4]
+            .with_output(0, "", "") // [5]
+            .with_output(0, "", "") // [6]
+            .with_output(0, "", "") // [7]
+            .with_output(0, "", "") // [8]
+            .with_output(0, "", "") // [9]
+            .with_output(0, "", "") // [10]
+            .with_output(0, "", "") // [11]
+            .with_output(0, "", "") // [12]
+            .with_output(0, "", "") // [13] game 10 band sets
+            .with_output(0, &ls, "") // [14] game vol find_node_id
+            .with_output(0, "", "") // [15] game vol Props set
+            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [16] chat EQ ls
+            .with_output(0, "", "") // [17]
+            .with_output(0, "", "") // [18]
+            .with_output(0, "", "") // [19]
+            .with_output(0, "", "") // [20]
+            .with_output(0, "", "") // [21]
+            .with_output(0, "", "") // [22]
+            .with_output(0, "", "") // [23]
+            .with_output(0, "", "") // [24]
+            .with_output(0, "", "") // [25]
+            .with_output(0, "", "") // [26] chat 10 band sets
+            .with_output(0, &ls, "") // [27] chat vol find_node_id
+            .with_output(0, "", "") // [28] chat vol Props set
+            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [29] media EQ ls
+            .with_output(0, "", "") // [30]
+            .with_output(0, "", "") // [31]
+            .with_output(0, "", "") // [32]
+            .with_output(0, "", "") // [33]
+            .with_output(0, "", "") // [34]
+            .with_output(0, "", "") // [35]
+            .with_output(0, "", "") // [36]
+            .with_output(0, "", "") // [37]
+            .with_output(0, "", "") // [38]
+            .with_output(0, "", "") // [39] media 10 band sets
+            .with_output(0, &ls, "") // [40] media vol find_node_id
+            .with_output(0, "", "") // [41] media vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "");
+            .with_output(0, &ls, "") // [42]
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+            .with_output(0, &ls, ""); // [43]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1336,7 +2132,7 @@ mod tests {
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
 
-        // Phase 2: apply_all game — ls Node then 10 pw-cli s 10 Props calls
+        // Phase 2: apply_all game — ls Node then 10 pw-cli s Props calls
         assert_eq!(
             calls[3],
             vec!["pw-cli", "ls", "Node"],
@@ -1346,22 +2142,43 @@ mod tests {
         assert_eq!(calls[4][1], "s");
         assert_eq!(calls[4][3], "Props");
 
-        // apply_all chat starts after 3 (up) + 1 + 10 (game) = 14
+        // Phase 2b: apply_volume_mute game — index 14
         assert_eq!(
             calls[14],
+            vec!["pw-cli", "ls", "Node"],
+            "game vol find_node_id"
+        );
+
+        // Phase 2 chat: EQ starts at index 16
+        assert_eq!(
+            calls[16],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // apply_all media starts after 14 + 1 + 10 = 25
+        // Phase 2b chat: volume starts at index 27
         assert_eq!(
-            calls[25],
+            calls[27],
+            vec!["pw-cli", "ls", "Node"],
+            "chat vol find_node_id"
+        );
+
+        // Phase 2 media: EQ starts at index 29
+        assert_eq!(
+            calls[29],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Total: 3 (up) + 3*(1+10) (apply) + 1 (mic step5 source_exists) = 37
-        assert_eq!(calls.len(), 37, "expected 37 total pw-cli calls");
+        // Phase 2b media: volume starts at index 40
+        assert_eq!(
+            calls[40],
+            vec!["pw-cli", "ls", "Node"],
+            "media vol find_node_id"
+        );
+
+        // Total: 3 (up) + 3*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 44
+        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
 
         // No spawned processes (sinks already present)
         assert!(
@@ -1375,51 +2192,61 @@ mod tests {
         // Channels absent → spawn_owned fires for each sink creation.
         // spawn_owned goes into `spawned` (NOT `calls`) and does NOT consume queued outputs.
         // Phase 1 only consumes 3 queued outputs (one ls-Node per channel).
-        // Phase 2: each channel: apply_all: ls (find_node_id) + 10 band sets = 11 each.
+        // Per channel: Phase 2 (ls + 10 bands) then Phase 2b (ls + 1 Props), interleaved.
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
             // Phase 1: 3 ls calls only (spawn_owned does not consume queued outputs)
-            .with_output(0, &ls_absent, "") // game ls (absent)
-            .with_output(0, &ls_absent, "") // chat ls (absent)
-            .with_output(0, &ls_absent, "") // media ls (absent)
-            // Phase 2: apply_all per channel (sinks now "present" for id lookup)
-            .with_output(0, &ls_present, "") // game ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // game 10 band sets
-            .with_output(0, &ls_present, "") // chat ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // chat 10 band sets
-            .with_output(0, &ls_present, "") // media ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // media 10 band sets
+            .with_output(0, &ls_absent, "") // [0] game ls (absent)
+            .with_output(0, &ls_absent, "") // [1] chat ls (absent)
+            .with_output(0, &ls_absent, "") // [2] media ls (absent)
+            // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [3] game EQ find_node_id
+            .with_output(0, "", "") // [4]
+            .with_output(0, "", "") // [5]
+            .with_output(0, "", "") // [6]
+            .with_output(0, "", "") // [7]
+            .with_output(0, "", "") // [8]
+            .with_output(0, "", "") // [9]
+            .with_output(0, "", "") // [10]
+            .with_output(0, "", "") // [11]
+            .with_output(0, "", "") // [12]
+            .with_output(0, "", "") // [13] game 10 band sets
+            .with_output(0, &ls_present, "") // [14] game vol find_node_id
+            .with_output(0, "", "") // [15] game vol Props set
+            // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [16] chat EQ find_node_id
+            .with_output(0, "", "") // [17]
+            .with_output(0, "", "") // [18]
+            .with_output(0, "", "") // [19]
+            .with_output(0, "", "") // [20]
+            .with_output(0, "", "") // [21]
+            .with_output(0, "", "") // [22]
+            .with_output(0, "", "") // [23]
+            .with_output(0, "", "") // [24]
+            .with_output(0, "", "") // [25]
+            .with_output(0, "", "") // [26] chat 10 band sets
+            .with_output(0, &ls_present, "") // [27] chat vol find_node_id
+            .with_output(0, "", "") // [28] chat vol Props set
+            // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [29] media EQ find_node_id
+            .with_output(0, "", "") // [30]
+            .with_output(0, "", "") // [31]
+            .with_output(0, "", "") // [32]
+            .with_output(0, "", "") // [33]
+            .with_output(0, "", "") // [34]
+            .with_output(0, "", "") // [35]
+            .with_output(0, "", "") // [36]
+            .with_output(0, "", "") // [37]
+            .with_output(0, "", "") // [38]
+            .with_output(0, "", "") // [39] media 10 band sets
+            .with_output(0, &ls_present, "") // [40] media vol find_node_id
+            .with_output(0, "", "") // [41] media vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "");
+            .with_output(0, &ls_absent, "") // [42]
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+            .with_output(0, &ls_absent, ""); // [43]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1434,7 +2261,7 @@ mod tests {
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
 
-        // Phase 2: apply game starts at index 3 (right after phase1 ls calls)
+        // Phase 2: apply game EQ starts at index 3 (right after phase1 ls calls)
         assert_eq!(
             calls[3],
             vec!["pw-cli", "ls", "Node"],
@@ -1444,25 +2271,46 @@ mod tests {
         assert_eq!(calls[4][1], "s", "game band 0 sub-cmd");
         assert_eq!(calls[4][3], "Props", "game band 0 Props");
 
-        // apply_all chat: 3 (phase1 ls) + 1+10 (game apply) = 14
+        // Phase 2b: apply game vol at index 14
         assert_eq!(
             calls[14],
+            vec!["pw-cli", "ls", "Node"],
+            "game vol find_node_id"
+        );
+
+        // Phase 2 chat EQ: index 16
+        assert_eq!(
+            calls[16],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // apply_all media: 14 + 1+10 = 25
+        // Phase 2b chat vol: index 27
         assert_eq!(
-            calls[25],
+            calls[27],
+            vec!["pw-cli", "ls", "Node"],
+            "chat vol find_node_id"
+        );
+
+        // Phase 2 media EQ: index 29
+        assert_eq!(
+            calls[29],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Total: 3 (phase1 ls) + 3*11 (apply) + 1 (mic step5 source_exists) = 37
+        // Phase 2b media vol: index 40
+        assert_eq!(
+            calls[40],
+            vec!["pw-cli", "ls", "Node"],
+            "media vol find_node_id"
+        );
+
+        // Total: 3 (phase1 ls) + 3*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 44
         assert_eq!(
             calls.len(),
-            37,
-            "expected 37 total run calls (no spawns in calls)"
+            44,
+            "expected 44 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 3 pipewire -c invocations (channels only)
@@ -1496,8 +2344,8 @@ mod tests {
             .with_output(0, &ls, "")
             .with_output(0, &ls, "")
             .with_output(0, &ls, "")
-            // Phase 2: apply_all 3 channels
-            .with_output(0, &ls, "")
+            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // game EQ ls
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
@@ -1507,19 +2355,11 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, &ls, "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // game vol ls
+            .with_output(0, "", "") // game vol Props
+            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // chat EQ ls
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
@@ -1529,8 +2369,26 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // chat vol ls
+            .with_output(0, "", "") // chat vol Props
+            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // media EQ ls
             .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // media vol ls
+            .with_output(0, "", "") // media vol Props
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls, "");
         // Phase 4: Router::save_persistent writes files — no runner calls.
 
@@ -1555,6 +2413,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1562,6 +2422,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1569,6 +2431,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![RouteConfig {
@@ -1576,7 +2440,9 @@ mod tests {
                     target_sink: "Arctis_Media".into(),
                 }],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         };
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
@@ -1647,6 +2513,8 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls_absent, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
             .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1693,11 +2561,17 @@ mod tests {
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
-            // Phase 2: find_node_id for each channel — node absent → Parse error
+            // Phase 2: find_node_id for each channel — node absent → Parse error (warn+continue)
+            .with_output(0, &ls_absent, "") // game
+            .with_output(0, &ls_absent, "") // chat
+            .with_output(0, &ls_absent, "") // media
+            // Phase 2b: apply_volume_mute find_node_id for each channel — also absent (warn+continue)
             .with_output(0, &ls_absent, "") // game
             .with_output(0, &ls_absent, "") // chat
             .with_output(0, &ls_absent, "") // media
             // Phase 5: mic source_exists check
+            .with_output(0, &ls_absent, "")
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls
             .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
@@ -1721,11 +2595,11 @@ mod tests {
         // 3 tracked tokens
         assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
 
-        // 7 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 1 (mic step5 source_exists)
+        // 11 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 3 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
         assert_eq!(
             engine.runner.calls.len(),
-            7,
-            "expected 7 run calls: 3 ls-up + 3 ls-find-node + 1 mic source_exists"
+            11,
+            "expected 11 run calls: 3 ls-up + 3 ls-find-node + 3 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
         );
     }
 
@@ -1742,14 +2616,20 @@ mod tests {
             for _ in 0..3 {
                 runner = runner.with_output(0, &ls, "");
             }
-            // Phase 2: 3 channels × (1 ls + 10 band sets)
+            // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
             for _ in 0..3 {
+                // Phase 2: EQ apply (1 ls + 10 band sets)
                 runner = runner.with_output(0, &ls, "");
                 for _ in 0..10 {
                     runner = runner.with_output(0, "", "");
                 }
+                // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+                runner = runner.with_output(0, &ls, ""); // find_node_id
+                runner = runner.with_output(0, "", ""); // Props set
             }
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls
+            runner = runner.with_output(0, &ls, "");
+            // Phase 6: surround disabled → remove() → source_exists() → 1 ls
             runner = runner.with_output(0, &ls, "");
         }
 
@@ -1796,15 +2676,21 @@ mod tests {
         for _ in 0..3 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
         for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
         }
         // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node found)
         r = r.with_output(0, &ls_no_mic, "");
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        r = r.with_output(0, &ls, "");
         r
     }
 
@@ -1831,6 +2717,8 @@ mod tests {
                     description: "Game".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "chat".into(),
@@ -1838,6 +2726,8 @@ mod tests {
                     description: "Chat".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "media".into(),
@@ -1845,10 +2735,13 @@ mod tests {
                     description: "Media".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
             ],
             routes: vec![],
             mic: MicChainConfig::default(),
+            surround: arctis_config::SurroundConfig::default(),
         });
 
         // Use a temp ASM_CONFIG_HOME so we don't touch real config.
@@ -2014,6 +2907,8 @@ mod tests {
                                 gain_db: -2.0,
                             },
                         ],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -2021,6 +2916,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: Some("alsa_output.headphones".into()),
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -2028,11 +2925,15 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -2193,6 +3094,149 @@ mod tests {
         assert!(result.is_err(), "unknown channel_id must return an error");
     }
 
+    // ─────────────────────────────────────────────
+    // F2.1: set_channel_volume / set_channel_mute tests
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn set_channel_volume_persists_and_applies_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_vol");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        // set_channel_volume: find_node_id (ls) + apply_volume_mute (Props set)
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // Props set
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_volume("game", -6.0)
+            .expect("set_channel_volume should succeed");
+
+        // Persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config must be persisted");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("volume_db = -6"),
+            "config.toml must contain volume_db = -6, got: {saved_str}"
+        );
+
+        // In-memory state updated
+        let state = engine.state();
+        let ch = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert!(
+            (ch.volume_db - (-6.0)).abs() < f32::EPSILON,
+            "volume_db must be -6.0"
+        );
+
+        // Event emitted
+        let event = rx
+            .try_recv()
+            .expect("ChannelVolumeSet event must be emitted");
+        assert!(
+            matches!(
+                event,
+                crate::state::Event::ChannelVolumeSet {
+                    ref channel_id,
+                    volume_db,
+                } if channel_id == "game" && (volume_db - (-6.0)).abs() < f32::EPSILON
+            ),
+            "event must be ChannelVolumeSet{{channel_id: game, volume_db: -6.0}}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_volume_rejects_out_of_range() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_volume("game", 100.0)
+            .expect_err("100 dB should be rejected");
+        assert!(
+            matches!(err, EngineError::BadRequest(_)),
+            "expected BadRequest"
+        );
+    }
+
+    #[test]
+    fn set_channel_mute_persists_and_applies_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_mute");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // Props set
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_mute("chat", true)
+            .expect("set_channel_mute should succeed");
+
+        // Persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config must be persisted");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("muted = true"),
+            "config.toml must contain muted = true, got: {saved_str}"
+        );
+
+        // In-memory state updated
+        let state = engine.state();
+        let ch = state.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert!(ch.muted, "muted must be true");
+
+        // Event emitted
+        let event = rx.try_recv().expect("ChannelMuteSet event must be emitted");
+        assert!(
+            matches!(
+                event,
+                crate::state::Event::ChannelMuteSet {
+                    ref channel_id,
+                    muted,
+                } if channel_id == "chat" && muted
+            ),
+            "event must be ChannelMuteSet{{channel_id: chat, muted: true}}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_volume_rejects_unknown_channel() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_volume("nonexistent", 0.0)
+            .expect_err("unknown channel should fail");
+        assert!(matches!(err, EngineError::BadRequest(_)));
+    }
+
+    #[test]
+    fn set_channel_mute_rejects_unknown_channel() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_mute("nonexistent", true)
+            .expect_err("unknown channel should fail");
+        assert!(matches!(err, EngineError::BadRequest(_)));
+    }
+
     #[test]
     fn new_profile_creates_clones_active_persists_reconciles_emits_event() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -2267,6 +3311,226 @@ mod tests {
         let result = engine.new_profile("default"); // "default" already exists
         assert!(result.is_err(), "duplicate profile name must error");
         assert!(!tmp.exists(), "no disk write on error");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // TDD: F3 profile management — rename active, EQ preset unit tests
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn rename_active_profile_updates_active_profile_field() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("rename_active");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify initial active profile
+        assert_eq!(engine.state().active_profile, "default");
+
+        engine
+            .rename_profile("default", "my-renamed")
+            .expect("rename_profile should succeed");
+
+        // active_profile in state must reflect the new name
+        assert_eq!(
+            engine.state().active_profile,
+            "my-renamed",
+            "state().active_profile must be updated after renaming the active profile"
+        );
+        // Old name must be gone, new name must exist
+        let names = engine.config().profile_names();
+        assert!(
+            !names.contains(&"default".to_string()),
+            "old profile name must not exist"
+        );
+        assert!(
+            names.contains(&"my-renamed".to_string()),
+            "new profile name must exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn save_eq_preset_captures_channel_bands_into_named_preset() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_save");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        // Give the game channel two EQ bands
+        cfg.profiles[0].channels[0].eq = vec![
+            EqBandConfig {
+                kind: "peaking".into(),
+                freq_hz: 200.0,
+                q: 1.0,
+                gain_db: 4.0,
+            },
+            EqBandConfig {
+                kind: "highshelf".into(),
+                freq_hz: 6000.0,
+                q: 0.7,
+                gain_db: -2.0,
+            },
+        ];
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        engine
+            .save_eq_preset("my-preset", "game")
+            .expect("save_eq_preset should succeed");
+
+        // Preset must exist in config with the correct bands
+        let preset = engine
+            .config()
+            .eq_presets
+            .iter()
+            .find(|p| p.name == "my-preset")
+            .expect("preset must exist in config after save");
+        assert_eq!(preset.bands.len(), 2, "preset must have 2 bands");
+        assert_eq!(preset.bands[0].freq_hz, 200.0, "first band freq must match");
+        assert_eq!(preset.bands[0].gain_db, 4.0, "first band gain must match");
+        assert_eq!(
+            preset.bands[1].kind, "highshelf",
+            "second band kind must match"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn apply_eq_preset_copies_bands_to_channel_and_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_apply");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let preset_bands = vec![EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 500.0,
+            q: 1.5,
+            gain_db: 6.0,
+        }];
+
+        let mut cfg = make_config_no_eq_no_routes();
+        // Inject the preset directly into config
+        cfg.eq_presets.push(arctis_config::EqPreset {
+            name: "test-preset".into(),
+            kind_hint: None,
+            bands: preset_bands.clone(),
+        });
+
+        // apply_eq_preset → apply_all: 1 ls (find_node_id) + 10 band set calls
+        let ls = ls_all_present();
+        let mut runner = MockRunner::new();
+        runner = runner.with_output(0, &ls, ""); // find_node_id
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", ""); // band Props sets
+        }
+
+        let mut engine = Engine::new(runner, cfg);
+
+        engine
+            .apply_eq_preset("test-preset", "game")
+            .expect("apply_eq_preset should succeed");
+
+        // Channel EQ in config must equal preset bands
+        let active = engine.config().active_profile.clone();
+        let profile = engine
+            .config()
+            .profile(&active)
+            .expect("active profile must exist");
+        let channel = profile
+            .channels
+            .iter()
+            .find(|c| c.id == "game")
+            .expect("game channel must exist");
+        assert_eq!(channel.eq.len(), 1, "channel must have 1 band after apply");
+        assert_eq!(
+            channel.eq[0].freq_hz, 500.0,
+            "channel band freq must match preset"
+        );
+        assert_eq!(
+            channel.eq[0].gain_db, 6.0,
+            "channel band gain must match preset"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn delete_eq_preset_removes_it_from_config() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_delete");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.eq_presets.push(arctis_config::EqPreset {
+            name: "to-delete".into(),
+            kind_hint: None,
+            bands: vec![],
+        });
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify it exists before delete
+        assert!(
+            engine
+                .config()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must exist before delete"
+        );
+
+        engine
+            .delete_eq_preset("to-delete")
+            .expect("delete_eq_preset should succeed");
+
+        // Must be gone from config
+        assert!(
+            !engine
+                .config()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must be removed from config after delete"
+        );
+
+        // Must be gone from state
+        assert!(
+            !engine
+                .state()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must not appear in state after delete"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -2449,6 +3713,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -2456,6 +3722,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -2463,11 +3731,15 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
                 mic: mic_enabled_passthrough(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -2486,15 +3758,21 @@ mod tests {
         for _ in 0..3 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
         for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
         }
         // Phase 5: mic enabled → create() → source_exists() (absent) → spawn
         r = r.with_output(0, &ls_mic_absent, "");
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        r = r.with_output(0, &ls, "");
         r
     }
 
@@ -2795,6 +4073,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -2802,6 +4082,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -2809,6 +4091,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -2817,7 +4101,9 @@ mod tests {
                     hw_mic: Some("alsa_input.hw_mic".to_string()),
                     ..Default::default()
                 },
+                surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -3227,6 +4513,929 @@ mod tests {
             event,
             crate::state::Event::MicEnabledSet { enabled: true },
             "event must be MicEnabledSet {{ enabled: true }}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: resolve_hrir_path + available_hrirs
+    // ─────────────────────────────────────────────
+
+    use crate::convert;
+
+    // These tests inject the base dir directly — NO env mutation, NO ENV_MUTEX needed.
+    // This is the canonical pattern: resolve_hrir_path / available_hrirs take base_dir
+    // as a parameter so tests never race on process-global HOME.
+
+    #[test]
+    fn resolve_hrir_path_with_named_stem_returns_abs_path() {
+        let tmp = unique_cfg_tmp("hrir_named");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        let wav = profiles_dir.join("00-default.wav");
+        std::fs::write(&wav, b"").unwrap();
+
+        let cfg = arctis_config::SurroundConfig {
+            hrir: Some("00-default".into()),
+            ..Default::default()
+        };
+        let path = convert::resolve_hrir_path(&cfg, &base).expect("should resolve named stem");
+        assert_eq!(path, wav);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_hrir_path_named_stem_missing_returns_err() {
+        let tmp = unique_cfg_tmp("hrir_missing");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        let cfg = arctis_config::SurroundConfig {
+            hrir: Some("nonexistent".into()),
+            ..Default::default()
+        };
+        let result = convert::resolve_hrir_path(&cfg, &base);
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_stem_picks_first_lexicographic() {
+        let tmp = unique_cfg_tmp("hrir_lex");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("beta.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("alpha.wav"), b"").unwrap();
+
+        let cfg = arctis_config::SurroundConfig::default(); // hrir = None
+        let path =
+            convert::resolve_hrir_path(&cfg, &base).expect("should pick first lexicographic");
+        assert!(
+            path.ends_with("alpha.wav"),
+            "expected alpha.wav, got {:?}",
+            path
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_stem_no_profiles_fallback_to_hrir_wav() {
+        let tmp = unique_cfg_tmp("hrir_fallback");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("hrir.wav"), b"").unwrap();
+
+        let cfg = arctis_config::SurroundConfig::default();
+        let path = convert::resolve_hrir_path(&cfg, &base).expect("should fall back to hrir.wav");
+        assert!(
+            path.ends_with("hrir.wav"),
+            "expected hrir.wav, got {:?}",
+            path
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_hrir_path_no_hrir_at_all_returns_err() {
+        let tmp = unique_cfg_tmp("hrir_none");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let cfg = arctis_config::SurroundConfig::default();
+        let result = convert::resolve_hrir_path(&cfg, &base);
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn available_hrirs_returns_sorted_stems() {
+        let tmp = unique_cfg_tmp("avail_hrirs");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("zz-last.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("aa-first.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("mm-middle.wav"), b"").unwrap();
+
+        let hrirs = convert::available_hrirs(&base);
+        assert_eq!(hrirs, vec!["aa-first", "mm-middle", "zz-last"]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn available_hrirs_empty_when_dir_missing() {
+        let tmp = unique_cfg_tmp("avail_hrirs_empty");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        // Intentionally don't create the profiles dir.
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let hrirs = convert::available_hrirs(&base);
+        assert!(hrirs.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: reconcile step6 (surround)
+    // ─────────────────────────────────────────────
+
+    /// Build a config with surround enabled, pointing to a real temp HRIR file.
+    fn make_config_surround_enabled(hrir_stem: &str) -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: None,
+                        eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
+                    },
+                ],
+                routes: vec![],
+                mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig {
+                    enabled: true,
+                    hrir: Some(hrir_stem.into()),
+                    channels: vec!["game".into(), "media".into()],
+                    hw_sink: None,
+                },
+            }],
+            eq_presets: vec![],
+        }
+    }
+
+    #[test]
+    fn reconcile_step6_disabled_calls_source_exists_noop() {
+        // Surround disabled → remove() is called → source_exists() fires → 1 ls
+        // queue_reconcile_present already adds the surround step6 ls output
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = make_config_no_eq_no_routes(); // surround disabled by default
+        let mut engine = Engine::new(runner, cfg);
+        engine.seed_pw_version((1, 6, 0));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // The last call should be the surround source_exists check (ls Node, step6)
+        let calls = &engine.runner.calls;
+        let last = calls.last().expect("at least one call");
+        assert_eq!(
+            last,
+            &vec!["pw-cli", "ls", "Node"],
+            "step6 must call source_exists"
+        );
+        // No surround spawn (disabled → remove path, source absent → no-op)
+        assert!(
+            !engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "no surround spawn when disabled"
+        );
+        // Total 44 calls: 38 baseline + 6 from apply_volume_mute (3 channels × 2 calls)
+        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
+    }
+
+    /// Queue outputs for reconcile with surround ENABLED and surround node absent.
+    /// Step6 enabled (apply_surround uses recreate in enabled path):
+    ///   1. recreate() = remove() + create():
+    ///      remove: source_exists() → 1 ls (absent, no destroy)
+    ///      create: source_exists() → 1 ls absent → spawn (goes to spawned, not calls)
+    ///   2. reroute "game": set_output → ls (source_exists: present) → find_node_id → destroy → pkill + ls (source absent → spawn)
+    ///   3. reroute "media": same
+    fn queue_reconcile_surround_enabled_absent(runner: MockRunner) -> MockRunner {
+        let ls_channels = ls_all_present();
+        let ls_surround_absent = ls_all_absent(); // no surround node
+        let mut r = runner;
+        // Phase 1: 3 ls (all channels present)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls_channels, "");
+        }
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
+        for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
+            r = r.with_output(0, &ls_channels, "");
+            for _ in 0..10 {
+                r = r.with_output(0, "", "");
+            }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls_channels, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
+        }
+        // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
+        r = r.with_output(0, &ls_surround_absent, "");
+        // Phase 6 (surround enabled, absent) — recreate():
+        //   remove: source_exists() → 1 ls (absent, no destroy needed)
+        r = r.with_output(0, &ls_surround_absent, "");
+        //   create: source_exists() → 1 ls absent → spawn (in spawned, not calls)
+        r = r.with_output(0, &ls_surround_absent, "");
+        // reroute "game": set_output → ChannelManager::set_output →
+        //   find existing present node: ls (source_exists present) + find_node_id ls + destroy + pkill
+        //   create absent: ls absent → spawn
+        r = r.with_output(0, &ls_channels, ""); // set_output: source_exists (game present)
+        r = r.with_output(0, &ls_channels, ""); // set_output: find_node_id
+        r = r.with_output(0, "", ""); // set_output: destroy
+        r = r.with_output(0, "", ""); // set_output: pkill
+        r = r.with_output(0, &ls_surround_absent, ""); // set_output: create source_exists (absent → spawn)
+                                                       // reroute "media": same
+        r = r.with_output(0, &ls_channels, "");
+        r = r.with_output(0, &ls_channels, "");
+        r = r.with_output(0, "", "");
+        r = r.with_output(0, "", "");
+        r = r.with_output(0, &ls_surround_absent, "");
+        r
+    }
+
+    #[test]
+    fn reconcile_step6_enabled_spawns_surround_and_reroutes_channels() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_step6_enabled");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let runner = queue_reconcile_surround_enabled_absent(MockRunner::new());
+        let cfg = make_config_surround_enabled("test-hrir");
+        let mut engine = Engine::new(runner, cfg);
+        engine.seed_pw_version((1, 6, 0));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // Surround sink was spawned
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be spawned: {:?}",
+            engine.runner.spawned
+        );
+        // Channel reroutes spawned new instances for game + media
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game"))
+                .unwrap_or(false)),
+            "game channel must be respawned for surround routing"
+        );
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "media channel must be respawned for surround routing"
+        );
+        // Children tracked: surround + game + media
+        assert!(engine.children.len() >= 3, "at least 3 children tracked");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 TDD: surround_set_* methods
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn surround_set_enabled_true_without_hrir_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_on_no_hrir");
+        // Don't create any HRIR file → resolve_hrir_path must fail
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.surround_set_enabled(true);
+        assert!(
+            matches!(result, Err(EngineError::BadRequest(_))),
+            "must error when no HRIR exists: {result:?}"
+        );
+        // Config must NOT have been mutated (error before mutation)
+        assert!(
+            !engine.config().active().unwrap().surround.enabled,
+            "surround.enabled must remain false on error"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn surround_set_hrir_persists_and_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_set_hrir_home");
+        let tmp_cfg = unique_cfg_tmp("surr_set_hrir_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("my-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // surround disabled → surround_set_hrir just persists, no recreate
+        let cfg = make_config_no_eq_no_routes(); // surround disabled
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .surround_set_hrir("my-hrir".into())
+            .expect("surround_set_hrir should succeed");
+
+        // Config persisted
+        let saved_path = tmp_cfg.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("my-hrir"),
+            "persisted config must contain hrir stem"
+        );
+
+        // In-memory updated
+        assert_eq!(
+            engine.config().active().unwrap().surround.hrir.as_deref(),
+            Some("my-hrir")
+        );
+
+        // Event emitted
+        let event = rx.try_recv().expect("SurroundHrirSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::SurroundHrirSet {
+                hrir: Some("my-hrir".into())
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_hrir_nonexistent_returns_err() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_hrir_err");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        // Don't write the file.
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.surround_set_hrir("nonexistent".into());
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        // hrir must remain None (rollback)
+        assert!(engine.config().active().unwrap().surround.hrir.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn surround_set_channels_persists_and_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_ch");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .surround_set_channels(vec!["game".into(), "chat".into(), "media".into()])
+            .expect("surround_set_channels should succeed");
+
+        // Config persisted
+        assert!(tmp.join("config.toml").exists());
+
+        // Event emitted
+        let event = rx
+            .try_recv()
+            .expect("SurroundChannelsSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::SurroundChannelsSet {
+                channels: vec!["game".into(), "chat".into(), "media".into()]
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn state_surround_snapshot_reflects_config() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_state");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("aa-first.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("zz-last.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround = arctis_config::SurroundConfig {
+            enabled: false,
+            hrir: Some("aa-first".into()),
+            channels: vec!["game".into()],
+            hw_sink: Some("alsa_output.pci".into()),
+        };
+        let engine = Engine::new(MockRunner::new(), cfg);
+        let s = engine.state();
+
+        assert!(!s.surround.enabled);
+        assert_eq!(s.surround.hrir.as_deref(), Some("aa-first"));
+        assert_eq!(s.surround.channels, vec!["game"]);
+        assert_eq!(s.surround.hw_sink.as_deref(), Some("alsa_output.pci"));
+        assert_eq!(s.surround.available_hrirs, vec!["aa-first", "zz-last"]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 Bug Fix tests: C1, C2, I3
+    // ─────────────────────────────────────────────
+
+    /// C1 fix: apply_surround restores a channel removed from the surround list.
+    ///
+    /// Setup: `surround_routed = {"game", "media"}`, config has `channels = ["game"]`.
+    /// After apply_surround: media must be restored to its output_device; surround_routed = {"game"}.
+    #[test]
+    fn apply_surround_restores_removed_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("c1_restore_home");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+
+        // Config: surround enabled with only "game" in channels.
+        // "media" was previously routed to surround but is now removed.
+        let cfg = make_config_surround_enabled("test-hrir"); // channels = ["game", "media"]
+                                                             // We'll override channels to just ["game"] below.
+
+        // Runner calls for apply_surround with surround_routed = {"game", "media"},
+        // desired = {"game"}, to_restore = ["media"], to_route = [] (game already tracked):
+        //
+        // recreate surround (absent):
+        //   remove: source_exists → 1 ls (absent, no destroy)
+        //   create: source_exists → 1 ls (absent) → spawn
+        //
+        // restore media (Arctis_Media present → destroy + pkill, then create absent → spawn):
+        //   remove: sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        //   create: sink_exists → 1 ls (absent) → spawn
+        let ls_channels = ls_all_present();
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // restore media: remove sink_exists (present)
+            .with_output(0, &ls_channels, "")
+            // restore media: remove find_node_id
+            .with_output(0, &ls_channels, "")
+            // restore media: destroy
+            .with_output(0, "", "")
+            // restore media: pkill
+            .with_output(0, "", "")
+            // restore media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Pre-populate surround_routed to simulate prior state.
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        // Mutate config so surround only has "game".
+        {
+            let p = engine.config.profile_mut("default").unwrap();
+            p.surround.channels = vec!["game".into()];
+        }
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        // surround_routed must now only contain "game" (media was removed).
+        assert!(
+            engine.surround_routed.contains("game"),
+            "game must remain in surround_routed"
+        );
+        assert!(
+            !engine.surround_routed.contains("media"),
+            "media must be removed from surround_routed after restore"
+        );
+        assert_eq!(
+            engine.surround_routed.len(),
+            1,
+            "exactly 1 channel in surround_routed"
+        );
+
+        // media was respawned (set_output → recreate → create → spawn)
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "Arctis_Media must be respawned to restore from surround routing: {:?}",
+            engine.runner.spawned
+        );
+
+        // surround sink was recreated (spawned)
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be respawned: {:?}",
+            engine.runner.spawned
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("HOME");
+    }
+
+    /// C2 fix: apply_surround disabled path restores channels with output_device=None.
+    ///
+    /// Setup: `surround_routed = {"game"}` (simulating prior enable), config has
+    /// `surround.enabled = false`. After apply_surround: game must be restored
+    /// (even though output_device = None), surround_routed = {}.
+    #[test]
+    fn apply_surround_disabled_restores_stale_channel_with_no_output_device() {
+        // Config: surround disabled (default). Game channel has output_device = None.
+        let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
+
+        // Runner calls for apply_surround with surround_routed = {"game"},
+        // surround disabled:
+        //
+        // remove surround (absent → no destroy):
+        //   source_exists → 1 ls (absent)
+        //
+        // restore game (Arctis_Game present, then recreate):
+        //   remove: sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        //   create: sink_exists → 1 ls (absent) → spawn
+        let ls_channels = ls_all_present();
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // remove surround: source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: remove sink_exists (present)
+            .with_output(0, &ls_channels, "")
+            // restore game: remove find_node_id
+            .with_output(0, &ls_channels, "")
+            // restore game: destroy
+            .with_output(0, "", "")
+            // restore game: pkill
+            .with_output(0, "", "")
+            // restore game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate prior enable: game was routed to surround.
+        engine.surround_routed.insert("game".into());
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        // surround_routed must be empty after disable.
+        assert!(
+            engine.surround_routed.is_empty(),
+            "surround_routed must be empty after disable: {:?}",
+            engine.surround_routed
+        );
+
+        // game channel was respawned (restored even with output_device = None).
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game"))
+                .unwrap_or(false)),
+            "Arctis_Game must be respawned after disable even with output_device=None: {:?}",
+            engine.runner.spawned
+        );
+
+        // Verify destroy was called (channel was present, then destroyed and recreated).
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 3 && c[1] == "destroy"),
+            "destroy must be called when restoring the channel"
+        );
+    }
+
+    /// Enable → disable flow: all listed channels are restored after disable.
+    ///
+    /// This tests the full round-trip:
+    /// 1. surround_set_enabled(true) → populates surround_routed
+    /// 2. surround_set_enabled(false) → drains surround_routed + restores channels
+    #[test]
+    fn surround_set_enabled_disable_restores_all_channels() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_roundtrip_home");
+        let tmp_cfg = unique_cfg_tmp("surr_roundtrip_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // Config: surround disabled, channels = ["game", "media"] (will be enabled).
+        // Start with surround disabled so surround_set_enabled(true) is meaningful.
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround = arctis_config::SurroundConfig {
+            enabled: false,
+            hrir: Some("test-hrir".into()),
+            channels: vec!["game".into(), "media".into()],
+            hw_sink: None,
+        };
+
+        // Phase 1: surround_set_enabled(true) → apply_surround(enabled):
+        //   recreate surround: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //   to_route = ["game", "media"] (both not yet tracked):
+        //     route game: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //     route media: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //
+        // Phase 2: surround_set_enabled(false) → apply_surround(disabled):
+        //   remove surround: source_exists (absent) = 1 ls
+        //   restore game (was present from spawn above — but MockRunner can't distinguish;
+        //     we'll report game as absent for simplicity → remove is no-op, create spawns)
+        //   restore media: same
+        //
+        // For simplicity, we report all channels/surround as absent throughout.
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // --- Phase 1: surround_set_enabled(true) ---
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // route game: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // route game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // route media: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // route media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // --- Phase 2: surround_set_enabled(false) ---
+            // remove surround: source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // restore media: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+
+        // Enable surround.
+        engine
+            .surround_set_enabled(true)
+            .expect("enable must succeed");
+
+        // After enable: surround_routed must contain both channels.
+        assert!(
+            engine.surround_routed.contains("game"),
+            "game must be in surround_routed after enable"
+        );
+        assert!(
+            engine.surround_routed.contains("media"),
+            "media must be in surround_routed after enable"
+        );
+
+        // Disable surround.
+        engine
+            .surround_set_enabled(false)
+            .expect("disable must succeed");
+
+        // After disable: surround_routed must be empty.
+        assert!(
+            engine.surround_routed.is_empty(),
+            "surround_routed must be empty after disable: {:?}",
+            engine.surround_routed
+        );
+
+        // game and media channels must have been respawned (restored).
+        let game_spawns = engine
+            .runner
+            .spawned
+            .iter()
+            .filter(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("Arctis_Game"))
+                    .unwrap_or(false)
+            })
+            .count();
+        let media_spawns = engine
+            .runner
+            .spawned
+            .iter()
+            .filter(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("Arctis_Media"))
+                    .unwrap_or(false)
+            })
+            .count();
+
+        // game: spawned on route (enable) + spawned on restore (disable) = 2
+        assert!(
+            game_spawns >= 2,
+            "game must be spawned at least twice (route + restore): {game_spawns}"
+        );
+        // media: same
+        assert!(
+            media_spawns >= 2,
+            "media must be spawned at least twice (route + restore): {media_spawns}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// I3 fix: surround_set_hrir routes through apply_surround (not inlined recreate).
+    ///
+    /// When surround is ENABLED and HRIR changes, apply_surround is called.
+    /// Since channels are already in surround_routed, to_route and to_restore are both empty
+    /// → only the sink is recreated (no channel thrash).
+    #[test]
+    fn surround_set_hrir_enabled_uses_apply_surround_no_channel_thrash() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_hrir_i3_home");
+        let tmp_cfg = unique_cfg_tmp("surr_hrir_i3_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("old-hrir.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("new-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // Config: surround enabled, channels = ["game"].
+        let cfg = make_config_surround_enabled("old-hrir");
+
+        // Pre-populate surround_routed to simulate that "game" is already routed.
+        // apply_surround will find to_route = [], to_restore = [] → only sink recreated.
+        //
+        // recreate surround (absent):
+        //   remove: source_exists → 1 ls (absent)
+        //   create: source_exists → 1 ls (absent) → spawn
+        // No channel operations.
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate that channels are already tracked (prior enable).
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        engine
+            .surround_set_hrir("new-hrir".into())
+            .expect("surround_set_hrir must succeed");
+
+        // Surround sink was respawned (HRIR change took effect).
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be respawned after HRIR change: {:?}",
+            engine.runner.spawned
+        );
+
+        // No channel thrash: game and media were NOT respawned (already tracked).
+        assert!(
+            !engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game") || s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "channels must NOT be thrashed when HRIR changes (already in surround_routed): {:?}",
+            engine.runner.spawned
+        );
+
+        // surround_routed unchanged.
+        assert!(engine.surround_routed.contains("game"));
+        assert!(engine.surround_routed.contains("media"));
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // Minor fix tests: surround tracker + prune
+    // ─────────────────────────────────────────────
+
+    /// Fix: remove_channel prunes surround.channels and surround_routed stays consistent.
+    ///
+    /// Setup: config has channels = ["game", "chat", "media"], surround.channels = ["game", "media"].
+    /// surround_routed = {"game", "media"} (simulating prior enable).
+    ///
+    /// After remove_channel("media"):
+    ///   - surround.channels must not contain "media"
+    ///   - surround_routed tracker is unaffected by remove_channel itself (reconcile handles it),
+    ///     but a subsequent apply_surround driven from the new config must not try to route "media"
+    ///     (it no longer exists in channels) and must restore it from surround_routed → tracker
+    ///     drains "media" correctly.
+    #[test]
+    fn remove_channel_prunes_surround_channels_and_tracker_stays_consistent() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("rm_ch_surr_prune");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Config: surround enabled, surround.channels = ["game", "media"],
+        // actual channels = ["game", "chat", "media"].
+        let cfg = make_config_surround_enabled("unused-hrir"); // channels: game, chat, media; surround.channels: game, media
+
+        // remove_channel("media") → AudioBackend::remove:
+        //   sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // sink_exists
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", "") // pw-cli destroy
+            .with_output(1, "", ""); // pkill (exit 1 — ignored)
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate prior surround enable: both channels tracked.
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        engine
+            .remove_channel("media")
+            .expect("remove_channel must succeed");
+
+        // surround.channels must no longer reference the deleted channel.
+        let surr_channels = &engine.config.active().unwrap().surround.channels;
+        assert!(
+            !surr_channels.contains(&"media".to_string()),
+            "surround.channels must not reference deleted channel 'media': {surr_channels:?}"
+        );
+        assert!(
+            surr_channels.contains(&"game".to_string()),
+            "surround.channels must still contain 'game': {surr_channels:?}"
+        );
+
+        // The actual channels list must also not contain "media".
+        let profile = engine.config.active().unwrap();
+        assert!(
+            !profile.channels.iter().any(|c| c.id == "media"),
+            "channels list must not contain removed channel"
+        );
+
+        // surround_routed tracker: remove_channel doesn't touch it (reconcile/apply_surround
+        // will clean it up on next pass). That is the correct contract — verify it's still
+        // populated so a subsequent apply_surround can restore cleanly.
+        assert!(
+            engine.surround_routed.contains("media"),
+            "surround_routed retains 'media' until next apply_surround pass"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

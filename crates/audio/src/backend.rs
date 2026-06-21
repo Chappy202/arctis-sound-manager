@@ -1,7 +1,7 @@
 use crate::config::{render_filter_chain_conf, SinkSpec};
 use crate::eq::{EqBand, EqModel};
 use crate::error::AudioError;
-use crate::props::set_band_props_argv;
+use crate::props::{set_band_props_argv, set_node_volume_props_argv};
 use crate::runner::{ChildToken, CmdOutput, CommandRunner};
 use std::path::PathBuf;
 
@@ -114,6 +114,19 @@ impl<R: CommandRunner> AudioBackend<R> {
             let out = self.runner.run("pw-cli", &args)?;
             Self::check(out, "pw-cli")?;
         }
+        Ok(())
+    }
+
+    /// Apply volume+mute to the channel sink node live via `pw-cli s <id> Props …`.
+    /// `volume_db` is in dB; converted to linear (10^(db/20)) for channelVolumes.
+    /// Channel sinks are stereo → 2 identical channelVolume entries.
+    pub fn apply_volume_mute(&mut self, volume_db: f32, muted: bool) -> Result<(), AudioError> {
+        let id = self.find_node_id()?;
+        let linear = 10f32.powf(volume_db / 20.0);
+        let argv = set_node_volume_props_argv(&id, &[linear, linear], muted)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-cli", &args)?;
+        Self::check(out, "pw-cli")?;
         Ok(())
     }
 
@@ -336,6 +349,45 @@ id 58, type PipeWire:Interface:Node/3
             handle.child.is_some(),
             "recreate must surface the new child token"
         );
+    }
+
+    #[test]
+    fn apply_volume_mute_emits_exact_pw_cli_props_argv() {
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // find_node_id
+            .with_output(0, "", ""); // the set
+        let mut be = AudioBackend::new(runner, spec());
+        be.apply_volume_mute(-6.0, false).unwrap();
+        let last = be.runner().last_call().unwrap();
+        let linear = 10f32.powf(-6.0_f32 / 20.0);
+        let expected_vol = if linear.fract() == 0.0 {
+            format!("{linear:.1}")
+        } else {
+            format!("{linear}")
+        };
+        let expected_json =
+            format!("{{ channelVolumes = [ {expected_vol} {expected_vol} ] mute = false }}");
+        assert_eq!(
+            last,
+            &vec![
+                "pw-cli".to_string(),
+                "s".to_string(),
+                "57".to_string(),
+                "Props".to_string(),
+                expected_json,
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_volume_mute_muted_sends_mute_true() {
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "")
+            .with_output(0, "", "");
+        let mut be = AudioBackend::new(runner, spec());
+        be.apply_volume_mute(0.0, true).unwrap();
+        let last = be.runner().last_call().unwrap();
+        assert!(last.last().unwrap().contains("mute = true"));
     }
 
     #[test]

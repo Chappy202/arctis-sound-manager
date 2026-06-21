@@ -1,5 +1,6 @@
 <script lang="ts">
   import { engineState, loadError, init, destroy } from "../stores.js";
+  import { channelAdd, channelRemove } from "../ipc.js";
   import ChannelStrip from "./ChannelStrip.svelte";
   import RouteList from "./RouteList.svelte";
 
@@ -12,6 +13,53 @@
   function refresh() {
     destroy();
     init();
+  }
+
+  // ── F4: Add channel ───────────────────────────────────────────────────────
+  let addId = $state("");
+  let addBusy = $state(false);
+  let addError = $state<string | null>(null);
+
+  async function handleAddChannel() {
+    const id = addId.trim();
+    if (!id) return;
+    addBusy = true;
+    addError = null;
+    try {
+      const newState = await channelAdd(id);
+      if (newState) {
+        engineState.set(newState);
+      }
+      addId = "";
+    } catch (err: unknown) {
+      addError = err instanceof Error ? err.message : String(err);
+    } finally {
+      addBusy = false;
+    }
+  }
+
+  function handleAddKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      handleAddChannel();
+    }
+  }
+
+  // ── F4: Remove channel ────────────────────────────────────────────────────
+  let removeBusy = $state(false);
+
+  async function handleRemoveChannel(id: string) {
+    if (!confirm(`Remove channel "${id}"? This cannot be undone.`)) return;
+    removeBusy = true;
+    try {
+      const newState = await channelRemove(id);
+      if (newState) {
+        engineState.set(newState);
+      }
+    } catch (err: unknown) {
+      console.error("[MixerPage] channelRemove failed:", err);
+    } finally {
+      removeBusy = false;
+    }
   }
 </script>
 
@@ -70,9 +118,37 @@
                   // State will be refreshed via state-changed event.
                   // No extra action needed here.
                 }}
+                onRemove={$engineState.channels.length > 1 && !removeBusy
+                  ? () => handleRemoveChannel(channel.id)
+                  : undefined}
               />
             </div>
           {/each}
+
+          <!-- ===== Add channel affordance ===== -->
+          <div class="add-channel-strip" role="listitem">
+            <p class="add-channel-label">ADD CHANNEL</p>
+            <div class="add-channel-row">
+              <input
+                class="add-channel-input"
+                type="text"
+                placeholder="id (e.g. aux)"
+                bind:value={addId}
+                disabled={addBusy}
+                aria-label="New channel id"
+                onkeydown={handleAddKeydown}
+              />
+              <button
+                class="add-channel-btn"
+                disabled={addBusy || !addId.trim()}
+                aria-label="Add channel"
+                onclick={handleAddChannel}
+              >+</button>
+            </div>
+            {#if addError}
+              <p class="add-channel-error" role="alert">{addError}</p>
+            {/if}
+          </div>
         </div>
       {/if}
     </div>
@@ -271,6 +347,98 @@
     color: var(--ss-text-tertiary);
     font-style: italic;
     margin: 0;
+  }
+
+  /* ===== Add channel strip ===== */
+  .add-channel-strip {
+    display: flex;
+    flex-direction: column;
+    width: var(--ss-channel-strip-w, 120px);
+    min-width: var(--ss-channel-strip-w-min, 100px);
+    background: var(--ss-surface-1);
+    border: var(--ss-border-width) dashed var(--ss-border);
+    border-radius: var(--ss-radius-md);
+    padding: var(--ss-space-3);
+    gap: var(--ss-space-2);
+    flex-shrink: 0;
+    justify-content: flex-start;
+  }
+
+  .add-channel-label {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-micro-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-tertiary);
+    margin: 0;
+  }
+
+  .add-channel-row {
+    display: flex;
+    gap: var(--ss-space-1);
+  }
+
+  .add-channel-input {
+    flex: 1;
+    min-width: 0;
+    height: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-primary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+  }
+
+  .add-channel-input:focus {
+    outline: none;
+    border-color: var(--ss-accent-border);
+  }
+
+  .add-channel-input:disabled {
+    cursor: not-allowed;
+    color: var(--ss-text-disabled);
+  }
+
+  .add-channel-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--ss-control-h-sm);
+    height: var(--ss-control-h-sm);
+    background: var(--ss-gradient-primary);
+    border: none;
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-bright);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: filter var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .add-channel-btn:hover:not(:disabled) {
+    filter: brightness(1.15);
+  }
+
+  .add-channel-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.4;
+  }
+
+  .add-channel-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .add-channel-error {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    margin: 0;
+    word-break: break-word;
   }
 
   /* ===== Routes ===== */

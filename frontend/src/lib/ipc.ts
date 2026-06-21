@@ -26,6 +26,10 @@ export interface ChannelSnapshot {
   output_device: string | null;
   /** Full per-band EQ state; empty = flat / no overrides. */
   eq_bands: EqBandSnapshot[];
+  /** Software volume in dB. Range: -60..=+6. 0 dB = unity gain. */
+  volume_db: number;
+  /** Whether the channel is muted. */
+  muted: boolean;
 }
 
 export interface MicStageSnapshot {
@@ -44,6 +48,21 @@ export interface MicSnapshot {
   suppression_backend: string;
   /** Backends whose plugin is present on this machine */
   available_suppression_backends: string[];
+  /** Pinned hardware mic capture source; null = auto / not pinned. */
+  hw_mic?: string | null;
+}
+
+export interface SurroundSnapshot {
+  enabled: boolean;
+  hrir: string | null;
+  available_hrirs: string[];
+  channels: string[];
+  hw_sink: string | null;
+}
+
+export interface EqPresetSnapshot {
+  name: string;
+  band_count: number;
 }
 
 export interface EngineState {
@@ -55,6 +74,8 @@ export interface EngineState {
   device_present: boolean;
   device_fields: Record<string, string>;
   mic: MicSnapshot;
+  surround: SurroundSnapshot;
+  eq_presets: EqPresetSnapshot[];
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +118,23 @@ export function buildDeviceSetArgs(
   return { control, value };
 }
 
+/** Builds the arg object for set_channel_volume.
+ * volume_db has no rename — Tauri v2 snake_case param names pass through as-is. */
+export function buildSetChannelVolumeArgs(
+  channel: string,
+  volume_db: number,
+): { channel: string; volume_db: number } {
+  return { channel, volume_db };
+}
+
+/** Builds the arg object for set_channel_mute. */
+export function buildSetChannelMuteArgs(
+  channel: string,
+  muted: boolean,
+): { channel: string; muted: boolean } {
+  return { channel, muted };
+}
+
 /** Builds the camelCase arg object for the mic_eq_band command.
  * Tauri v2 converts these camelCase keys back to the Rust command's snake_case params
  * at the invoke boundary — the same round-trip as buildSetEqBandArgs; this is intentional. */
@@ -108,6 +146,40 @@ export function buildMicEqBandArgs(
   gain_db: number,
 ): { band: number; kind: string; freqHz: number; q: number; gainDb: number } {
   return { band, kind, freqHz: freq_hz, q, gainDb: gain_db };
+}
+
+/** Builds arg object for profile_rename. Old/new are both simple strings — no rename needed. */
+export function buildProfileRenameArgs(
+  old_name: string,
+  new_name: string,
+): { old: string; new: string } {
+  return { old: old_name, new: new_name };
+}
+
+/** Builds arg object for eq_preset_save. */
+export function buildEqPresetSaveArgs(
+  name: string,
+  channel: string,
+): { name: string; channel: string } {
+  return { name, channel };
+}
+
+/** Builds arg object for eq_preset_apply. */
+export function buildEqPresetApplyArgs(
+  preset: string,
+  channel: string,
+): { preset: string; channel: string } {
+  return { preset, channel };
+}
+
+/** Builds arg object for channel_add (F4). */
+export function buildChannelAddArgs(id: string): { id: string } {
+  return { id };
+}
+
+/** Builds arg object for channel_remove (F4). */
+export function buildChannelRemoveArgs(id: string): { id: string } {
+  return { id };
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +205,20 @@ export const profileNew = (name: string): Promise<EngineState> =>
 export const setChannelOutput = (channel: string, device: string | null): Promise<EngineState> =>
   invoke<EngineState>("set_channel_output", buildSetChannelOutputArgs(channel, device));
 
+/**
+ * Set the software volume (dB) for a channel. Range: -60..=+6. 0 dB = unity gain.
+ * Returns the updated EngineState for immediate store application.
+ */
+export const setChannelVolume = (channel: string, volumeDb: number): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_volume", buildSetChannelVolumeArgs(channel, volumeDb));
+
+/**
+ * Set the mute state for a channel.
+ * Returns the updated EngineState for immediate store application.
+ */
+export const setChannelMute = (channel: string, muted: boolean): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_mute", buildSetChannelMuteArgs(channel, muted));
+
 /** Update a parametric EQ band; returns updated EngineState. */
 export const setEqBand = (
   channel: string,
@@ -147,6 +233,10 @@ export const setEqBand = (
 /** Route an app binary to a target sink; returns updated EngineState. */
 export const setRoute = (app_binary: string, target_sink: string): Promise<EngineState> =>
   invoke<EngineState>("set_route", buildSetRouteArgs(app_binary, target_sink));
+
+/** Remove the routing rule for an app binary; returns updated EngineState. */
+export const clearRoute = (app_binary: string): Promise<EngineState> =>
+  invoke<EngineState>("clear_route", { appBinary: app_binary });
 
 /**
  * Set a single device hardware control by name.
@@ -185,6 +275,69 @@ export const micHwMic = (device: string | null): Promise<EngineState> =>
 /** Switch the noise-suppression backend ("deep_filter" | "rnnoise"). */
 export const micSuppressionBackend = (backend: string): Promise<EngineState> =>
   invoke<EngineState>("mic_suppression_backend", { backend });
+
+// ── F1.5: Surround / HRIR commands ──────────────────────────────────────────
+
+/** Enable or disable virtual surround (master switch). */
+export const surroundEnable = (enabled: boolean): Promise<EngineState> =>
+  invoke<EngineState>("surround_enable", { enabled });
+
+/** Set the active HRIR profile by stem name (e.g. "02-dh-dolby-headphone"). */
+export const surroundSetHrir = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_hrir", { name });
+
+/** Set which channels are routed through surround (e.g. ["game", "media"]). */
+export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_channels", { channels });
+
+/** Pin (or clear) the surround output to a specific hardware sink. */
+export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_hw_sink", { hw_sink: hwSink });
+
+// ── F3b: Profile management commands ─────────────────────────────────────────
+
+/** Rename a profile. Returns updated EngineState. */
+export const profileRename = (oldName: string, newName: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_rename", buildProfileRenameArgs(oldName, newName));
+
+/** Delete a profile (cannot delete active or last). Returns updated EngineState. */
+export const profileDelete = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_delete", { name });
+
+/**
+ * Export a profile as a TOML string.
+ * Returns the raw TOML text, NOT an EngineState — use to trigger a download or clipboard copy.
+ */
+export const profileExport = (name: string): Promise<string> =>
+  invoke<string>("profile_export", { name });
+
+/** Import a profile from a TOML string. Resolves name collisions automatically. */
+export const profileImport = (toml: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_import", { toml });
+
+// ── F3b: EQ preset commands ───────────────────────────────────────────────────
+
+/** Save the current EQ bands of a channel as a named preset. */
+export const eqPresetSave = (name: string, channel: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_save", buildEqPresetSaveArgs(name, channel));
+
+/** Apply a named EQ preset to a channel's EQ bands. */
+export const eqPresetApply = (preset: string, channel: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_apply", buildEqPresetApplyArgs(preset, channel));
+
+/** Delete a named EQ preset. */
+export const eqPresetDelete = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_delete", { name });
+
+// ── F4: Channel add / remove commands ────────────────────────────────────────
+
+/** Add a new channel by id. Returns updated EngineState. */
+export const channelAdd = (id: string): Promise<EngineState> =>
+  invoke<EngineState>("channel_add", buildChannelAddArgs(id));
+
+/** Remove a channel by id. Returns updated EngineState. */
+export const channelRemove = (id: string): Promise<EngineState> =>
+  invoke<EngineState>("channel_remove", buildChannelRemoveArgs(id));
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

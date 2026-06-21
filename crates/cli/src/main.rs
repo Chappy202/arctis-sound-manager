@@ -72,6 +72,11 @@ enum Command {
         #[command(subcommand)]
         action: MicAction,
     },
+    /// Virtual surround / HRIR (spatial audio via PipeWire convolver).
+    Surround {
+        #[command(subcommand)]
+        action: SurroundAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -103,6 +108,31 @@ enum EqAction {
     },
     /// Show the resolved node id and confirm the sink is present.
     Show,
+    /// EQ preset management (save, apply, list, delete).
+    Preset {
+        #[command(subcommand)]
+        action: EqPresetAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EqPresetAction {
+    /// Save the current EQ bands of a channel as a named preset.
+    Save {
+        name: String,
+        #[arg(long)]
+        channel: String,
+    },
+    /// Apply a named preset to a channel's EQ.
+    Apply {
+        name: String,
+        #[arg(long)]
+        channel: String,
+    },
+    /// List all available EQ presets.
+    List,
+    /// Delete a named EQ preset.
+    Delete { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,6 +145,19 @@ enum ChannelsAction {
     },
     /// Remove all configured channels (idempotent).
     Down,
+    /// Add a new channel to the active profile. The engine derives node_name and description from id.
+    Add {
+        /// Channel id: e.g. "aux". Must not be empty, contain whitespace or path separators,
+        /// or duplicate an existing channel id.
+        id: String,
+    },
+    /// Remove a channel from the active profile by id. Any channel may be removed
+    /// (including game/chat/media) unless it is the last remaining channel.
+    /// Routes referencing the removed channel become inert.
+    Remove {
+        /// Channel id to remove.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,6 +172,16 @@ enum RouteAction {
         #[arg(long)]
         by_name: bool,
     },
+    /// Remove the routing rule for an app and move its stream back to the default sink.
+    Clear {
+        /// Application binary name whose rule should be removed.
+        app: String,
+    },
+    /// Remove is an alias for clear.
+    Remove {
+        /// Application binary name whose rule should be removed.
+        app: String,
+    },
     /// Print all persistent routing rules from routes.json.
     List,
 }
@@ -139,6 +192,21 @@ enum ChannelCmd {
     Output {
         #[command(subcommand)]
         action: ChannelOutputAction,
+    },
+    /// Set the software volume for a channel in dB (-60..+6). 0 = unity.
+    Volume {
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// Volume in dB, e.g. -6.0 for -6 dB.
+        #[arg(allow_negative_numbers = true)]
+        db: f32,
+    },
+    /// Mute or unmute a channel.
+    Mute {
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// `on` to mute, `off` to unmute.
+        state: String,
     },
 }
 
@@ -165,6 +233,18 @@ enum ProfileAction {
     Save,
     /// Create a new profile as a copy of the active one.
     New { name: String },
+    /// Rename a profile.
+    Rename { old: String, new: String },
+    /// Delete a profile (cannot delete the active or last profile).
+    Delete { name: String },
+    /// Export a profile as standalone TOML (prints to stdout or --out file).
+    Export {
+        name: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Import a profile from a TOML file.
+    Import { file: std::path::PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -259,6 +339,43 @@ enum MicAction {
     Backend {
         /// Backend name: deep_filter|rnnoise
         backend: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SurroundAction {
+    /// Print the virtual surround status (enabled, HRIR, channels, hw_sink).
+    Status,
+    /// Enable virtual surround (master switch on).
+    On,
+    /// Disable virtual surround (master switch off).
+    Off,
+    /// HRIR profile management (list or set).
+    Hrir {
+        #[command(subcommand)]
+        action: HrirAction,
+    },
+    /// Set which channels are routed through surround (comma-separated, e.g. game,media).
+    Channels {
+        /// Channel ids, comma-separated: game,media (or a single id).
+        #[arg(value_delimiter = ',')]
+        channels: Vec<String>,
+    },
+    /// Pin (or clear) the surround output to a specific hardware sink node.name.
+    HwSink {
+        /// Hardware sink node.name; omit to clear the pin.
+        device: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HrirAction {
+    /// List available HRIR profiles from ~/.local/share/pipewire/hrir_hesuvi/profiles/.
+    List,
+    /// Set the active HRIR profile by stem (filename without .wav).
+    Set {
+        /// Profile stem, e.g. 02-dh-dolby-headphone
+        name: String,
     },
 }
 
@@ -429,6 +546,10 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
                             println!("    {k}: {v}");
                         }
                     }
+                    match &mic.hw_mic {
+                        Some(hw) => println!("  hw_mic: {hw}"),
+                        None => println!("  hw_mic: (auto / not pinned)"),
+                    }
                     if !mic.eq_bands.is_empty() {
                         println!("  eq bands:");
                         for (i, b) in mic.eq_bands.iter().enumerate() {
@@ -548,6 +669,93 @@ fn dispatch_device(action: DeviceAction) -> ExitCode {
         DeviceAction::Transparency { level } => device_set_via_daemon("transparency_level", level),
         DeviceAction::MicVolume { level } => device_set_via_daemon("mic_volume", level),
         DeviceAction::Set { control, value } => device_set_via_daemon(&control, value),
+    }
+}
+
+fn dispatch_surround(action: SurroundAction) -> ExitCode {
+    if !daemon::socket_path().exists() {
+        eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+        eprintln!(
+            "note: surround commands require the daemon (single worker enforces PipeWire serialisation)"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let is_status = matches!(action, SurroundAction::Status);
+    let is_hrir_list = matches!(
+        action,
+        SurroundAction::Hrir {
+            action: HrirAction::List
+        }
+    );
+    let req = match action {
+        SurroundAction::Status => daemon::Request::SurroundStatus,
+        SurroundAction::On => daemon::Request::SurroundEnable { enabled: true },
+        SurroundAction::Off => daemon::Request::SurroundEnable { enabled: false },
+        SurroundAction::Hrir {
+            action: HrirAction::List,
+        } => daemon::Request::SurroundStatus,
+        SurroundAction::Hrir {
+            action: HrirAction::Set { name },
+        } => daemon::Request::SurroundSetHrir { name },
+        SurroundAction::Channels { channels } => daemon::Request::SurroundSetChannels { channels },
+        SurroundAction::HwSink { device } => daemon::Request::SurroundSetHwSink { hw_sink: device },
+    };
+
+    match daemon::send_request(&req) {
+        Ok(resp) if resp.ok => {
+            if is_status {
+                if let Some(state) = resp.state {
+                    let s = &state.surround;
+                    println!(
+                        "surround: {}",
+                        if s.enabled { "enabled" } else { "disabled" }
+                    );
+                    match &s.hrir {
+                        Some(h) => println!("  hrir: {h}"),
+                        None => println!("  hrir: (default)"),
+                    }
+                    if s.available_hrirs.is_empty() {
+                        println!(
+                            "  available_hrirs: none found in ~/.local/share/pipewire/hrir_hesuvi/profiles/"
+                        );
+                    } else {
+                        println!("  available_hrirs:");
+                        for h in &s.available_hrirs {
+                            println!("    {h}");
+                        }
+                    }
+                    println!("  channels: {}", s.channels.join(", "));
+                    match &s.hw_sink {
+                        Some(sink) => println!("  hw_sink: {sink}"),
+                        None => println!("  hw_sink: (auto-detected)"),
+                    }
+                }
+            } else if is_hrir_list {
+                if let Some(state) = resp.state {
+                    let s = &state.surround;
+                    if s.available_hrirs.is_empty() {
+                        println!("none found in ~/.local/share/pipewire/hrir_hesuvi/profiles/");
+                    } else {
+                        for h in &s.available_hrirs {
+                            println!("{h}");
+                        }
+                    }
+                }
+            } else {
+                println!("ok");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(resp) => {
+            let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+            eprintln!("error: {msg}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error communicating with daemon: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -705,17 +913,14 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 },
+                EqAction::Preset { action } => dispatch_eq_preset(action),
             }
         }
-        Command::Channels { action } => {
-            let target = match &action {
-                ChannelsAction::Up { target } => target.clone(),
-                ChannelsAction::Down => None,
-            };
-            let cfg = ChannelSetConfig::default_sonar(target.as_deref());
-            let mut mgr = ChannelManager::new(RealRunner, cfg);
-            match action {
-                ChannelsAction::Up { .. } => match mgr.up(&EqModel::default_10band()) {
+        Command::Channels { action } => match action {
+            ChannelsAction::Up { target } => {
+                let cfg = ChannelSetConfig::default_sonar(target.as_deref());
+                let mut mgr = ChannelManager::new(RealRunner, cfg);
+                match mgr.up(&EqModel::default_10band()) {
                     Ok(handles) => {
                         println!("channels up: {} sinks ready", handles.len());
                         ExitCode::SUCCESS
@@ -724,8 +929,12 @@ fn main() -> ExitCode {
                         eprintln!("error bringing channels up: {e}");
                         ExitCode::FAILURE
                     }
-                },
-                ChannelsAction::Down => match mgr.down() {
+                }
+            }
+            ChannelsAction::Down => {
+                let cfg = ChannelSetConfig::default_sonar(None);
+                let mut mgr = ChannelManager::new(RealRunner, cfg);
+                match mgr.down() {
                     Ok(()) => {
                         println!("channels down");
                         ExitCode::SUCCESS
@@ -734,9 +943,63 @@ fn main() -> ExitCode {
                         eprintln!("error bringing channels down: {e}");
                         ExitCode::FAILURE
                     }
-                },
+                }
             }
-        }
+            ChannelsAction::Add { id } => {
+                if !daemon::socket_path().exists() {
+                    eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                    eprintln!(
+                        "note: channel add requires the daemon (single worker enforces PipeWire serialisation)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let req = daemon::Request::ChannelAdd { id: id.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{id}' added");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error communicating with daemon: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ChannelsAction::Remove { id } => {
+                if !daemon::socket_path().exists() {
+                    eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                    eprintln!(
+                        "note: channel remove requires the daemon (single worker enforces PipeWire serialisation)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let req = daemon::Request::ChannelRemove { id: id.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{id}' removed");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error communicating with daemon: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Command::Route { action } => match action {
             RouteAction::Set {
                 app,
@@ -783,6 +1046,28 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            RouteAction::Clear { app } | RouteAction::Remove { app } => {
+                let mut router = Router::new(RealRunner);
+                if let Err(e) = router.load_persistent() {
+                    eprintln!("warning: could not load existing routes: {e}");
+                }
+                router.remove_rule(&app);
+                // Best-effort live clear (stream back to default).
+                match router.clear_live(&AppMatch::Binary(app.clone())) {
+                    Ok(()) => println!("live: cleared stream target for {app}"),
+                    Err(e) => eprintln!("warning: live clear failed (is the app playing?): {e}"),
+                }
+                match router.save_persistent() {
+                    Ok(()) => {
+                        println!("persistent: rule removed for {app}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error saving routes after remove: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
             RouteAction::List => {
                 let mut router = Router::new(RealRunner);
                 if let Err(e) = router.load_persistent() {
@@ -825,9 +1110,65 @@ fn main() -> ExitCode {
                     }
                 }
             },
+            ChannelCmd::Volume { channel, db } => {
+                let req = daemon::Request::SetChannelVolume {
+                    channel: channel.clone(),
+                    volume_db: db,
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{channel}' volume set to {db} dB");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ChannelCmd::Mute { channel, state } => {
+                let muted = match state.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        eprintln!("mute state must be 'on' or 'off', got: {other}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let req = daemon::Request::SetChannelMute {
+                    channel: channel.clone(),
+                    muted,
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        let mute_str = if muted { "muted" } else { "unmuted" };
+                        println!("channel '{channel}' {mute_str}");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Command::Device { action } => dispatch_device(action),
         Command::Mic { action } => dispatch_mic(action),
+        Command::Surround { action } => dispatch_surround(action),
         Command::Profile { action } => dispatch_profile(action),
         Command::Apply => dispatch_apply(),
         Command::Daemon { foreground: _ } => {
@@ -972,6 +1313,346 @@ fn dispatch_profile(action: ProfileAction) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Rename { old, new } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileRename {
+                    old: old.clone(),
+                    new: new.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("profile '{old}' renamed to '{new}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through to direct engine path
+                }
+            }
+            // Direct engine path
+            let mut cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = cfg.rename_profile(&old, &new) {
+                eprintln!("error renaming profile: {e}");
+                return ExitCode::FAILURE;
+            }
+            if cfg.active_profile == old {
+                cfg.active_profile = new.clone();
+            }
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("profile '{old}' renamed to '{new}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Delete { name } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileDelete { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("profile '{name}' deleted");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct engine path
+            let mut cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = cfg.delete_profile(&name) {
+                eprintln!("error deleting profile: {e}");
+                return ExitCode::FAILURE;
+            }
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("profile '{name}' deleted");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Export { name, out } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileExport { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        let text = resp.text.unwrap_or_default();
+                        if let Some(path) = out {
+                            if let Err(e) = std::fs::write(&path, &text) {
+                                eprintln!("error writing to {}: {e}", path.display());
+                                return ExitCode::FAILURE;
+                            }
+                            println!("profile '{name}' exported to {}", path.display());
+                        } else {
+                            print!("{text}");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct path
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let profile = match cfg.profile(&name) {
+                Some(p) => p,
+                None => {
+                    eprintln!("error: profile '{name}' not found");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let text = match toml::to_string(profile) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error serializing profile: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(path) = out {
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("error writing to {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                println!("profile '{name}' exported to {}", path.display());
+            } else {
+                print!("{text}");
+            }
+            ExitCode::SUCCESS
+        }
+        ProfileAction::Import { file } => {
+            let toml_str = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading {}: {e}", file.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileImport {
+                    toml: toml_str.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            // The imported name is the last profile added (by convention)
+                            let name = state.profiles.last().cloned().unwrap_or_default();
+                            println!("profile imported as '{name}'");
+                        } else {
+                            println!("profile imported");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct engine path
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.import_profile(&toml_str) {
+                Ok(name) => {
+                    println!("profile imported as '{name}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error importing profile: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
+    match action {
+        EqPresetAction::Save { name, channel } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetSave {
+                    name: name.clone(),
+                    channel: channel.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' saved from channel '{channel}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.save_eq_preset(&name, &channel) {
+                Ok(()) => {
+                    println!("preset '{name}' saved from channel '{channel}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving preset: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        EqPresetAction::Apply { name, channel } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetApply {
+                    preset: name.clone(),
+                    channel: channel.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' applied to channel '{channel}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.apply_eq_preset(&name, &channel) {
+                Ok(()) => {
+                    println!("preset '{name}' applied to channel '{channel}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error applying preset: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        EqPresetAction::List => {
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::GetState) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            if state.eq_presets.is_empty() {
+                                println!("no EQ presets saved");
+                            } else {
+                                for p in &state.eq_presets {
+                                    println!("  {} ({} bands)", p.name, p.band_count);
+                                }
+                            }
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cfg.eq_presets.is_empty() {
+                println!("no EQ presets saved");
+            } else {
+                for p in &cfg.eq_presets {
+                    println!("  {} ({} bands)", p.name, p.bands.len());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        EqPresetAction::Delete { name } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetDelete { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' deleted");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.delete_eq_preset(&name) {
+                Ok(()) => {
+                    println!("preset '{name}' deleted");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error deleting preset: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -1253,6 +1934,52 @@ mod tests {
             } => {
                 assert_eq!(channel, "media");
                 assert_eq!(device, "alsa_output.speakers");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── F2.1: channel volume/mute subcommand parsing tests ───────────────────
+
+    #[test]
+    fn channel_volume_set() {
+        let cmd =
+            parse(&["channel", "volume", "game", "-6.0"]).expect("channel volume should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Volume { channel, db },
+            } => {
+                assert_eq!(channel, "game");
+                assert!((db - (-6.0_f32)).abs() < 0.001, "db must be -6.0, got {db}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_mute_set() {
+        let cmd = parse(&["channel", "mute", "chat", "on"]).expect("channel mute on should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Mute { channel, state },
+            } => {
+                assert_eq!(channel, "chat");
+                assert_eq!(state, "on");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_unmute_set() {
+        let cmd =
+            parse(&["channel", "mute", "media", "off"]).expect("channel mute off should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Mute { channel, state },
+            } => {
+                assert_eq!(channel, "media");
+                assert_eq!(state, "off");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -1585,6 +2312,117 @@ mod tests {
         }
     }
 
+    // ── F1.4: surround subcommand parsing tests ──────────────────────────────
+
+    #[test]
+    fn surround_status_parses() {
+        let cmd = parse(&["surround", "status"]).expect("surround status should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_on_parses() {
+        let cmd = parse(&["surround", "on"]).expect("surround on should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::On
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_off_parses() {
+        let cmd = parse(&["surround", "off"]).expect("surround off should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Off
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_hrir_list_parses() {
+        let cmd = parse(&["surround", "hrir", "list"]).expect("surround hrir list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Surround {
+                action: super::SurroundAction::Hrir {
+                    action: super::HrirAction::List
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn surround_hrir_set_parses() {
+        let cmd = parse(&["surround", "hrir", "set", "02-dh-dolby-headphone"])
+            .expect("surround hrir set should parse");
+        match cmd {
+            super::Command::Surround {
+                action:
+                    super::SurroundAction::Hrir {
+                        action: super::HrirAction::Set { name },
+                    },
+            } => assert_eq!(name, "02-dh-dolby-headphone"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_channels_parses_comma_separated() {
+        let cmd = parse(&["surround", "channels", "game,media"])
+            .expect("surround channels game,media should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::Channels { channels },
+            } => assert_eq!(channels, vec!["game".to_string(), "media".to_string()]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_channels_parses_single() {
+        let cmd =
+            parse(&["surround", "channels", "game"]).expect("surround channels game should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::Channels { channels },
+            } => assert_eq!(channels, vec!["game".to_string()]),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_hw_sink_with_device_parses() {
+        let cmd = parse(&["surround", "hw-sink", "alsa_output.usb-SteelSeries"])
+            .expect("surround hw-sink with device should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::HwSink { device },
+            } => assert_eq!(device, Some("alsa_output.usb-SteelSeries".into())),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surround_hw_sink_no_device_parses() {
+        let cmd =
+            parse(&["surround", "hw-sink"]).expect("surround hw-sink (no device) should parse");
+        match cmd {
+            super::Command::Surround {
+                action: super::SurroundAction::HwSink { device },
+            } => assert_eq!(device, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     // ── parse_anc_mode unit tests ────────────────────────────────────────────
 
     #[test]
@@ -1609,6 +2447,184 @@ mod tests {
         assert!(
             e.contains("off | transparency | on"),
             "error should hint at valid values: {e}"
+        );
+    }
+
+    // ── Profile management parse tests ───────────────────────────────────────
+
+    #[test]
+    fn profile_rename_parses() {
+        let cmd = parse(&["profile", "rename", "old-name", "new-name"])
+            .expect("profile rename should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Rename { old, new },
+            } => {
+                assert_eq!(old, "old-name");
+                assert_eq!(new, "new-name");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_delete_parses() {
+        let cmd = parse(&["profile", "delete", "myprofile"]).expect("profile delete should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Delete { name },
+            } => assert_eq!(name, "myprofile"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_export_to_stdout_parses() {
+        let cmd = parse(&["profile", "export", "myprofile"]).expect("profile export should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Export { name, out: None },
+            } => assert_eq!(name, "myprofile"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_export_with_out_parses() {
+        let cmd = parse(&["profile", "export", "myprofile", "--out", "/tmp/prof.toml"])
+            .expect("profile export --out should parse");
+        match cmd {
+            super::Command::Profile {
+                action:
+                    super::ProfileAction::Export {
+                        name,
+                        out: Some(path),
+                    },
+            } => {
+                assert_eq!(name, "myprofile");
+                assert_eq!(path, std::path::PathBuf::from("/tmp/prof.toml"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_import_parses() {
+        let cmd =
+            parse(&["profile", "import", "/tmp/prof.toml"]).expect("profile import should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Import { file },
+            } => assert_eq!(file, std::path::PathBuf::from("/tmp/prof.toml")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── EQ preset parse tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn eq_preset_save_parses() {
+        let cmd = parse(&["eq", "preset", "save", "flat", "--channel", "game"])
+            .expect("eq preset save should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Save { name, channel },
+                    },
+            } => {
+                assert_eq!(name, "flat");
+                assert_eq!(channel, "game");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_preset_apply_parses() {
+        let cmd = parse(&["eq", "preset", "apply", "flat", "--channel", "chat"])
+            .expect("eq preset apply should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Apply { name, channel },
+                    },
+            } => {
+                assert_eq!(name, "flat");
+                assert_eq!(channel, "chat");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_preset_list_parses() {
+        let cmd = parse(&["eq", "preset", "list"]).expect("eq preset list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Eq {
+                action: super::EqAction::Preset {
+                    action: super::EqPresetAction::List
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn eq_preset_delete_parses() {
+        let cmd =
+            parse(&["eq", "preset", "delete", "flat"]).expect("eq preset delete should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Delete { name },
+                    },
+            } => assert_eq!(name, "flat"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── F4: channels add / channels remove parse tests ────────────────────────
+
+    #[test]
+    fn channels_add_parses() {
+        let cmd = parse(&["channels", "add", "aux"]).expect("channels add should parse");
+        match cmd {
+            super::Command::Channels {
+                action: super::ChannelsAction::Add { id },
+            } => assert_eq!(id, "aux"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channels_remove_parses() {
+        let cmd = parse(&["channels", "remove", "aux"]).expect("channels remove should parse");
+        match cmd {
+            super::Command::Channels {
+                action: super::ChannelsAction::Remove { id },
+            } => assert_eq!(id, "aux"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channels_add_no_id_fails() {
+        let result = parse(&["channels", "add"]);
+        assert!(
+            result.is_err(),
+            "channels add with no id should fail to parse"
+        );
+    }
+
+    #[test]
+    fn channels_remove_no_id_fails() {
+        let result = parse(&["channels", "remove"]);
+        assert!(
+            result.is_err(),
+            "channels remove with no id should fail to parse"
         );
     }
 }

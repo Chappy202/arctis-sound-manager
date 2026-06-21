@@ -111,6 +111,27 @@ pub struct MicSnapshot {
     /// Backends whose LADSPA .so was found by the last probe.
     #[serde(default)]
     pub available_suppression_backends: Vec<SuppressionBackend>,
+    /// The pinned hardware mic capture source (if any).  `None` means auto / not pinned.
+    /// Populated from `profile.mic.hw_mic`; `None` is serde-default for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_mic: Option<String>,
+}
+
+/// Full surround snapshot returned in `EngineState`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SurroundSnapshot {
+    pub enabled: bool,
+    pub hrir: Option<String>,
+    pub available_hrirs: Vec<String>,
+    pub channels: Vec<String>,
+    pub hw_sink: Option<String>,
+}
+
+/// Lightweight summary of one EQ preset for the state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqPresetSnapshot {
+    pub name: String,
+    pub band_count: usize,
 }
 
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
@@ -123,6 +144,10 @@ pub struct EngineState {
     pub device_present: bool,
     pub device_fields: std::collections::BTreeMap<String, String>, // best-effort, may be empty
     pub mic: MicSnapshot,
+    #[serde(default)]
+    pub surround: SurroundSnapshot,
+    #[serde(default)]
+    pub eq_presets: Vec<EqPresetSnapshot>,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI
@@ -142,6 +167,10 @@ pub struct ChannelSnapshot {
     pub output_device: Option<String>,
     /// Full per-band EQ state. Empty means flat / no overrides configured.
     pub eq_bands: Vec<EqBandSnapshot>,
+    /// Software volume in dB. 0.0 = unity gain.
+    pub volume_db: f32,
+    /// Whether the channel is muted.
+    pub muted: bool,
 }
 
 /// Events emitted on the engine's outbound stream (mpsc::Receiver<Event> for the daemon/UI).
@@ -154,6 +183,26 @@ pub enum Event {
     ProfileCreated {
         name: String,
     },
+    ProfileRenamed {
+        old: String,
+        new: String,
+    },
+    ProfileDeleted {
+        name: String,
+    },
+    ProfileImported {
+        name: String,
+    },
+    EqPresetSaved {
+        name: String,
+    },
+    EqPresetApplied {
+        name: String,
+        channel_id: String,
+    },
+    EqPresetDeleted {
+        name: String,
+    },
     Reconciled,
     EqBandSet {
         channel_id: String,
@@ -163,9 +212,20 @@ pub enum Event {
         channel_id: String,
         device: Option<String>,
     },
+    ChannelVolumeSet {
+        channel_id: String,
+        volume_db: f32,
+    },
+    ChannelMuteSet {
+        channel_id: String,
+        muted: bool,
+    },
     RouteSet {
         app_binary: String,
         target_sink: String,
+    },
+    RouteCleared {
+        app_binary: String,
     },
     DeviceState {
         fields: std::collections::BTreeMap<String, String>,
@@ -189,5 +249,23 @@ pub enum Event {
     },
     MicSuppressionBackendSet {
         backend: SuppressionBackend,
+    },
+    SurroundEnabledSet {
+        enabled: bool,
+    },
+    SurroundHrirSet {
+        hrir: Option<String>,
+    },
+    SurroundChannelsSet {
+        channels: Vec<String>,
+    },
+    SurroundHwSinkSet {
+        hw_sink: Option<String>,
+    },
+    ChannelAdded {
+        id: String,
+    },
+    ChannelRemoved {
+        id: String,
     },
 }
