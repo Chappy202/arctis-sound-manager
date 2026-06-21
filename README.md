@@ -158,6 +158,8 @@ The daemon must be running first. On NVIDIA with a blank window, set
 
 ## CLI usage (`asm-cli`)
 
+`asm-cli` is the installed binary name of the `arctis-cli` crate; from a source checkout run it as `cargo run -p arctis-cli -- <args>`.
+
 All commands that touch PipeWire or the device require the daemon to be running.
 
 ### Device discovery

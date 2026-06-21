@@ -29,17 +29,19 @@ export function stageWireName(kind: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns the filesystem path of the LADSPA plugin for a stage, or null for
- * builtin stages that need no external plugin.
+ * Returns the LADSPA plugin basename for a stage, or null for builtin stages
+ * that need no external plugin.
  *
- * Used for the "Plugin not installed: <path>" unavailability tooltip.
+ * Used for the "Plugin not installed: <basename>" unavailability tooltip.
+ * Basenames are distro-agnostic — the daemon resolves the actual .so path via
+ * $LADSPA_PATH and well-known search dirs at runtime.
  * Note: for "suppression", plugin availability is backend-specific — use
  * backendAvailable/backendTooltip helpers instead; this returns null.
  */
 export function stagePluginPath(kind: string): string | null {
   switch (kind) {
     case "compressor":
-      return "/usr/lib64/ladspa/sc4m_1916.so";
+      return "sc4m_1916";
     default:
       return null; // builtins: gain, highpass, gate, mic_eq; suppression uses backendTooltip
   }

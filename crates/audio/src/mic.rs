@@ -144,46 +144,23 @@ pub enum StageKind {
     MicEq,
 }
 
-impl StageKind {
-    /// True when this stage is a PipeWire builtin (no external .so needed).
-    /// Note: Gate may be either builtin or LADSPA depending on PW version —
-    /// this returns false; convert.rs decides at chain-build time.
-    pub fn is_builtin(self) -> bool {
-        matches!(
-            self,
-            StageKind::Gain | StageKind::Highpass | StageKind::MicEq
-        )
-    }
-
-    /// Return the LADSPA plugin basename for LADSPA stages; None for builtins or
-    /// stages whose basename is determined at chain-build time (Suppression, Gate).
-    pub fn plugin_basename(self) -> Option<&'static str> {
-        match self {
-            StageKind::Compressor => Some(SC4M_PLUGIN_BASENAME),
-            _ => None,
-        }
-    }
-}
+impl StageKind {}
 
 // ─── MicBackend ───────────────────────────────────────────────────────────────
 
 /// Backend for the Clean Mic virtual `Audio/Source`. Mirrors `AudioBackend`'s
 /// lifecycle (idempotent create/remove/recreate) but uses a `ChainSpec` +
 /// `[FilterNode]` instead of `SinkSpec` + `EqModel`, so it works with the
-/// generalized renderer. Plugin availability is checked via `PluginProbe`.
-pub struct MicBackend<R: CommandRunner, P: PluginProbe> {
+/// generalized renderer. Stage availability is decided by `convert::mic_chain_nodes`,
+/// not by this struct.
+pub struct MicBackend<R: CommandRunner> {
     runner: R,
-    probe: P,
     spec: ChainSpec,
 }
 
-impl<R: CommandRunner, P: PluginProbe> MicBackend<R, P> {
-    pub fn new(runner: R, probe: P, spec: ChainSpec) -> Self {
-        Self {
-            runner,
-            probe,
-            spec,
-        }
+impl<R: CommandRunner> MicBackend<R> {
+    pub fn new(runner: R, spec: ChainSpec) -> Self {
+        Self { runner, spec }
     }
 
     /// Expose the runner for assertions in tests.
@@ -299,26 +276,6 @@ impl<R: CommandRunner, P: PluginProbe> MicBackend<R, P> {
         Self::check(out, "pw-cli")?;
         Ok(())
     }
-
-    /// Report availability of the requested stages.
-    ///
-    /// Builtin stages are always `true`. LADSPA stages depend on `probe`.
-    pub fn availability(&self, stages: &[StageKind]) -> Vec<(StageKind, bool)> {
-        stages
-            .iter()
-            .map(|&stage| {
-                let available = if stage.is_builtin() {
-                    true
-                } else {
-                    stage
-                        .plugin_basename()
-                        .map(|b| self.probe.ladspa_available(b))
-                        .unwrap_or(false)
-                };
-                (stage, available)
-            })
-            .collect()
-    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -408,10 +365,7 @@ id 40, type PipeWire:Interface:Node/3
     fn create_passthrough_spawns_with_no_ladspa() {
         // source_exists: absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_MIC, "");
-        let probe = MockPluginProbe::none(); // probe never consulted for builtin-only
-                                             // Keep a shared ref to count probe calls before MicBackend takes ownership.
-        let probe_calls = probe.call_count.clone();
-        let mut be = MicBackend::new(runner, probe, mic_spec());
+        let mut be = MicBackend::new(runner, mic_spec());
         let handle = be.create(&passthrough_nodes()).unwrap();
 
         // spawn_owned was called with "pipewire -c <conf>"
@@ -426,12 +380,6 @@ id 40, type PipeWire:Interface:Node/3
         );
         // Handle carries the child token.
         assert!(handle.child.is_some());
-        // Probe must never have been consulted: passthrough chain has no LADSPA nodes.
-        assert_eq!(
-            probe_calls.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "probe must not be consulted for a builtin-only passthrough chain"
-        );
     }
 
     // ── Test 2: full chain with rnnoise present ──────────────────────────────
@@ -439,8 +387,7 @@ id 40, type PipeWire:Interface:Node/3
     #[test]
     fn create_full_chain_spawns_when_rnnoise_present() {
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_MIC, "");
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
-        let mut be = MicBackend::new(runner, probe, mic_spec());
+        let mut be = MicBackend::new(runner, mic_spec());
         let handle = be.create(&full_nodes_with_suppression()).unwrap();
 
         let spawned = &be.runner().spawned;
@@ -454,8 +401,7 @@ id 40, type PipeWire:Interface:Node/3
     #[test]
     fn create_is_idempotent_when_source_exists() {
         let runner = MockRunner::new().with_output(0, LS_WITH_MIC, "");
-        let probe = MockPluginProbe::none();
-        let mut be = MicBackend::new(runner, probe, mic_spec());
+        let mut be = MicBackend::new(runner, mic_spec());
         let handle = be.create(&passthrough_nodes()).unwrap();
 
         // Only the ls Node existence check ran; no spawn.
@@ -476,8 +422,7 @@ id 40, type PipeWire:Interface:Node/3
         let runner = MockRunner::new()
             .with_output(0, LS_WITH_MIC, "") // find_node_id
             .with_output(0, "", ""); // the set
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
-        let mut be = MicBackend::new(runner, probe, mic_spec());
+        let mut be = MicBackend::new(runner, mic_spec());
         be.apply_control("mic_suppression", "VAD Threshold (%)", 40.0)
             .unwrap();
 
@@ -503,8 +448,7 @@ id 40, type PipeWire:Interface:Node/3
             .with_output(0, LS_WITH_MIC, "") // find_node_id
             .with_output(0, "", "") // pw-cli destroy
             .with_output(0, "", ""); // pkill -f <conf> (best-effort)
-        let probe = MockPluginProbe::none();
-        let mut be = MicBackend::new(runner, probe, mic_spec());
+        let mut be = MicBackend::new(runner, mic_spec());
         be.remove().unwrap();
 
         let calls = &be.runner().calls;
@@ -516,45 +460,7 @@ id 40, type PipeWire:Interface:Node/3
         assert!(calls[3][2].ends_with("arctis_clean_mic.conf"));
     }
 
-    // ── Test 6: availability — builtins true, ladspa per probe ──────────────
-
-    #[test]
-    fn availability_marks_builtin_true_ladspa_per_probe() {
-        let probe = MockPluginProbe::none(); // no LADSPA plugins present
-        let be = MicBackend::new(MockRunner::new(), probe, mic_spec());
-
-        let stages = vec![
-            StageKind::Gain,
-            StageKind::Highpass,
-            StageKind::Suppression,
-            StageKind::Gate,
-            StageKind::MicEq,
-            StageKind::Compressor,
-        ];
-        let avail = be.availability(&stages);
-
-        assert_eq!(avail.len(), 6);
-        assert_eq!(avail[0], (StageKind::Gain, true)); // builtin
-        assert_eq!(avail[1], (StageKind::Highpass, true)); // builtin
-        assert_eq!(avail[2], (StageKind::Suppression, false)); // LADSPA, probe says absent (plugin_basename=None → false)
-        assert_eq!(avail[3], (StageKind::Gate, false)); // no longer always builtin, plugin_basename=None → false
-        assert_eq!(avail[4], (StageKind::MicEq, true)); // builtin
-        assert_eq!(avail[5], (StageKind::Compressor, false)); // LADSPA, probe says absent
-    }
-
-    #[test]
-    fn availability_ladspa_true_when_probe_reports_present() {
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME, SC4M_PLUGIN_BASENAME]);
-        let be = MicBackend::new(MockRunner::new(), probe, mic_spec());
-
-        // Suppression uses plugin_basename() = None, so probe is not consulted → false
-        // Compressor uses plugin_basename() = SC4M → probe consulted → true
-        let avail = be.availability(&[StageKind::Suppression, StageKind::Compressor]);
-        assert_eq!(avail[0], (StageKind::Suppression, false)); // None basename → false
-        assert_eq!(avail[1], (StageKind::Compressor, true));
-    }
-
-    // ── Test 7: parse_node_id shared with sink backend (regression) ─────────
+    // ── Test 6: parse_node_id shared with sink backend (regression) ─────────
 
     #[test]
     fn parse_node_id_shared_with_sink_backend() {

@@ -57,8 +57,8 @@ describe("stageWireName", () => {
 // ---------------------------------------------------------------------------
 
 describe("stagePluginPath", () => {
-  it("returns compressor plugin path for compressor", () => {
-    expect(stagePluginPath("compressor")).toBe("/usr/lib64/ladspa/sc4m_1916.so");
+  it("returns compressor plugin basename for compressor", () => {
+    expect(stagePluginPath("compressor")).toBe("sc4m_1916");
   });
 
   it("returns null for builtin stages (gain, highpass, gate, mic_eq)", () => {
@@ -183,7 +183,7 @@ describe("isStageDisabled", () => {
 // ---------------------------------------------------------------------------
 
 describe("stageUnavailableTooltip", () => {
-  it("returns tooltip containing compressor plugin path when unavailable", () => {
+  it("returns tooltip containing compressor plugin basename when unavailable", () => {
     const stage: MicStageSnapshot = {
       kind: "compressor",
       enabled: false,
@@ -192,7 +192,7 @@ describe("stageUnavailableTooltip", () => {
     };
     const tooltip = stageUnavailableTooltip(stage);
     expect(tooltip).toBeDefined();
-    expect(tooltip).toContain("/usr/lib64/ladspa/sc4m_1916.so");
+    expect(tooltip).toContain("sc4m_1916");
     expect(tooltip).toContain("Plugin not installed:");
   });
 

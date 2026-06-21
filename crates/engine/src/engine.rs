@@ -681,14 +681,14 @@ impl<R: CommandRunner> Engine<R> {
         if !profile.mic.enabled {
             // Master switch off: remove the source (idempotent).
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if let Err(e) = mic_be.remove() {
                 eprintln!("warning: reconcile mic remove failed (ignoring): {e}");
             }
         } else {
             // Master switch on: create (idempotent — no-op if already present).
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             match mic_be.create(&nodes) {
                 Ok(handle) => {
                     if let Some(token) = handle.child {
@@ -744,7 +744,7 @@ impl<R: CommandRunner> Engine<R> {
                 convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             let handle = mic_be.recreate(&nodes)?;
             if let Some(token) = handle.child {
                 self.children.track(token);
@@ -892,7 +892,7 @@ impl<R: CommandRunner> Engine<R> {
                 );
                 self.mic_availability = availability;
                 let spec = convert::mic_chain_spec(&profile.mic);
-                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
                 let handle = mic_be.recreate(&nodes)?;
                 if let Some(token) = handle.child {
                     self.children.track(token);
@@ -907,7 +907,7 @@ impl<R: CommandRunner> Engine<R> {
                 };
                 let profile = self.config.active()?.clone();
                 let spec = convert::mic_chain_spec(&profile.mic);
-                let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
                 if let Err(e) = mic_be.apply_control(node_name, control_name, apply_value) {
                     eprintln!(
                         "warning: mic_set_param apply_control failed (post-spawn race?): {e}"
@@ -949,7 +949,7 @@ impl<R: CommandRunner> Engine<R> {
             let profile = self.config.active()?.clone();
             let spec = convert::mic_chain_spec(&profile.mic);
             let node_name = convert::mic_eq_band_node_name(band);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if let Err(e) = mic_be.apply_control(&node_name, "Freq", eq_band.freq_hz) {
                 eprintln!("warning: mic_set_eq_band Freq apply_control failed: {e}");
             }
@@ -986,7 +986,7 @@ impl<R: CommandRunner> Engine<R> {
                 convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if on {
                 match mic_be.create(&nodes) {
                     Ok(handle) => {
@@ -1033,7 +1033,7 @@ impl<R: CommandRunner> Engine<R> {
                 convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             let handle = mic_be.recreate(&nodes)?;
             if let Some(token) = handle.child {
                 self.children.track(token);
@@ -1076,7 +1076,7 @@ impl<R: CommandRunner> Engine<R> {
                 convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             let handle = mic_be.recreate(&nodes)?;
             if let Some(token) = handle.child {
                 self.children.track(token);
