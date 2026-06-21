@@ -15,6 +15,9 @@ import {
   isStageDisabled,
   stageUnavailableTooltip,
   micBandToArgs,
+  backendLabel,
+  backendAvailable,
+  backendTooltip,
 } from "./mic.js";
 import type { MicStageSnapshot } from "./ipc.js";
 import type { Band } from "./eq.js";
@@ -36,8 +39,8 @@ describe("stageWireName", () => {
     expect(stageWireName("highpass")).toBe("highpass");
   });
 
-  it("maps rnnoise → rnnoise (identity)", () => {
-    expect(stageWireName("rnnoise")).toBe("rnnoise");
+  it("maps suppression → suppression (identity)", () => {
+    expect(stageWireName("suppression")).toBe("suppression");
   });
 
   it("maps compressor → compressor (identity)", () => {
@@ -54,12 +57,8 @@ describe("stageWireName", () => {
 // ---------------------------------------------------------------------------
 
 describe("stagePluginPath", () => {
-  it("returns rnnoise plugin path for rnnoise", () => {
-    expect(stagePluginPath("rnnoise")).toBe("/usr/lib64/ladspa/librnnoise_ladspa.so");
-  });
-
-  it("returns compressor plugin path for compressor", () => {
-    expect(stagePluginPath("compressor")).toBe("/usr/lib64/ladspa/sc4m_1916.so");
+  it("returns compressor plugin basename for compressor", () => {
+    expect(stagePluginPath("compressor")).toBe("sc4m_1916");
   });
 
   it("returns null for builtin stages (gain, highpass, gate, mic_eq)", () => {
@@ -67,6 +66,79 @@ describe("stagePluginPath", () => {
     expect(stagePluginPath("highpass")).toBeNull();
     expect(stagePluginPath("gate")).toBeNull();
     expect(stagePluginPath("mic_eq")).toBeNull();
+  });
+
+  it("returns null for suppression (backend-specific plugin; use backendTooltip instead)", () => {
+    expect(stagePluginPath("suppression")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// backendLabel
+// ---------------------------------------------------------------------------
+
+describe("backendLabel", () => {
+  it("maps deep_filter → DeepFilterNet", () => {
+    expect(backendLabel("deep_filter")).toBe("DeepFilterNet");
+  });
+
+  it("maps rnnoise → RNNoise", () => {
+    expect(backendLabel("rnnoise")).toBe("RNNoise");
+  });
+
+  it("returns the raw id for unknown backends (forward-compat)", () => {
+    expect(backendLabel("some_future_backend")).toBe("some_future_backend");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// backendAvailable
+// ---------------------------------------------------------------------------
+
+describe("backendAvailable", () => {
+  it("returns true when backend is in the available list", () => {
+    expect(backendAvailable("deep_filter", ["deep_filter", "rnnoise"])).toBe(true);
+    expect(backendAvailable("rnnoise", ["deep_filter", "rnnoise"])).toBe(true);
+  });
+
+  it("returns false when backend is absent from the available list", () => {
+    expect(backendAvailable("deep_filter", ["rnnoise"])).toBe(false);
+    expect(backendAvailable("rnnoise", [])).toBe(false);
+  });
+
+  it("returns false for an empty available list", () => {
+    expect(backendAvailable("deep_filter", [])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// backendTooltip
+// ---------------------------------------------------------------------------
+
+describe("backendTooltip", () => {
+  it("returns undefined when backend is available (no tooltip needed)", () => {
+    expect(backendTooltip("deep_filter", ["deep_filter", "rnnoise"])).toBeUndefined();
+    expect(backendTooltip("rnnoise", ["deep_filter", "rnnoise"])).toBeUndefined();
+  });
+
+  it("returns a DeepFilterNet-specific message when deep_filter is unavailable", () => {
+    const tip = backendTooltip("deep_filter", ["rnnoise"]);
+    expect(tip).toBeDefined();
+    expect(tip).toContain("DeepFilterNet");
+    expect(tip).toContain("plugin not installed");
+  });
+
+  it("returns an RNNoise-specific message when rnnoise is unavailable", () => {
+    const tip = backendTooltip("rnnoise", []);
+    expect(tip).toBeDefined();
+    expect(tip).toContain("RNNoise");
+    expect(tip).toContain("plugin not installed");
+  });
+
+  it("returns a generic message for unknown unavailable backends", () => {
+    const tip = backendTooltip("some_backend", []);
+    expect(tip).toBeDefined();
+    expect(tip).toContain("some_backend");
   });
 });
 
@@ -77,7 +149,7 @@ describe("stagePluginPath", () => {
 describe("isStageDisabled", () => {
   it("returns true when available is false", () => {
     const stage: MicStageSnapshot = {
-      kind: "rnnoise",
+      kind: "suppression",
       enabled: true,
       available: false,
       params: {},
@@ -87,7 +159,7 @@ describe("isStageDisabled", () => {
 
   it("returns false when available is true", () => {
     const stage: MicStageSnapshot = {
-      kind: "rnnoise",
+      kind: "suppression",
       enabled: true,
       available: true,
       params: {},
@@ -111,20 +183,7 @@ describe("isStageDisabled", () => {
 // ---------------------------------------------------------------------------
 
 describe("stageUnavailableTooltip", () => {
-  it("returns tooltip containing rnnoise plugin path when unavailable", () => {
-    const stage: MicStageSnapshot = {
-      kind: "rnnoise",
-      enabled: false,
-      available: false,
-      params: {},
-    };
-    const tooltip = stageUnavailableTooltip(stage);
-    expect(tooltip).toBeDefined();
-    expect(tooltip).toContain("/usr/lib64/ladspa/librnnoise_ladspa.so");
-    expect(tooltip).toContain("Plugin not installed:");
-  });
-
-  it("returns tooltip containing compressor plugin path when unavailable", () => {
+  it("returns tooltip containing compressor plugin basename when unavailable", () => {
     const stage: MicStageSnapshot = {
       kind: "compressor",
       enabled: false,
@@ -133,12 +192,26 @@ describe("stageUnavailableTooltip", () => {
     };
     const tooltip = stageUnavailableTooltip(stage);
     expect(tooltip).toBeDefined();
-    expect(tooltip).toContain("/usr/lib64/ladspa/sc4m_1916.so");
+    expect(tooltip).toContain("sc4m_1916");
+    expect(tooltip).toContain("Plugin not installed:");
+  });
+
+  it("returns a gate-specific tooltip mentioning PipeWire version and gate_1410 when gate unavailable", () => {
+    const stage: MicStageSnapshot = {
+      kind: "gate",
+      enabled: false,
+      available: false,
+      params: {},
+    };
+    const tooltip = stageUnavailableTooltip(stage);
+    expect(tooltip).toBeDefined();
+    expect(tooltip).toContain("PipeWire");
+    expect(tooltip).toContain("gate_1410");
   });
 
   it("returns undefined when stage is available (no tooltip needed)", () => {
     const stage: MicStageSnapshot = {
-      kind: "rnnoise",
+      kind: "suppression",
       enabled: true,
       available: true,
       params: {},
@@ -146,7 +219,7 @@ describe("stageUnavailableTooltip", () => {
     expect(stageUnavailableTooltip(stage)).toBeUndefined();
   });
 
-  it("returns undefined for builtins (no plugin path)", () => {
+  it("returns undefined for builtins when available (no plugin path)", () => {
     const stage: MicStageSnapshot = {
       kind: "gain",
       enabled: true,
@@ -164,7 +237,18 @@ describe("stageUnavailableTooltip", () => {
       available: false,
       params: {},
     };
-    // Builtins have no plugin path, so the tooltip omits the path
+    const tooltip = stageUnavailableTooltip(stage);
+    expect(tooltip).toBeDefined();
+    expect(tooltip).toContain("not available");
+  });
+
+  it("returns generic message for unavailable suppression stage (backend-specific handled elsewhere)", () => {
+    const stage: MicStageSnapshot = {
+      kind: "suppression",
+      enabled: false,
+      available: false,
+      params: {},
+    };
     const tooltip = stageUnavailableTooltip(stage);
     expect(tooltip).toBeDefined();
     expect(tooltip).toContain("not available");

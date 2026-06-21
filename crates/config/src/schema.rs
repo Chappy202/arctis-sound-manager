@@ -1,10 +1,11 @@
 use arctis_domain::eq_bounds::{
     EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
-    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
-    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
-    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
-    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
-    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
+    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
+    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
+    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
+    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
+    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
+    MIC_VAD_THRESHOLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,9 @@ fn default_retro_grace() -> f32 {
 }
 fn default_gate_thresh() -> f32 {
     0.003
+}
+fn default_atten_limit() -> f32 {
+    100.0
 }
 fn default_comp_threshold() -> f32 {
     -18.0
@@ -88,28 +92,46 @@ impl Default for MicHighpassStage {
     }
 }
 
-/// RNNoise-based noise suppression stage (LADSPA `noise_suppressor_mono`).
-/// Conservative defaults chosen to avoid the "tinny" artifact.
+/// Which noise-suppression backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionBackend {
+    /// DeepFilterNet LADSPA plugin (default, higher quality).
+    #[default]
+    DeepFilter,
+    /// RNNoise LADSPA plugin (fallback, lower CPU).
+    Rnnoise,
+}
+
+/// Noise suppression stage — supports DeepFilterNet (default) or RNNoise (fallback).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MicRnnoiseStage {
-    /// Whether the RNNoise stage is active. Defaults to false.
+pub struct MicSuppressionStage {
+    /// Whether the suppression stage is active. Defaults to false.
     #[serde(default)]
     pub enabled: bool,
-    /// VAD threshold %. Lower = less suppression = less tinny. Default 40 (below plugin default of 49.5).
+    /// Which suppression backend to use.
+    #[serde(default)]
+    pub backend: SuppressionBackend,
+    /// DeepFilterNet: attenuation limit in dB (0..=100). Default 100.0 = full suppression.
+    #[serde(default = "default_atten_limit")]
+    pub attenuation_limit_db: f32,
+    /// RNNoise: VAD threshold %. Default 40.
     #[serde(default = "default_vad")]
     pub vad_threshold: f32,
-    /// VAD grace period in ms. Longer = less clipping of trailing speech. Default 800 ms.
+    /// RNNoise: VAD grace period in ms. Default 800 ms.
     #[serde(default = "default_grace")]
     pub vad_grace_ms: f32,
-    /// Retroactive VAD grace in ms. Default 100 ms.
+    /// RNNoise: Retroactive VAD grace in ms. Default 100 ms.
     #[serde(default = "default_retro_grace")]
     pub vad_retro_grace_ms: f32,
 }
 
-impl Default for MicRnnoiseStage {
+impl Default for MicSuppressionStage {
     fn default() -> Self {
         Self {
             enabled: false,
+            backend: SuppressionBackend::default(),
+            attenuation_limit_db: default_atten_limit(),
             vad_threshold: default_vad(),
             vad_grace_ms: default_grace(),
             vad_retro_grace_ms: default_retro_grace(),
@@ -183,9 +205,10 @@ pub struct MicChainConfig {
     /// High-pass filter stage.
     #[serde(default)]
     pub highpass: MicHighpassStage,
-    /// RNNoise noise suppression stage.
-    #[serde(default)]
-    pub rnnoise: MicRnnoiseStage,
+    /// Noise suppression stage (DeepFilterNet by default, RNNoise fallback).
+    /// `alias = "rnnoise"` preserves backward compatibility with old configs.
+    #[serde(default, alias = "rnnoise")]
+    pub suppression: MicSuppressionStage,
     /// Optional compressor stage (sc4m LADSPA).
     #[serde(default)]
     pub compressor: MicCompressorStage,
@@ -372,35 +395,46 @@ impl Config {
                     mic.highpass.freq_hz, MIC_HIGHPASS_MIN_HZ, MIC_HIGHPASS_MAX_HZ, profile.name
                 )));
             }
-            if mic.rnnoise.enabled {
+            if mic.suppression.enabled {
+                if !(MIC_ATTEN_LIMIT_MIN_DB..=MIC_ATTEN_LIMIT_MAX_DB)
+                    .contains(&mic.suppression.attenuation_limit_db)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic attenuation_limit_db {} out of range {}..={} in profile '{}'",
+                        mic.suppression.attenuation_limit_db,
+                        MIC_ATTEN_LIMIT_MIN_DB,
+                        MIC_ATTEN_LIMIT_MAX_DB,
+                        profile.name
+                    )));
+                }
                 if !(MIC_VAD_THRESHOLD_MIN..=MIC_VAD_THRESHOLD_MAX)
-                    .contains(&mic.rnnoise.vad_threshold)
+                    .contains(&mic.suppression.vad_threshold)
                 {
                     return Err(ConfigError::Invalid(format!(
                         "mic vad_threshold {} out of range {}..={} in profile '{}'",
-                        mic.rnnoise.vad_threshold,
+                        mic.suppression.vad_threshold,
                         MIC_VAD_THRESHOLD_MIN,
                         MIC_VAD_THRESHOLD_MAX,
                         profile.name
                     )));
                 }
                 if !(MIC_VAD_GRACE_MIN_MS..=MIC_VAD_GRACE_MAX_MS)
-                    .contains(&mic.rnnoise.vad_grace_ms)
+                    .contains(&mic.suppression.vad_grace_ms)
                 {
                     return Err(ConfigError::Invalid(format!(
                         "mic vad_grace_ms {} ms out of range {}..={} in profile '{}'",
-                        mic.rnnoise.vad_grace_ms,
+                        mic.suppression.vad_grace_ms,
                         MIC_VAD_GRACE_MIN_MS,
                         MIC_VAD_GRACE_MAX_MS,
                         profile.name
                     )));
                 }
                 if !(MIC_VAD_RETRO_GRACE_MIN_MS..=MIC_VAD_RETRO_GRACE_MAX_MS)
-                    .contains(&mic.rnnoise.vad_retro_grace_ms)
+                    .contains(&mic.suppression.vad_retro_grace_ms)
                 {
                     return Err(ConfigError::Invalid(format!(
                         "mic vad_retro_grace_ms {} ms out of range {}..={} in profile '{}'",
-                        mic.rnnoise.vad_retro_grace_ms,
+                        mic.suppression.vad_retro_grace_ms,
                         MIC_VAD_RETRO_GRACE_MIN_MS,
                         MIC_VAD_RETRO_GRACE_MAX_MS,
                         profile.name
@@ -669,7 +703,7 @@ mod tests {
         assert!(!mic.enabled, "master switch should be off");
         assert!(!mic.gain.enabled, "gain should be off");
         assert!(!mic.highpass.enabled, "highpass should be off");
-        assert!(!mic.rnnoise.enabled, "rnnoise should be off");
+        assert!(!mic.suppression.enabled, "suppression should be off");
         assert!(!mic.compressor.enabled, "compressor should be off");
         assert!(!mic.gate.enabled, "gate should be off");
         assert!(!mic.eq_enabled, "eq_enabled should be off");
@@ -726,8 +760,10 @@ description = "Chat"
                 enabled: true,
                 freq_hz: 80.0,
             },
-            rnnoise: MicRnnoiseStage {
+            suppression: MicSuppressionStage {
                 enabled: true,
+                backend: SuppressionBackend::DeepFilter,
+                attenuation_limit_db: 100.0,
                 vad_threshold: 40.0,
                 vad_grace_ms: 800.0,
                 vad_retro_grace_ms: 100.0,
@@ -759,12 +795,13 @@ description = "Chat"
         );
     }
 
-    /// 4. Enabled RNNoise with out-of-range VAD threshold → ConfigError::Invalid.
+    /// 4. Enabled suppression with out-of-range VAD threshold → ConfigError::Invalid.
     #[test]
     fn validate_rejects_out_of_range_enabled_vad() {
         let mut cfg = Config::default_config();
-        cfg.profiles[0].mic.rnnoise.enabled = true;
-        cfg.profiles[0].mic.rnnoise.vad_threshold = 150.0; // above max 99.0
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = SuppressionBackend::Rnnoise;
+        cfg.profiles[0].mic.suppression.vad_threshold = 150.0; // above max 99.0
         let err = cfg
             .validate()
             .expect_err("out-of-range VAD threshold should be rejected");
@@ -774,12 +811,12 @@ description = "Chat"
         );
     }
 
-    /// 5. Disabled RNNoise with out-of-range VAD threshold → Ok (disabled stages not validated).
+    /// 5. Disabled suppression with out-of-range VAD threshold → Ok (disabled stages not validated).
     #[test]
     fn validate_ignores_out_of_range_disabled_stage() {
         let mut cfg = Config::default_config();
-        cfg.profiles[0].mic.rnnoise.enabled = false;
-        cfg.profiles[0].mic.rnnoise.vad_threshold = 150.0; // would be invalid if enabled
+        cfg.profiles[0].mic.suppression.enabled = false;
+        cfg.profiles[0].mic.suppression.vad_threshold = 150.0; // would be invalid if enabled
         assert!(
             cfg.validate().is_ok(),
             "disabled stage with out-of-range param should pass validation"
@@ -896,8 +933,9 @@ description = "Chat"
     #[test]
     fn validate_accepts_vad_threshold_at_max() {
         let mut cfg = Config::default_config();
-        cfg.profiles[0].mic.rnnoise.enabled = true;
-        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.0;
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = SuppressionBackend::Rnnoise;
+        cfg.profiles[0].mic.suppression.vad_threshold = 99.0;
         assert!(
             cfg.validate().is_ok(),
             "vad_threshold=99.0 (max) should be accepted"
@@ -908,14 +946,83 @@ description = "Chat"
     #[test]
     fn validate_rejects_vad_threshold_just_above_max() {
         let mut cfg = Config::default_config();
-        cfg.profiles[0].mic.rnnoise.enabled = true;
-        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.01;
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = SuppressionBackend::Rnnoise;
+        cfg.profiles[0].mic.suppression.vad_threshold = 99.01;
         let err = cfg
             .validate()
             .expect_err("vad_threshold=99.01 should be rejected");
         assert!(
             matches!(err, ConfigError::Invalid(_)),
             "expected Invalid, got: {err}"
+        );
+    }
+
+    /// attenuation_limit_db out of range (enabled suppression with DeepFilter) → rejected.
+    #[test]
+    fn validate_rejects_attenuation_limit_out_of_range() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = SuppressionBackend::DeepFilter;
+        cfg.profiles[0].mic.suppression.attenuation_limit_db = 150.0; // above max 100.0
+        let err = cfg
+            .validate()
+            .expect_err("attenuation_limit_db=150.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// attenuation_limit_db at max (100.0) → accepted.
+    #[test]
+    fn validate_accepts_attenuation_limit_at_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = SuppressionBackend::DeepFilter;
+        cfg.profiles[0].mic.suppression.attenuation_limit_db = 100.0;
+        assert!(
+            cfg.validate().is_ok(),
+            "attenuation_limit_db=100.0 (max) should be accepted"
+        );
+    }
+
+    /// Old config with `rnnoise` key deserializes via alias into `suppression`.
+    #[test]
+    fn old_rnnoise_key_deserializes_via_alias() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+
+[profiles.mic]
+enabled = false
+
+[profiles.mic.rnnoise]
+enabled = true
+vad_threshold = 55.0
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("old rnnoise key must deserialize");
+        let profile = cfg.active().expect("active profile");
+        assert!(
+            profile.mic.suppression.enabled,
+            "rnnoise.enabled must map to suppression.enabled"
+        );
+        assert!(
+            (profile.mic.suppression.vad_threshold - 55.0).abs() < f32::EPSILON,
+            "rnnoise.vad_threshold must map to suppression.vad_threshold"
         );
     }
 }

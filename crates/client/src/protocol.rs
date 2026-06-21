@@ -72,6 +72,10 @@ pub enum Request {
     MicEnable {
         enabled: bool,
     },
+    /// Select the noise-suppression backend (deep_filter|rnnoise).
+    MicSuppressionBackend {
+        backend: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -505,6 +509,62 @@ mod tests {
         let req = Request::MicHwMic { device: None };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("mic-hw-mic"), "cmd tag must be mic-hw-mic");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task 3: MicSuppressionBackend wire-tag + round-trip tests ────────────
+
+    #[test]
+    fn parse_mic_suppression_backend_deep_filter_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"mic-suppression-backend","backend":"deep_filter"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::MicSuppressionBackend {
+                backend: "deep_filter".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mic_suppression_backend_rnnoise_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"mic-suppression-backend","backend":"rnnoise"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::MicSuppressionBackend {
+                backend: "rnnoise".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn request_mic_suppression_backend_deep_filter_round_trips() {
+        let req = Request::MicSuppressionBackend {
+            backend: "deep_filter".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("mic-suppression-backend"),
+            "cmd tag must be mic-suppression-backend, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_suppression_backend_rnnoise_round_trips() {
+        let req = Request::MicSuppressionBackend {
+            backend: "rnnoise".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("mic-suppression-backend"),
+            "cmd tag must be mic-suppression-backend, got: {json}"
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

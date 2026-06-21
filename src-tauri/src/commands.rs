@@ -160,3 +160,11 @@ pub async fn mic_hw_mic(
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::MicHwMic { device }).await
 }
+
+#[tauri::command]
+pub async fn mic_suppression_backend(
+    backend: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MicSuppressionBackend { backend }).await
+}

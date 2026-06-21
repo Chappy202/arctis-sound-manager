@@ -13,7 +13,8 @@ pub struct FilterNode {
     pub node_type: NodeType,
     /// builtin label (e.g. "bq_highpass", "linear", "noisegate") OR ladspa label.
     pub label: String,
-    /// LADSPA plugin .so path; None for builtin.
+    /// LADSPA plugin basename (e.g. "librnnoise_ladspa"); None for builtin.
+    /// PipeWire resolves the basename across $LADSPA_PATH at runtime.
     pub plugin: Option<String>,
     pub port_in: String,
     pub port_out: String,
@@ -57,33 +58,37 @@ impl ChainChannels {
     }
 }
 
+/// Whether a filter-chain is a virtual sink (EQ) or a virtual source (mic).
+///
+/// This drives the capture.props / playback.props idiom:
+/// - `Sink`: capture.props gets `media.class = Audio/Sink`; playback.props gets
+///   `node.passive = true` and optional `target.object` (the hw sink).
+/// - `Source`: capture.props gets `node.passive = true` (NOT media.class);
+///   playback.props gets `media.class = Audio/Source` (what apps select).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainKind {
+    Sink,
+    Source,
+}
+
 /// Endpoint media classes + targets for a generic filter-chain instance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChainSpec {
     pub node_name: String,
     pub description: String,
     pub channels: ChainChannels,
-    /// capture.props media.class (e.g. "Audio/Sink" for an EQ sink,
-    /// "Audio/Source" for the Clean Mic — capture side binds the hw mic).
-    pub capture_media_class: String,
-    /// The node.name used in capture.props. EQ sink uses the bare node_name;
-    /// mic source uses "<node_name>.capture".
+    /// Source vs sink — drives the capture.props/playback.props idiom.
+    pub kind: ChainKind,
+    /// The node.name used in capture.props.
+    /// EQ sink: bare node_name; mic source: "<node_name>.capture".
     pub capture_node_name: String,
-    /// Optional capture target.object (the hw mic node.name for the mic source).
+    /// Optional target.object in capture.props (the hw mic node.name for a source).
     pub capture_target: Option<String>,
-    /// playback.props media.class (e.g. "Audio/Source" for the Clean Mic;
-    /// for the EQ sink the playback tail is the hw sink output, class empty).
-    pub playback_media_class: Option<String>,
-    /// Optional playback target.object (the hw sink for an EQ sink).
+    /// Optional target.object in playback.props (the hw sink for an EQ sink).
     pub playback_target: Option<String>,
-    /// Whether playback.props should carry node.passive = true (EQ sink tail).
-    pub playback_passive: bool,
-    /// The playback node.name; EQ sink uses "<name>.output", the mic
-    /// source uses the bare "<name>" (the source IS the playback side).
+    /// The playback node.name.
+    /// EQ sink: "<name>.output"; mic source: the bare "<name>".
     pub playback_node_name: String,
-    /// true for the Clean Mic source (capture.props needs `stream.capture.sink = false`);
-    /// false for EQ sinks.
-    pub capture_is_source_stream: bool,
 }
 
 // ─── Identity + routing for one virtual EQ sink ─────────────────────────────
@@ -184,26 +189,40 @@ pub fn render_chain_conf(spec: &ChainSpec, nodes: &[FilterNode]) -> Result<Strin
     let last_out = format!("{}:{}", last.name, last.port_out);
 
     // ── capture.props ────────────────────────────────────────────────────────
+    // Source chain: node.passive = true (NO media.class), optional target.object.
+    // Sink chain:   media.class = Audio/Sink (NO node.passive).
     let capture_name = &spec.capture_node_name;
-    let capture_target_line = match &spec.capture_target {
-        Some(t) => format!("                target.object = \"{t}\"\n"),
-        None => String::new(),
-    };
+    let mut capture_inner = format!("                node.name   = \"{capture_name}\"\n");
+    match spec.kind {
+        ChainKind::Source => {
+            capture_inner.push_str("                node.passive = true\n");
+            if let Some(ref t) = spec.capture_target {
+                capture_inner.push_str(&format!("                target.object = \"{t}\"\n"));
+            }
+        }
+        ChainKind::Sink => {
+            capture_inner.push_str("                media.class = Audio/Sink\n");
+            // Sink chains do not pin a capture target.
+        }
+    }
 
     // ── playback.props ───────────────────────────────────────────────────────
-    let mut playback_inner = String::new();
-    playback_inner.push_str(&format!(
+    // Source chain: media.class = Audio/Source (what apps select). No node.passive.
+    // Sink chain:   node.passive = true; optional target.object (hw sink).
+    let mut playback_inner = format!(
         "                node.name   = \"{}\"\n",
         spec.playback_node_name
-    ));
-    if spec.playback_passive {
-        playback_inner.push_str("                node.passive = true\n");
-    }
-    if let Some(ref mc) = spec.playback_media_class {
-        playback_inner.push_str(&format!("                media.class = {mc}\n"));
-    }
-    if let Some(ref t) = spec.playback_target {
-        playback_inner.push_str(&format!("                target.object = \"{t}\"\n"));
+    );
+    match spec.kind {
+        ChainKind::Source => {
+            playback_inner.push_str("                media.class = Audio/Source\n");
+        }
+        ChainKind::Sink => {
+            playback_inner.push_str("                node.passive = true\n");
+            if let Some(ref t) = spec.playback_target {
+                playback_inner.push_str(&format!("                target.object = \"{t}\"\n"));
+            }
+        }
     }
 
     // ── assemble ─────────────────────────────────────────────────────────────
@@ -241,17 +260,7 @@ pub fn render_chain_conf(spec: &ChainSpec, nodes: &[FilterNode]) -> Result<Strin
     out.push_str(&format!("            audio.channels = {channels}\n"));
     out.push_str(&format!("            audio.position = [ {position} ]\n"));
     out.push_str("            capture.props = {\n");
-    out.push_str(&format!(
-        "                node.name   = \"{capture_name}\"\n"
-    ));
-    out.push_str(&format!(
-        "                media.class = {}\n",
-        spec.capture_media_class
-    ));
-    out.push_str(&capture_target_line);
-    if spec.capture_is_source_stream {
-        out.push_str("                stream.capture.sink = false\n");
-    }
+    out.push_str(&capture_inner);
     out.push_str("            }\n");
     out.push_str("            playback.props = {\n");
     out.push_str(&playback_inner);
@@ -295,14 +304,11 @@ pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String,
         node_name: spec.node_name.clone(),
         description: spec.description.clone(),
         channels: ChainChannels::Stereo,
-        capture_media_class: "Audio/Sink".to_string(),
+        kind: ChainKind::Sink,
         capture_node_name: spec.node_name.clone(),
         capture_target: None,
-        playback_media_class: None,
-        playback_passive: true,
         playback_target: spec.playback_target.clone(),
         playback_node_name: format!("{}.output", spec.node_name),
-        capture_is_source_stream: false,
     };
 
     render_chain_conf(&chain_spec, &nodes)
@@ -364,14 +370,11 @@ mod tests {
             node_name: "arctis_clean_mic".into(),
             description: "Clean Mic".into(),
             channels: ChainChannels::Mono,
-            capture_media_class: "Audio/Source".into(),
+            kind: ChainKind::Source,
             capture_node_name: "arctis_clean_mic.capture".into(),
             capture_target: Some("alsa_input.hw_mic".into()),
-            playback_media_class: Some("Audio/Source".into()),
-            playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
-            capture_is_source_stream: true,
         }
     }
 
@@ -422,17 +425,13 @@ mod tests {
                 ],
             },
             FilterNode {
-                name: "mic_rnnoise".into(),
+                name: "mic_suppression".into(),
                 node_type: NodeType::Ladspa,
-                label: "noise_suppressor_mono".into(),
-                plugin: Some("/usr/lib64/ladspa/librnnoise_ladspa.so".into()),
-                port_in: "Input".into(),
-                port_out: "Output".into(),
-                controls: vec![
-                    ("VAD Threshold (%)".to_string(), 40.0),
-                    ("VAD Grace Period (ms)".to_string(), 800.0),
-                    ("Retroactive VAD Grace (ms)".to_string(), 100.0),
-                ],
+                label: "deep_filter_mono".into(),
+                plugin: Some("libdeep_filter_ladspa".into()),
+                port_in: "Audio In".into(),
+                port_out: "Audio Out".into(),
+                controls: vec![("Attenuation Limit (dB)".to_string(), 100.0)],
             },
             FilterNode {
                 name: "mic_gate".into(),
@@ -442,9 +441,11 @@ mod tests {
                 port_in: "In".into(),
                 port_out: "Out".into(),
                 controls: vec![
-                    ("Threshold".to_string(), 0.003),
-                    ("Attack".to_string(), 5.0),
-                    ("Release".to_string(), 150.0),
+                    ("Open Threshold".to_string(), 0.003),
+                    ("Close Threshold".to_string(), 0.0027),
+                    ("Attack (s)".to_string(), 0.005),
+                    ("Hold (s)".to_string(), 0.05),
+                    ("Release (s)".to_string(), 0.1),
                 ],
             },
             FilterNode {
@@ -479,41 +480,81 @@ mod tests {
         assert!(matches!(err, AudioError::Invalid(_)));
     }
 
+    /// Source chain: capture.props has node.passive = true (no media.class);
+    /// playback.props has media.class = Audio/Source.
     #[test]
-    fn render_chain_conf_renders_ladspa_plugin_line() {
-        let got = render_chain_conf(&passthrough_spec(), &full_chain_nodes()).unwrap();
-        assert!(got.contains("type = ladspa"));
-        assert!(got.contains("plugin = \"/usr/lib64/ladspa/librnnoise_ladspa.so\""));
+    fn render_chain_conf_source_has_correct_capture_playback_props() {
+        let got = render_chain_conf(&passthrough_spec(), &passthrough_nodes()).unwrap();
+        // capture.props: node.passive present, no media.class
+        assert!(
+            got.contains("node.passive = true"),
+            "source capture.props must have node.passive = true"
+        );
+        // The media.class in capture.props must NOT be present
+        let capture_section = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section present");
+        assert!(
+            !capture_section.contains("media.class"),
+            "source capture.props must NOT have media.class, got: {capture_section}"
+        );
+        // playback.props must have media.class = Audio/Source
+        let playback_section = got
+            .split("playback.props")
+            .nth(1)
+            .expect("playback.props section present");
+        assert!(
+            playback_section.contains("media.class = Audio/Source"),
+            "source playback.props must have media.class = Audio/Source"
+        );
     }
 
-    /// Mic ChainSpec with `capture_target: None` (unpinned hw mic) and
-    /// `capture_is_source_stream: true` → output MUST still contain `stream.capture.sink = false`.
+    /// Source chain uses LADSPA basename in plugin field (not absolute path).
     #[test]
-    fn render_chain_conf_emits_capture_sink_when_source_stream_unpinned() {
+    fn render_chain_conf_ladspa_emits_basename() {
+        let got = render_chain_conf(&passthrough_spec(), &full_chain_nodes()).unwrap();
+        assert!(got.contains("type = ladspa"));
+        assert!(
+            got.contains("plugin = \"libdeep_filter_ladspa\""),
+            "plugin field must be basename, got: {got}"
+        );
+        // Must NOT contain an absolute path
+        assert!(
+            !got.contains("/usr/lib"),
+            "plugin field must not be an absolute path"
+        );
+    }
+
+    /// Source chain (unpinned hw mic) — capture.props must still have node.passive.
+    #[test]
+    fn render_chain_conf_source_unpinned_still_has_node_passive() {
         let spec = ChainSpec {
             node_name: "arctis_clean_mic".into(),
             description: "Clean Mic".into(),
             channels: ChainChannels::Mono,
-            capture_media_class: "Audio/Source".into(),
+            kind: ChainKind::Source,
             capture_node_name: "arctis_clean_mic.capture".into(),
             capture_target: None, // unpinned — no hw_mic set
-            playback_media_class: Some("Audio/Source".into()),
-            playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
-            capture_is_source_stream: true,
         };
         let got = render_chain_conf(&spec, &passthrough_nodes()).unwrap();
         assert!(
-            got.contains("stream.capture.sink = false"),
-            "unpinned mic source must still emit stream.capture.sink = false"
+            got.contains("node.passive = true"),
+            "unpinned mic source must still have node.passive = true in capture.props"
+        );
+        assert!(
+            !got.contains("stream.capture.sink"),
+            "stream.capture.sink must not appear in any chain"
         );
     }
 
-    /// EQ sink ChainSpec (`capture_is_source_stream: false`) → output MUST NOT contain
-    /// `stream.capture.sink = false`.
+    /// EQ sink: capture.props has media.class = Audio/Sink (no node.passive);
+    /// playback.props has node.passive = true.
     #[test]
-    fn render_chain_conf_omits_capture_sink_for_eq_sink() {
+    fn render_chain_conf_sink_has_correct_capture_playback_props() {
         use crate::eq::{BandKind, EqBand};
         let spec = SinkSpec {
             node_name: "arctis_eq".into(),
@@ -527,6 +568,29 @@ mod tests {
             },
         )
         .unwrap();
+        // EQ sink capture.props: media.class = Audio/Sink, no node.passive
+        let capture_section = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            capture_section.contains("media.class = Audio/Sink"),
+            "sink capture.props must have media.class = Audio/Sink"
+        );
+        assert!(
+            !capture_section.contains("node.passive"),
+            "sink capture.props must NOT have node.passive"
+        );
+        // EQ sink playback.props: node.passive = true
+        let playback_section = got
+            .split("playback.props")
+            .nth(1)
+            .expect("playback.props section");
+        assert!(
+            playback_section.contains("node.passive = true"),
+            "sink playback.props must have node.passive = true"
+        );
         assert!(
             !got.contains("stream.capture.sink"),
             "EQ sink must not emit stream.capture.sink"

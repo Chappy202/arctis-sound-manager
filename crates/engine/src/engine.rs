@@ -1,15 +1,17 @@
 use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
-    AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend,
-    PluginProbe, RouteRule, Router, StageKind,
+    query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
+    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
+    DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
-    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
-    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
-    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
-    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
-    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
+    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
+    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
+    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
+    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
+    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
+    MIC_VAD_THRESHOLD_MIN,
 };
 use std::sync::Arc;
 
@@ -81,6 +83,10 @@ pub struct Engine<R: CommandRunner> {
     probe: Box<dyn PluginProbe>,
     /// Last-reconcile mic stage availability (stored for state() snapshot).
     mic_availability: Vec<crate::state::StageAvailability>,
+    /// Whether PipeWire's builtin noisegate is available (PW ≥ 1.6).
+    builtin_noisegate: bool,
+    /// Cached PipeWire version (queried once, then cached).
+    pw_version: Option<(u32, u32, u32)>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -96,6 +102,8 @@ impl<R: CommandRunner> Engine<R> {
             device_tx: None,
             probe: Box::new(FsPluginProbe),
             mic_availability: Vec::new(),
+            builtin_noisegate: false,
+            pw_version: None,
         }
     }
 
@@ -114,6 +122,25 @@ impl<R: CommandRunner> Engine<R> {
             device_tx: None,
             probe,
             mic_availability: Vec::new(),
+            builtin_noisegate: false,
+            pw_version: None,
+        }
+    }
+
+    /// Pre-seed the PipeWire version so `ensure_pw_version()` is a no-op during tests.
+    /// Avoids adding an extra runner call that exact-call-count tests don't expect.
+    #[cfg(test)]
+    pub fn seed_pw_version(&mut self, version: (u32, u32, u32)) {
+        self.pw_version = Some(version);
+        self.builtin_noisegate = supports_builtin_noisegate(version);
+    }
+
+    /// Query (once) and cache the PipeWire version. Sets `builtin_noisegate` based on version.
+    fn ensure_pw_version(&mut self) {
+        if self.pw_version.is_none() {
+            self.pw_version = query_pw_version(&mut self.runner);
+            self.builtin_noisegate =
+                supports_builtin_noisegate(self.pw_version.unwrap_or((0, 0, 0)));
         }
     }
 
@@ -175,6 +202,7 @@ impl<R: CommandRunner> Engine<R> {
     pub fn state(&self) -> crate::state::EngineState {
         use crate::state::{
             ChannelSnapshot, EngineState, EqBandSnapshot, MicSnapshot, MicStageSnapshot, StageName,
+            SuppressionBackend,
         };
         let active = self.config.active().ok();
         let channels = active
@@ -249,19 +277,27 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
                 {
-                    let avail = avail_map.get(&StageName::Rnnoise).copied().unwrap_or(false);
+                    let avail = avail_map
+                        .get(&StageName::Suppression)
+                        .copied()
+                        .unwrap_or(false);
                     let mut params = std::collections::BTreeMap::new();
-                    if mc.rnnoise.enabled {
-                        params.insert("vad_threshold".to_string(), mc.rnnoise.vad_threshold);
-                        params.insert("vad_grace_ms".to_string(), mc.rnnoise.vad_grace_ms);
+                    if mc.suppression.enabled {
+                        // Include all params — harmless to include both backends' params
+                        params.insert(
+                            "attenuation_limit_db".to_string(),
+                            mc.suppression.attenuation_limit_db,
+                        );
+                        params.insert("vad_threshold".to_string(), mc.suppression.vad_threshold);
+                        params.insert("vad_grace_ms".to_string(), mc.suppression.vad_grace_ms);
                         params.insert(
                             "vad_retro_grace_ms".to_string(),
-                            mc.rnnoise.vad_retro_grace_ms,
+                            mc.suppression.vad_retro_grace_ms,
                         );
                     }
                     MicStageSnapshot {
-                        kind: StageName::Rnnoise,
-                        enabled: mc.rnnoise.enabled,
+                        kind: StageName::Suppression,
+                        enabled: mc.suppression.enabled,
                         available: avail,
                         params,
                     }
@@ -285,7 +321,7 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
                 {
-                    let avail = avail_map.get(&StageName::Gate).copied().unwrap_or(true);
+                    let avail = avail_map.get(&StageName::Gate).copied().unwrap_or(false);
                     let mut params = std::collections::BTreeMap::new();
                     if mc.gate.enabled {
                         params.insert("threshold".to_string(), mc.gate.threshold);
@@ -317,10 +353,31 @@ impl<R: CommandRunner> Engine<R> {
                     gain_db: b.gain_db,
                 })
                 .collect();
+
+            // Map config SuppressionBackend → state SuppressionBackend
+            let suppression_backend = match mc.suppression.backend {
+                arctis_config::SuppressionBackend::DeepFilter => SuppressionBackend::DeepFilter,
+                arctis_config::SuppressionBackend::Rnnoise => SuppressionBackend::Rnnoise,
+            };
+
+            // Report which backends' plugins are available
+            let available_suppression_backends: Vec<SuppressionBackend> = {
+                let mut backends = Vec::new();
+                if self.probe.ladspa_available(DEEPFILTER_PLUGIN_BASENAME) {
+                    backends.push(SuppressionBackend::DeepFilter);
+                }
+                if self.probe.ladspa_available(RNNOISE_PLUGIN_BASENAME) {
+                    backends.push(SuppressionBackend::Rnnoise);
+                }
+                backends
+            };
+
             MicSnapshot {
                 enabled: mc.enabled,
                 stages,
                 eq_bands,
+                suppression_backend,
+                available_suppression_backends,
             }
         } else {
             MicSnapshot::default()
@@ -615,21 +672,23 @@ impl<R: CommandRunner> Engine<R> {
         }
 
         // Step 5: mic source build/teardown (Clean Mic virtual Audio/Source).
-        // Build availability from the probe (disjoint borrow from self.runner).
-        let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+        // Query PW version once (cached) then build availability from the probe.
+        self.ensure_pw_version();
+        let (nodes, availability) =
+            convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
         self.mic_availability = availability;
 
         if !profile.mic.enabled {
             // Master switch off: remove the source (idempotent).
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if let Err(e) = mic_be.remove() {
                 eprintln!("warning: reconcile mic remove failed (ignoring): {e}");
             }
         } else {
             // Master switch on: create (idempotent — no-op if already present).
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             match mic_be.create(&nodes) {
                 Ok(handle) => {
                     if let Some(token) = handle.child {
@@ -667,7 +726,7 @@ impl<R: CommandRunner> Engine<R> {
             match stage {
                 StageKind::Gain => profile.mic.gain.enabled = on,
                 StageKind::Highpass => profile.mic.highpass.enabled = on,
-                StageKind::Rnnoise => profile.mic.rnnoise.enabled = on,
+                StageKind::Suppression => profile.mic.suppression.enabled = on,
                 StageKind::Compressor => profile.mic.compressor.enabled = on,
                 StageKind::Gate => profile.mic.gate.enabled = on,
                 StageKind::MicEq => profile.mic.eq_enabled = on,
@@ -679,11 +738,13 @@ impl<R: CommandRunner> Engine<R> {
         // When off, the persisted config change takes effect the next time
         // mic_set_enabled(true) or reconcile() builds the chain.
         if self.config.active()?.mic.enabled {
+            self.ensure_pw_version();
             let profile = self.config.active()?.clone();
-            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            let (nodes, availability) =
+                convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             let handle = mic_be.recreate(&nodes)?;
             if let Some(token) = handle.child {
                 self.children.track(token);
@@ -699,10 +760,12 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Set a single mic DSP parameter live (in-place via `apply_control`).
     /// Validates range against domain bounds; errors on out-of-range.
+    /// `GateThreshold` triggers a full recreate (different control format between builtin/LADSPA).
     pub fn mic_set_param(&mut self, param: MicParam, value: f32) -> Result<(), EngineError> {
-        // Validate and mutate config
-        let control_name: &'static str;
-        let node_name: &'static str;
+        let mut needs_recreate = false;
+        let mut control_name_opt: Option<&'static str> = None;
+        let mut node_name_opt: Option<&'static str> = None;
+
         {
             let engine_name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&engine_name).ok_or_else(|| {
@@ -719,8 +782,8 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.gain.gain_db = value;
-                    node_name = "mic_gain";
-                    control_name = "Mult";
+                    node_name_opt = Some("mic_gain");
+                    control_name_opt = Some("Mult");
                 }
                 MicParam::HighpassFreq => {
                     if !(MIC_HIGHPASS_MIN_HZ..=MIC_HIGHPASS_MAX_HZ).contains(&value) {
@@ -729,8 +792,18 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.highpass.freq_hz = value;
-                    node_name = "mic_highpass";
-                    control_name = "Freq";
+                    node_name_opt = Some("mic_highpass");
+                    control_name_opt = Some("Freq");
+                }
+                MicParam::AttenuationLimitDb => {
+                    if !(MIC_ATTEN_LIMIT_MIN_DB..=MIC_ATTEN_LIMIT_MAX_DB).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "attenuation_limit_db {value} out of range {MIC_ATTEN_LIMIT_MIN_DB}..={MIC_ATTEN_LIMIT_MAX_DB}"
+                        )));
+                    }
+                    mic.suppression.attenuation_limit_db = value;
+                    node_name_opt = Some("mic_suppression");
+                    control_name_opt = Some("Attenuation Limit (dB)");
                 }
                 MicParam::VadThreshold => {
                     if !(MIC_VAD_THRESHOLD_MIN..=MIC_VAD_THRESHOLD_MAX).contains(&value) {
@@ -738,9 +811,9 @@ impl<R: CommandRunner> Engine<R> {
                             "vad_threshold {value} out of range {MIC_VAD_THRESHOLD_MIN}..={MIC_VAD_THRESHOLD_MAX}"
                         )));
                     }
-                    mic.rnnoise.vad_threshold = value;
-                    node_name = "mic_rnnoise";
-                    control_name = "VAD Threshold (%)";
+                    mic.suppression.vad_threshold = value;
+                    node_name_opt = Some("mic_suppression");
+                    control_name_opt = Some("VAD Threshold (%)");
                 }
                 MicParam::VadGraceMs => {
                     if !(MIC_VAD_GRACE_MIN_MS..=MIC_VAD_GRACE_MAX_MS).contains(&value) {
@@ -748,9 +821,9 @@ impl<R: CommandRunner> Engine<R> {
                             "vad_grace_ms {value} ms out of range {MIC_VAD_GRACE_MIN_MS}..={MIC_VAD_GRACE_MAX_MS}"
                         )));
                     }
-                    mic.rnnoise.vad_grace_ms = value;
-                    node_name = "mic_rnnoise";
-                    control_name = "VAD Grace Period (ms)";
+                    mic.suppression.vad_grace_ms = value;
+                    node_name_opt = Some("mic_suppression");
+                    control_name_opt = Some("VAD Grace Period (ms)");
                 }
                 MicParam::VadRetroGraceMs => {
                     if !(MIC_VAD_RETRO_GRACE_MIN_MS..=MIC_VAD_RETRO_GRACE_MAX_MS).contains(&value) {
@@ -758,9 +831,9 @@ impl<R: CommandRunner> Engine<R> {
                             "vad_retro_grace_ms {value} ms out of range {MIC_VAD_RETRO_GRACE_MIN_MS}..={MIC_VAD_RETRO_GRACE_MAX_MS}"
                         )));
                     }
-                    mic.rnnoise.vad_retro_grace_ms = value;
-                    node_name = "mic_rnnoise";
-                    control_name = "Retroactive VAD Grace (ms)";
+                    mic.suppression.vad_retro_grace_ms = value;
+                    node_name_opt = Some("mic_suppression");
+                    control_name_opt = Some("Retroactive VAD Grace (ms)");
                 }
                 MicParam::GateThreshold => {
                     if !(MIC_GATE_THRESHOLD_MIN..=MIC_GATE_THRESHOLD_MAX).contains(&value) {
@@ -769,8 +842,9 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.gate.threshold = value;
-                    node_name = "mic_gate";
-                    control_name = "Threshold";
+                    // Gate threshold changes the gate topology (different control name/units
+                    // between builtin noisegate and LADSPA gate_1410) → recreate, not live Props.
+                    needs_recreate = true;
                 }
                 MicParam::CompThresholdDb => {
                     if !(MIC_COMP_THRESHOLD_MIN_DB..=MIC_COMP_THRESHOLD_MAX_DB).contains(&value) {
@@ -779,8 +853,8 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.compressor.threshold_db = value;
-                    node_name = "mic_compressor";
-                    control_name = "Threshold level (dB)";
+                    node_name_opt = Some("mic_compressor");
+                    control_name_opt = Some("Threshold level (dB)");
                 }
                 MicParam::CompRatio => {
                     if !(MIC_COMP_RATIO_MIN..=MIC_COMP_RATIO_MAX).contains(&value) {
@@ -789,8 +863,8 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.compressor.ratio = value;
-                    node_name = "mic_compressor";
-                    control_name = "Ratio (1:n)";
+                    node_name_opt = Some("mic_compressor");
+                    control_name_opt = Some("Ratio (1:n)");
                 }
                 MicParam::CompMakeupDb => {
                     if !(MIC_COMP_MAKEUP_MIN_DB..=MIC_COMP_MAKEUP_MAX_DB).contains(&value) {
@@ -799,29 +873,46 @@ impl<R: CommandRunner> Engine<R> {
                         )));
                     }
                     mic.compressor.makeup_db = value;
-                    node_name = "mic_compressor";
-                    control_name = "Makeup gain (dB)";
+                    node_name_opt = Some("mic_compressor");
+                    control_name_opt = Some("Makeup gain (dB)");
                 }
             }
         }
         self.save_config()?;
 
-        // Only perform live apply_control when the master switch is on.
-        // When off, the persisted config change takes effect the next time
-        // mic_set_enabled(true) or reconcile() builds the chain.
+        // Only perform live I/O when the master switch is on.
         if self.config.active()?.mic.enabled {
-            // Apply live: use MicBackend::apply_control.
-            // For the gain stage, value needs to be converted to linear.
-            let apply_value = if param == MicParam::GainDb {
-                convert::db_to_linear(value)
-            } else {
-                value
-            };
-            let profile = self.config.active()?.clone();
-            let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
-            if let Err(e) = mic_be.apply_control(node_name, control_name, apply_value) {
-                eprintln!("warning: mic_set_param apply_control failed (post-spawn race?): {e}");
+            if needs_recreate {
+                self.ensure_pw_version();
+                let profile = self.config.active()?.clone();
+                let (nodes, availability) = convert::mic_chain_nodes(
+                    &profile.mic,
+                    self.probe.as_ref(),
+                    self.builtin_noisegate,
+                );
+                self.mic_availability = availability;
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
+                let handle = mic_be.recreate(&nodes)?;
+                if let Some(token) = handle.child {
+                    self.children.track(token);
+                }
+            } else if let (Some(node_name), Some(control_name)) = (node_name_opt, control_name_opt)
+            {
+                // For gain, convert to linear; all others pass raw value.
+                let apply_value = if param == MicParam::GainDb {
+                    convert::db_to_linear(value)
+                } else {
+                    value
+                };
+                let profile = self.config.active()?.clone();
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
+                if let Err(e) = mic_be.apply_control(node_name, control_name, apply_value) {
+                    eprintln!(
+                        "warning: mic_set_param apply_control failed (post-spawn race?): {e}"
+                    );
+                }
             }
         }
 
@@ -858,7 +949,7 @@ impl<R: CommandRunner> Engine<R> {
             let profile = self.config.active()?.clone();
             let spec = convert::mic_chain_spec(&profile.mic);
             let node_name = convert::mic_eq_band_node_name(band);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if let Err(e) = mic_be.apply_control(&node_name, "Freq", eq_band.freq_hz) {
                 eprintln!("warning: mic_set_eq_band Freq apply_control failed: {e}");
             }
@@ -889,11 +980,13 @@ impl<R: CommandRunner> Engine<R> {
 
         // Apply: mirror reconcile step5 create/remove logic exactly.
         {
+            self.ensure_pw_version();
             let profile = self.config.active()?.clone();
-            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            let (nodes, availability) =
+                convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             if on {
                 match mic_be.create(&nodes) {
                     Ok(handle) => {
@@ -934,11 +1027,13 @@ impl<R: CommandRunner> Engine<R> {
         // mic_set_enabled(true) or reconcile() builds the chain.
         let hw_mic_snapshot = self.config.active()?.mic.hw_mic.clone();
         if self.config.active()?.mic.enabled {
+            self.ensure_pw_version();
             let profile = self.config.active()?.clone();
-            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            let (nodes, availability) =
+                convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
             self.mic_availability = availability;
             let spec = convert::mic_chain_spec(&profile.mic);
-            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
             let handle = mic_be.recreate(&nodes)?;
             if let Some(token) = handle.child {
                 self.children.track(token);
@@ -947,6 +1042,48 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::MicHwMicSet {
             hw_mic: hw_mic_snapshot,
         });
+        Ok(())
+    }
+
+    /// Change the active noise-suppression backend. Triggers a full chain recreate when
+    /// the master switch is on (topology change: different LADSPA plugin).
+    pub fn mic_set_suppression_backend(
+        &mut self,
+        backend: crate::state::SuppressionBackend,
+    ) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            profile.mic.suppression.backend = match backend {
+                crate::state::SuppressionBackend::DeepFilter => {
+                    arctis_config::SuppressionBackend::DeepFilter
+                }
+                crate::state::SuppressionBackend::Rnnoise => {
+                    arctis_config::SuppressionBackend::Rnnoise
+                }
+            };
+        }
+        self.save_config()?;
+
+        // Recreate the chain if the master switch is on (topology change).
+        if self.config.active()?.mic.enabled {
+            self.ensure_pw_version();
+            let profile = self.config.active()?.clone();
+            let (nodes, availability) =
+                convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
+            let handle = mic_be.recreate(&nodes)?;
+            if let Some(token) = handle.child {
+                self.children.track(token);
+            }
+        }
+
+        self.emit(Event::MicSuppressionBackendSet { backend });
         Ok(())
     }
 }
@@ -1188,6 +1325,8 @@ mod tests {
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         let calls = &engine.runner.calls;
@@ -1284,6 +1423,8 @@ mod tests {
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         let calls = &engine.runner.calls;
@@ -1561,6 +1702,8 @@ mod tests {
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
 
         // Must return Ok — the Parse error from find_node_id is non-fatal
         let result = engine.reconcile();
@@ -2416,17 +2559,19 @@ mod tests {
         let _ = &ls_mic_absent;
     }
 
-    /// Test 3: rnnoise enabled but probe returns none → spawn still fires (chain minus rnnoise);
-    ///         state marks rnnoise unavailable.
+    /// Test 3: suppression enabled but probe returns none → spawn still fires (chain minus suppression);
+    ///         state marks suppression unavailable.
     #[test]
     fn reconcile_drops_unavailable_rnnoise_but_still_builds() {
         let mut cfg = make_config_mic_enabled();
-        // Enable rnnoise in config
-        cfg.profiles[0].mic.rnnoise.enabled = true;
+        // Enable suppression (default backend = DeepFilter) in config
+        cfg.profiles[0].mic.suppression.enabled = true;
 
-        // Queue for mic-enabled absent reconcile (rnnoise probe is none → dropped from chain)
+        // Queue for mic-enabled absent reconcile (deepfilter probe is none → dropped from chain)
         let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
         let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         // Spawn still fires (chain has passthrough fallback)
@@ -2436,19 +2581,19 @@ mod tests {
                 .get(2)
                 .map(|s| s.ends_with("arctis_clean_mic.conf"))
                 .unwrap_or(false)),
-            "spawn must fire even when rnnoise is unavailable"
+            "spawn must fire even when suppression is unavailable"
         );
 
-        // state reports rnnoise unavailable
+        // state reports suppression unavailable
         let state = engine.state();
-        let rnnoise_stage = state
+        let suppression_stage = state
             .mic
             .stages
             .iter()
-            .find(|s| s.kind == crate::state::StageName::Rnnoise);
-        let s = rnnoise_stage.expect("rnnoise must appear in stages");
-        assert!(!s.available, "rnnoise must be marked unavailable");
-        assert!(s.enabled, "rnnoise must show as enabled in config");
+            .find(|s| s.kind == crate::state::StageName::Suppression);
+        let s = suppression_stage.expect("suppression must appear in stages");
+        assert!(!s.available, "suppression must be marked unavailable");
+        assert!(s.enabled, "suppression must show as enabled in config");
     }
 
     /// Test 4: mic_set_stage_enabled → persists config + recreates (remove + spawn observed).
@@ -2481,6 +2626,8 @@ mod tests {
             .with_output(0, &ls_absent, "");
 
         let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine
             .mic_set_stage_enabled(StageKind::Gain, true)
             .expect("mic_set_stage_enabled should succeed");
@@ -2524,13 +2671,15 @@ mod tests {
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         let mut cfg = make_config_mic_enabled();
-        cfg.profiles[0].mic.rnnoise.enabled = true;
-        cfg.profiles[0].mic.rnnoise.vad_threshold = 40.0;
+        // Use Rnnoise backend so VadThreshold hits the VAD control path
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = arctis_config::SuppressionBackend::Rnnoise;
+        cfg.profiles[0].mic.suppression.vad_threshold = 40.0;
 
         let ls_with_mic = ls_with_mic();
 
         // mic_set_param(VadThreshold, 55.0):
-        //   apply_control("mic_rnnoise", "VAD Threshold (%)", 55.0)
+        //   apply_control("mic_suppression", "VAD Threshold (%)", 55.0)
         //   → find_node_id (1 ls) + pw-cli s 71 Props … (1 call)
         let runner = MockRunner::new()
             .with_output(0, &ls_with_mic, "") // find_node_id
@@ -2542,14 +2691,14 @@ mod tests {
             .expect("mic_set_param should succeed");
 
         let calls = &engine.runner.calls;
-        // Last call should be: pw-cli s 71 Props { params = [ "mic_rnnoise:VAD Threshold (%)" 55.0 ] }
+        // Last call should be: pw-cli s 71 Props { params = [ "mic_suppression:VAD Threshold (%)" 55.0 ] }
         let last = calls.last().expect("at least one call");
         assert_eq!(last[0], "pw-cli");
         assert_eq!(last[1], "s");
         assert_eq!(last[2], "71", "node id must be 71 (from ls fixture)");
         assert_eq!(last[3], "Props");
         assert_eq!(
-            last[4], "{ params = [ \"mic_rnnoise:VAD Threshold (%)\" 55.0 ] }",
+            last[4], "{ params = [ \"mic_suppression:VAD Threshold (%)\" 55.0 ] }",
             "Props JSON must exactly match"
         );
 
@@ -2598,31 +2747,33 @@ mod tests {
         let _ = &ls_absent;
     }
 
-    /// Test 7: state().mic.stages reports rnnoise unavailable when probe is missing.
+    /// Test 7: state().mic.stages reports suppression unavailable when probe is missing.
     #[test]
     fn state_reports_mic_stage_availability() {
         let mut cfg = make_config_mic_enabled();
-        cfg.profiles[0].mic.rnnoise.enabled = true; // request rnnoise
+        cfg.profiles[0].mic.suppression.enabled = true; // request suppression
 
-        // Queue for reconcile with mic enabled, rnnoise probe absent → rnnoise dropped
+        // Queue for reconcile with mic enabled, deepfilter probe absent → suppression dropped
         let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
         let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         let state = engine.state();
         assert!(state.mic.enabled, "mic must show enabled");
 
-        let rnnoise = state
+        let suppression = state
             .mic
             .stages
             .iter()
-            .find(|s| s.kind == crate::state::StageName::Rnnoise)
-            .expect("rnnoise stage must be in state");
+            .find(|s| s.kind == crate::state::StageName::Suppression)
+            .expect("suppression stage must be in state");
 
-        assert!(rnnoise.enabled, "rnnoise enabled in config");
+        assert!(suppression.enabled, "suppression enabled in config");
         assert!(
-            !rnnoise.available,
-            "rnnoise must be unavailable (probe returns false)"
+            !suppression.available,
+            "suppression must be unavailable (probe returns false)"
         );
     }
 
@@ -2871,7 +3022,187 @@ mod tests {
         std::env::remove_var("ASM_CONFIG_HOME");
     }
 
-    /// Test 5b-3: mic_set_enabled emits Event::MicEnabledSet.
+    // ── Task 2 new engine tests ───────────────────────────────────────────────
+
+    /// Task 2 test A: mic_set_suppression_backend persists, recreates, emits event.
+    #[test]
+    fn mic_set_suppression_backend_persists_recreates_emits() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("suppression_backend");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled(); // mic.enabled = true
+        let ls_with_mic = ls_with_mic();
+        let ls_absent = ls_without_mic();
+
+        // recreate() = remove() + create():
+        // remove: source_exists (present), find_node_id, destroy, pkill = 4 calls
+        // create: source_exists (absent) = 1 call + spawn
+        let runner = MockRunner::new()
+            .with_output(0, &ls_with_mic, "") // remove: source_exists
+            .with_output(0, &ls_with_mic, "") // remove: find_node_id
+            .with_output(0, "", "") // remove: destroy
+            .with_output(0, "", "") // remove: pkill
+            .with_output(0, &ls_absent, ""); // create: source_exists
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
+
+        engine
+            .mic_set_suppression_backend(crate::state::SuppressionBackend::Rnnoise)
+            .expect("mic_set_suppression_backend should succeed");
+
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("rnnoise"),
+            "persisted config must contain rnnoise backend"
+        );
+
+        // Recreate occurred: destroy was called
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 3 && c[1] == "destroy"),
+            "destroy must be called during recreate"
+        );
+
+        // Event emitted
+        let event = rx
+            .try_recv()
+            .expect("MicSuppressionBackendSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::MicSuppressionBackendSet {
+                backend: crate::state::SuppressionBackend::Rnnoise,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Task 2 test B: mic_set_param(AttenuationLimitDb) emits Props for mic_suppression.
+    #[test]
+    fn mic_set_param_attenuation_limit_emits_exact_props() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("atten_limit");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_mic_enabled();
+        cfg.profiles[0].mic.suppression.enabled = true;
+        cfg.profiles[0].mic.suppression.backend = arctis_config::SuppressionBackend::DeepFilter;
+        cfg.profiles[0].mic.suppression.attenuation_limit_db = 100.0;
+
+        let ls_with_mic = ls_with_mic();
+        let runner = MockRunner::new()
+            .with_output(0, &ls_with_mic, "") // find_node_id
+            .with_output(0, "", ""); // set Props
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_param(MicParam::AttenuationLimitDb, 80.0)
+            .expect("AttenuationLimitDb must succeed");
+
+        let last = engine.runner.calls.last().expect("at least one call");
+        assert_eq!(last[3], "Props");
+        assert!(
+            last[4].contains("mic_suppression:Attenuation Limit (dB)"),
+            "Props must reference mic_suppression:Attenuation Limit (dB), got: {}",
+            last[4]
+        );
+        assert!(
+            last[4].contains("80"),
+            "Props must contain the value 80, got: {}",
+            last[4]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Task 2 test C: state().mic.suppression_backend and available_suppression_backends.
+    #[test]
+    fn state_reports_suppression_backend_and_availability() {
+        use crate::state::SuppressionBackend;
+        use arctis_audio::MockPluginProbe;
+        // Use a probe that reports DeepFilter available but not RNNoise
+        let probe = MockPluginProbe::with([arctis_audio::DEEPFILTER_PLUGIN_BASENAME]);
+        let mut cfg = make_config_mic_enabled();
+        cfg.profiles[0].mic.suppression.backend = arctis_config::SuppressionBackend::DeepFilter;
+        let engine = Engine::with_probe(MockRunner::new(), cfg, Box::new(probe));
+        let state = engine.state();
+        assert_eq!(
+            state.mic.suppression_backend,
+            SuppressionBackend::DeepFilter,
+            "suppression_backend must match config"
+        );
+        assert!(
+            state
+                .mic
+                .available_suppression_backends
+                .contains(&SuppressionBackend::DeepFilter),
+            "DeepFilter must appear in available backends when probe reports it present"
+        );
+        assert!(
+            !state
+                .mic
+                .available_suppression_backends
+                .contains(&SuppressionBackend::Rnnoise),
+            "Rnnoise must not appear in available backends when probe reports it absent"
+        );
+    }
+
+    /// Task 2 test D: gate threshold change recreates (not live Props).
+    #[test]
+    fn mic_set_param_gate_threshold_recreates_not_live_props() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("gate_threshold_recreate");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled(); // gate disabled by default
+
+        // recreate(): remove (source absent → no-op 1 ls) + create (absent → spawn)
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new()
+            .with_output(0, &ls_absent, "") // remove: source_exists (absent, no-op)
+            .with_output(0, &ls_absent, ""); // create: source_exists (absent → spawn)
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_param(MicParam::GateThreshold, 0.005)
+            .expect("GateThreshold must succeed");
+
+        // Must have spawned (recreate happened), no direct Props set call
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "recreate must spawn arctis_clean_mic.conf for gate threshold change"
+        );
+        // No Props set call (no pw-cli s ... Props call)
+        assert!(
+            !engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 4 && c[1] == "s" && c[3] == "Props"),
+            "gate threshold must NOT emit Props (must recreate)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Task 2 test E: mic_set_enabled emits Event::MicEnabledSet.
     #[test]
     fn mic_set_enabled_emits_event() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());

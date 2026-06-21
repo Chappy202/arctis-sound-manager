@@ -1,10 +1,12 @@
 use crate::error::EngineError;
 use crate::state::StageAvailability;
 use arctis_audio::{
-    BandKind, ChainChannels, ChainSpec, ChannelDef, ChannelSetConfig, EqBand, EqModel, FilterNode,
-    NodeType, PluginProbe, RouteRule, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN, SC4M_LABEL, SC4M_PLUGIN,
+    BandKind, ChainChannels, ChainKind, ChainSpec, ChannelDef, ChannelSetConfig, EqBand, EqModel,
+    FilterNode, NodeType, PluginProbe, RouteRule, DEEPFILTER_LABEL_MONO,
+    DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME, RNNOISE_LABEL_MONO,
+    RNNOISE_PLUGIN_BASENAME, SC4M_LABEL, SC4M_PLUGIN_BASENAME,
 };
-use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, RouteConfig};
+use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, RouteConfig, SuppressionBackend};
 
 /// Parse a config-layer band kind string into an audio-layer `BandKind`.
 pub fn band_kind_from_str(s: &str) -> Result<BandKind, EngineError> {
@@ -68,38 +70,49 @@ pub fn db_to_linear(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Convert a linear amplitude to dB, clamped to [-70, +20] dB.
+/// Used for swh gate_1410 Threshold conversion from linear to dB.
+pub fn linear_to_db(x: f32) -> f32 {
+    if x <= 0.0 {
+        -70.0
+    } else {
+        (20.0 * x.log10()).clamp(-70.0, 20.0)
+    }
+}
+
 /// Build the `ChainSpec` for the Clean Mic virtual source.
 ///
-/// node_name = `arctis_clean_mic`, capture target = `cfg.hw_mic`, mono,
-/// both media classes = `Audio/Source` (capture side binds the hw mic, playback
-/// side exposes the virtual source).
+/// node_name = `arctis_clean_mic`, capture target = `cfg.hw_mic`, mono.
+/// capture.props gets `node.passive = true` + `target.object` (when pinned) and
+/// no `media.class`; playback.props gets `media.class = Audio/Source` to expose
+/// the virtual source to applications.
 pub fn mic_chain_spec(cfg: &MicChainConfig) -> ChainSpec {
     ChainSpec {
         node_name: "arctis_clean_mic".to_string(),
         description: "Clean Mic".to_string(),
         channels: ChainChannels::Mono,
-        capture_media_class: "Audio/Source".to_string(),
+        kind: ChainKind::Source,
         capture_node_name: "arctis_clean_mic.capture".to_string(),
         capture_target: cfg.hw_mic.clone(),
-        playback_media_class: Some("Audio/Source".to_string()),
-        playback_passive: false,
         playback_target: None,
         playback_node_name: "arctis_clean_mic".to_string(),
-        capture_is_source_stream: true,
     }
 }
 
 /// Build the `FilterNode` list for the mic chain plus stage availability info.
 ///
-/// Walks the fixed stage order: gain → highpass → rnnoise → compressor → gate → mic-EQ.
-/// LADSPA stages (rnnoise, compressor) are only included if `probe.ladspa_exists(path)`;
+/// Walks the fixed stage order: gain → highpass → suppression → compressor → gate → mic-EQ.
+/// LADSPA stages (suppression, compressor) are only included if `probe.ladspa_available(path)`;
 /// otherwise they are skipped and recorded as unavailable.
+/// Gate uses the builtin noisegate when `builtin_noisegate = true` (PW ≥ 1.6),
+/// otherwise falls back to LADSPA gate_1410.
 ///
 /// If no enabled+available node results, emits a single passthrough `linear` node so
 /// `render_chain_conf` never sees an empty node list.
 pub fn mic_chain_nodes(
     cfg: &MicChainConfig,
     probe: &dyn PluginProbe,
+    builtin_noisegate: bool,
 ) -> (Vec<FilterNode>, Vec<StageAvailability>) {
     let mut nodes: Vec<FilterNode> = Vec::new();
     let mut availability: Vec<StageAvailability> = Vec::new();
@@ -145,36 +158,65 @@ pub fn mic_chain_nodes(
         });
     }
 
-    // ── RNNoise stage (LADSPA noise_suppressor_mono) ─────────────────────────
-    if cfg.rnnoise.enabled {
-        if probe.ladspa_exists(RNNOISE_PLUGIN) {
-            nodes.push(FilterNode {
-                name: "mic_rnnoise".to_string(),
-                node_type: NodeType::Ladspa,
-                label: RNNOISE_LABEL_MONO.to_string(),
-                plugin: Some(RNNOISE_PLUGIN.to_string()),
-                port_in: "Input".to_string(),
-                port_out: "Output".to_string(),
-                controls: vec![
-                    ("VAD Threshold (%)".to_string(), cfg.rnnoise.vad_threshold),
+    // ── Suppression stage (DeepFilterNet or RNNoise LADSPA) ──────────────────
+    if cfg.suppression.enabled {
+        let (plugin_bn, label, port_in, port_out, controls): (
+            &str,
+            &str,
+            &str,
+            &str,
+            Vec<(String, f32)>,
+        ) = match cfg.suppression.backend {
+            SuppressionBackend::DeepFilter => (
+                DEEPFILTER_PLUGIN_BASENAME,
+                DEEPFILTER_LABEL_MONO,
+                "Audio In",
+                "Audio Out",
+                vec![(
+                    "Attenuation Limit (dB)".to_string(),
+                    cfg.suppression.attenuation_limit_db,
+                )],
+            ),
+            SuppressionBackend::Rnnoise => (
+                RNNOISE_PLUGIN_BASENAME,
+                RNNOISE_LABEL_MONO,
+                "Input",
+                "Output",
+                vec![
+                    (
+                        "VAD Threshold (%)".to_string(),
+                        cfg.suppression.vad_threshold,
+                    ),
                     (
                         "VAD Grace Period (ms)".to_string(),
-                        cfg.rnnoise.vad_grace_ms,
+                        cfg.suppression.vad_grace_ms,
                     ),
                     (
                         "Retroactive VAD Grace (ms)".to_string(),
-                        cfg.rnnoise.vad_retro_grace_ms,
+                        cfg.suppression.vad_retro_grace_ms,
                     ),
                 ],
+            ),
+        };
+
+        if probe.ladspa_available(plugin_bn) {
+            nodes.push(FilterNode {
+                name: "mic_suppression".to_string(),
+                node_type: NodeType::Ladspa,
+                label: label.to_string(),
+                plugin: Some(plugin_bn.to_string()),
+                port_in: port_in.to_string(),
+                port_out: port_out.to_string(),
+                controls,
             });
             availability.push(StageAvailability {
-                stage: crate::state::StageName::Rnnoise,
+                stage: crate::state::StageName::Suppression,
                 available: true,
                 requested: true,
             });
         } else {
             availability.push(StageAvailability {
-                stage: crate::state::StageName::Rnnoise,
+                stage: crate::state::StageName::Suppression,
                 available: false,
                 requested: true,
             });
@@ -183,12 +225,12 @@ pub fn mic_chain_nodes(
 
     // ── Compressor stage (LADSPA sc4m) ───────────────────────────────────────
     if cfg.compressor.enabled {
-        if probe.ladspa_exists(SC4M_PLUGIN) {
+        if probe.ladspa_available(SC4M_PLUGIN_BASENAME) {
             nodes.push(FilterNode {
                 name: "mic_compressor".to_string(),
                 node_type: NodeType::Ladspa,
                 label: SC4M_LABEL.to_string(),
-                plugin: Some(SC4M_PLUGIN.to_string()),
+                plugin: Some(SC4M_PLUGIN_BASENAME.to_string()),
                 port_in: "Input".to_string(),
                 port_out: "Output".to_string(),
                 controls: vec![
@@ -214,26 +256,64 @@ pub fn mic_chain_nodes(
         }
     }
 
-    // ── Gate stage (builtin noisegate) ───────────────────────────────────────
+    // ── Gate stage (builtin noisegate ≥1.6 or LADSPA gate_1410 fallback) ─────
     if cfg.gate.enabled {
-        nodes.push(FilterNode {
-            name: "mic_gate".to_string(),
-            node_type: NodeType::Builtin,
-            label: "noisegate".to_string(),
-            plugin: None,
-            port_in: "In".to_string(),
-            port_out: "Out".to_string(),
-            controls: vec![
-                ("Threshold".to_string(), cfg.gate.threshold),
-                ("Attack".to_string(), 5.0),
-                ("Release".to_string(), 150.0),
-            ],
-        });
-        availability.push(StageAvailability {
-            stage: crate::state::StageName::Gate,
-            available: true,
-            requested: true,
-        });
+        if builtin_noisegate {
+            nodes.push(FilterNode {
+                name: "mic_gate".to_string(),
+                node_type: NodeType::Builtin,
+                label: "noisegate".to_string(),
+                plugin: None,
+                port_in: "In".to_string(),
+                port_out: "Out".to_string(),
+                controls: vec![
+                    ("Open Threshold".to_string(), cfg.gate.threshold),
+                    ("Close Threshold".to_string(), cfg.gate.threshold * 0.9),
+                    ("Attack (s)".to_string(), 0.005),
+                    ("Hold (s)".to_string(), 0.050),
+                    ("Release (s)".to_string(), 0.100),
+                ],
+            });
+            availability.push(StageAvailability {
+                stage: crate::state::StageName::Gate,
+                available: true,
+                requested: true,
+            });
+        } else if probe.ladspa_available(GATE_PLUGIN_BASENAME) {
+            nodes.push(FilterNode {
+                name: "mic_gate".to_string(),
+                node_type: NodeType::Ladspa,
+                label: GATE_LABEL.to_string(),
+                plugin: Some(GATE_PLUGIN_BASENAME.to_string()),
+                port_in: "Input".to_string(),
+                port_out: "Output".to_string(),
+                controls: vec![
+                    (
+                        "Threshold (dB)".to_string(),
+                        linear_to_db(cfg.gate.threshold),
+                    ),
+                    ("Attack (ms)".to_string(), 10.0),
+                    ("Hold (ms)".to_string(), 100.0),
+                    ("Decay (ms)".to_string(), 200.0),
+                    ("Range (dB)".to_string(), -90.0),
+                    (
+                        "Output select (-1 = key listen, 0 = gate, 1 = bypass)".to_string(),
+                        0.0,
+                    ),
+                ],
+            });
+            availability.push(StageAvailability {
+                stage: crate::state::StageName::Gate,
+                available: true,
+                requested: true,
+            });
+        } else {
+            availability.push(StageAvailability {
+                stage: crate::state::StageName::Gate,
+                available: false,
+                requested: true,
+            });
+        }
     }
 
     // ── Mic EQ bands (builtin biquad) ────────────────────────────────────────
@@ -440,6 +520,37 @@ mod tests {
         assert_eq!(rules[1].target_sink, "Arctis_Chat");
     }
 
+    // ── linear_to_db unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn linear_to_db_zero_is_floor() {
+        assert!(
+            (linear_to_db(0.0) - (-70.0)).abs() < 1e-6,
+            "0.0 → -70 dB floor"
+        );
+    }
+
+    #[test]
+    fn linear_to_db_one_is_zero_db() {
+        assert!(linear_to_db(1.0).abs() < 1e-4, "1.0 → 0 dB");
+    }
+
+    #[test]
+    fn linear_to_db_0_003_is_around_minus_50_db() {
+        // 20 * log10(0.003) ≈ -50.46 dB
+        let db = linear_to_db(0.003);
+        assert!(
+            db < -49.0 && db > -52.0,
+            "0.003 should be ≈ -50 dB, got {db}"
+        );
+    }
+
+    #[test]
+    fn linear_to_db_clamps_above_20_db() {
+        let db = linear_to_db(1000.0); // 60 dB, clamped to 20
+        assert!((db - 20.0).abs() < 1e-6, "large linear clamped to 20 dB");
+    }
+
     // ── db_to_linear unit tests ───────────────────────────────────────────────
 
     #[test]
@@ -475,7 +586,7 @@ mod tests {
     fn mic_chain_nodes_passthrough_gives_single_linear_node() {
         let cfg = MicChainConfig::passthrough();
         let probe = MockPluginProbe::none();
-        let (nodes, availability) = mic_chain_nodes(&cfg, &probe);
+        let (nodes, availability) = mic_chain_nodes(&cfg, &probe, true);
         assert_eq!(nodes.len(), 1, "passthrough must yield exactly one node");
         assert_eq!(nodes[0].name, "mic_gain");
         assert_eq!(nodes[0].label, "linear");
@@ -495,7 +606,7 @@ mod tests {
         cfg.gain.enabled = true;
         cfg.gain.gain_db = 6.0;
         let probe = MockPluginProbe::none();
-        let (nodes, availability) = mic_chain_nodes(&cfg, &probe);
+        let (nodes, availability) = mic_chain_nodes(&cfg, &probe, true);
         // Only the gain node (no other stages enabled)
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "mic_gain");
@@ -511,36 +622,175 @@ mod tests {
 
     #[test]
     fn mic_chain_nodes_rnnoise_missing_plugin_dropped_and_marked_unavailable() {
+        use arctis_config::SuppressionBackend;
         let mut cfg = MicChainConfig::passthrough();
-        cfg.rnnoise.enabled = true;
+        cfg.suppression.enabled = true;
+        cfg.suppression.backend = SuppressionBackend::Rnnoise;
         let probe = MockPluginProbe::none(); // rnnoise plugin absent
-        let (nodes, availability) = mic_chain_nodes(&cfg, &probe);
-        // rnnoise dropped; fallback passthrough emitted
+        let (nodes, availability) = mic_chain_nodes(&cfg, &probe, true);
+        // suppression dropped; fallback passthrough emitted
         assert_eq!(
             nodes.len(),
             1,
             "should fall back to passthrough linear node"
         );
         assert_eq!(nodes[0].label, "linear");
-        let rnnoise_avail = availability
+        let suppression_avail = availability
             .iter()
-            .find(|a| a.stage == crate::state::StageName::Rnnoise);
-        let a = rnnoise_avail.expect("rnnoise stage must appear in availability");
-        assert!(!a.available, "rnnoise must be marked unavailable");
-        assert!(a.requested, "rnnoise was requested");
+            .find(|a| a.stage == crate::state::StageName::Suppression);
+        let a = suppression_avail.expect("suppression stage must appear in availability");
+        assert!(!a.available, "suppression must be marked unavailable");
+        assert!(a.requested, "suppression was requested");
     }
 
     #[test]
     fn mic_chain_nodes_rnnoise_present_plugin_included() {
-        use arctis_audio::RNNOISE_PLUGIN;
+        use arctis_audio::RNNOISE_PLUGIN_BASENAME;
+        use arctis_config::SuppressionBackend;
         let mut cfg = MicChainConfig::passthrough();
-        cfg.rnnoise.enabled = true;
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN]);
-        let (nodes, _) = mic_chain_nodes(&cfg, &probe);
-        // Only rnnoise (no gain/highpass/gate/eq enabled) — rnnoise IS present
+        cfg.suppression.enabled = true;
+        cfg.suppression.backend = SuppressionBackend::Rnnoise;
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        // Only suppression (no gain/highpass/gate/eq enabled) — rnnoise IS present
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name, "mic_rnnoise");
+        assert_eq!(nodes[0].name, "mic_suppression");
         assert_eq!(nodes[0].label, "noise_suppressor_mono");
+        // plugin field must be the basename
+        assert_eq!(nodes[0].plugin.as_deref(), Some(RNNOISE_PLUGIN_BASENAME));
+    }
+
+    // ── New mic_chain_nodes tests (Task 2) ────────────────────────────────────
+
+    #[test]
+    fn mic_chain_nodes_deepfilter_backend_uses_correct_ports_and_control() {
+        use arctis_audio::DEEPFILTER_PLUGIN_BASENAME;
+        use arctis_config::SuppressionBackend;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.suppression.enabled = true;
+        cfg.suppression.backend = SuppressionBackend::DeepFilter;
+        cfg.suppression.attenuation_limit_db = 80.0;
+        let probe = MockPluginProbe::with([DEEPFILTER_PLUGIN_BASENAME]);
+        let (nodes, avail) = mic_chain_nodes(&cfg, &probe, true);
+        assert_eq!(nodes.len(), 1);
+        let n = &nodes[0];
+        assert_eq!(n.name, "mic_suppression");
+        assert_eq!(n.label, "deep_filter_mono");
+        assert_eq!(n.port_in, "Audio In");
+        assert_eq!(n.port_out, "Audio Out");
+        assert_eq!(n.controls.len(), 1);
+        assert_eq!(n.controls[0].0, "Attenuation Limit (dB)");
+        assert!((n.controls[0].1 - 80.0).abs() < 1e-6);
+        let s = avail
+            .iter()
+            .find(|a| a.stage == crate::state::StageName::Suppression)
+            .expect("suppression must be in avail");
+        assert!(s.available);
+        assert!(s.requested);
+    }
+
+    #[test]
+    fn mic_chain_nodes_rnnoise_backend_uses_vad_controls() {
+        use arctis_audio::RNNOISE_PLUGIN_BASENAME;
+        use arctis_config::SuppressionBackend;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.suppression.enabled = true;
+        cfg.suppression.backend = SuppressionBackend::Rnnoise;
+        cfg.suppression.vad_threshold = 55.0;
+        cfg.suppression.vad_grace_ms = 600.0;
+        cfg.suppression.vad_retro_grace_ms = 120.0;
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        assert_eq!(nodes.len(), 1);
+        let n = &nodes[0];
+        assert_eq!(n.label, "noise_suppressor_mono");
+        assert_eq!(n.port_in, "Input");
+        assert_eq!(n.port_out, "Output");
+        assert_eq!(n.controls.len(), 3);
+        assert_eq!(n.controls[0].0, "VAD Threshold (%)");
+        assert!((n.controls[0].1 - 55.0).abs() < 1e-6);
+        assert_eq!(n.controls[1].0, "VAD Grace Period (ms)");
+        assert!((n.controls[1].1 - 600.0).abs() < 1e-6);
+        assert_eq!(n.controls[2].0, "Retroactive VAD Grace (ms)");
+        assert!((n.controls[2].1 - 120.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mic_chain_nodes_builtin_noisegate_false_uses_ladspa_gate() {
+        use arctis_audio::GATE_PLUGIN_BASENAME;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.gate.enabled = true;
+        cfg.gate.threshold = 0.003;
+        let probe = MockPluginProbe::with([GATE_PLUGIN_BASENAME]);
+        let (nodes, avail) = mic_chain_nodes(&cfg, &probe, false);
+        assert_eq!(nodes.len(), 1);
+        let n = &nodes[0];
+        assert_eq!(n.name, "mic_gate");
+        assert_eq!(n.label, "gate");
+        assert_eq!(n.port_in, "Input");
+        assert_eq!(n.port_out, "Output");
+        // First control is Threshold (dB) = linear_to_db(0.003)
+        assert_eq!(n.controls[0].0, "Threshold (dB)");
+        let expected_db = linear_to_db(0.003);
+        assert!(
+            (n.controls[0].1 - expected_db).abs() < 1e-4,
+            "Threshold (dB) must be linear_to_db(0.003)"
+        );
+        // Last control is Output select = 0.0
+        let last = n.controls.last().expect("controls not empty");
+        assert_eq!(
+            last.0,
+            "Output select (-1 = key listen, 0 = gate, 1 = bypass)"
+        );
+        assert!((last.1 - 0.0).abs() < 1e-6);
+        let s = avail
+            .iter()
+            .find(|a| a.stage == crate::state::StageName::Gate)
+            .expect("gate in avail");
+        assert!(s.available);
+    }
+
+    #[test]
+    fn mic_chain_nodes_builtin_noisegate_true_uses_builtin() {
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.gate.enabled = true;
+        cfg.gate.threshold = 0.003;
+        let probe = MockPluginProbe::none(); // no LADSPA needed
+        let (nodes, avail) = mic_chain_nodes(&cfg, &probe, true);
+        assert_eq!(nodes.len(), 1);
+        let n = &nodes[0];
+        assert_eq!(n.name, "mic_gate");
+        assert_eq!(n.label, "noisegate");
+        assert_eq!(n.port_in, "In");
+        assert_eq!(n.port_out, "Out");
+        assert_eq!(n.controls[0].0, "Open Threshold");
+        assert!((n.controls[0].1 - 0.003).abs() < 1e-7);
+        let s = avail
+            .iter()
+            .find(|a| a.stage == crate::state::StageName::Gate)
+            .expect("gate in avail");
+        assert!(s.available);
+    }
+
+    #[test]
+    fn mic_chain_nodes_suppression_backend_unavailable_dropped_chain_still_builds() {
+        use arctis_audio::DEEPFILTER_PLUGIN_BASENAME;
+        use arctis_config::SuppressionBackend;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.suppression.enabled = true;
+        cfg.suppression.backend = SuppressionBackend::DeepFilter;
+        cfg.gain.enabled = true;
+        let probe = MockPluginProbe::none(); // deepfilter absent
+        let (nodes, avail) = mic_chain_nodes(&cfg, &probe, true);
+        // gain present, suppression dropped → still 1 node (gain)
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name, "mic_gain");
+        let s = avail
+            .iter()
+            .find(|a| a.stage == crate::state::StageName::Suppression)
+            .expect("suppression in avail");
+        assert!(!s.available);
+        let _ = DEEPFILTER_PLUGIN_BASENAME;
     }
 
     #[test]
@@ -548,14 +798,13 @@ mod tests {
         let mut cfg = MicChainConfig::passthrough();
         cfg.hw_mic = Some("alsa_input.hw_mic".to_string());
         let spec = mic_chain_spec(&cfg);
+        // (no change to mic_chain_spec — just confirming it still compiles)
         assert_eq!(spec.node_name, "arctis_clean_mic");
         assert_eq!(spec.description, "Clean Mic");
         assert!(matches!(spec.channels, ChainChannels::Mono));
-        assert_eq!(spec.capture_media_class, "Audio/Source");
+        assert!(matches!(spec.kind, ChainKind::Source));
         assert_eq!(spec.capture_node_name, "arctis_clean_mic.capture");
         assert_eq!(spec.capture_target, Some("alsa_input.hw_mic".to_string()));
-        assert_eq!(spec.playback_media_class, Some("Audio/Source".to_string()));
-        assert!(!spec.playback_passive);
         assert_eq!(spec.playback_node_name, "arctis_clean_mic");
     }
 }

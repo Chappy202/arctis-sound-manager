@@ -23,6 +23,7 @@ pub fn run() {
             commands::mic_set,
             commands::mic_eq_band,
             commands::mic_hw_mic,
+            commands::mic_suppression_backend,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
