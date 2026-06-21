@@ -226,6 +226,61 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::CoexistStatus => {
+            // Run pw-cli ls Node + check home dir for legacy components.
+            let node_stdout = RealRunner
+                .run("pw-cli", &["ls", "Node"])
+                .map(|o| o.stdout)
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+            let report = crate::coexist::detect_from(&node_stdout, &home);
+            let any_detected = !report.legacy_loopbacks.is_empty()
+                || report.hrir_switch_present
+                || report.rpm_daemon_running;
+            let coexist_report = arctis_client::CoexistReport {
+                legacy_loopbacks: report.legacy_loopbacks,
+                hrir_switch_present: report.hrir_switch_present,
+                rpm_daemon_running: report.rpm_daemon_running,
+                any_detected,
+            };
+            Response::ok_with_coexist_report(coexist_report)
+        }
+        Request::CoexistDisable { dry_run } => {
+            // Detect + plan + run (or preview) teardown.
+            let node_stdout = RealRunner
+                .run("pw-cli", &["ls", "Node"])
+                .map(|o| o.stdout)
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+            let report = crate::coexist::detect_from(&node_stdout, &home);
+            let plan = crate::coexist::teardown_plan(&report);
+            let mut runner = RealRunner;
+            let tr = crate::coexist::run_teardown(&mut runner, &plan, dry_run);
+            let tr_all_ok = tr.all_ok();
+            let coexist_result = arctis_client::CoexistDisableResult {
+                dry_run: tr.dry_run,
+                actions_attempted: tr.actions_attempted,
+                successes: tr.successes,
+                failures: tr
+                    .failures
+                    .into_iter()
+                    .map(|f| arctis_client::CoexistActionResult {
+                        description: f.description,
+                        ok: f.ok,
+                        error: f.error,
+                    })
+                    .collect(),
+                all_ok: tr_all_ok,
+                owner_note: "To fully remove the legacy RPM package, run as root: \
+                             sudo dnf remove arctis-sound-manager"
+                    .to_string(),
+            };
+            Response::ok_with_coexist_result(coexist_result)
+        }
     }
 }
 

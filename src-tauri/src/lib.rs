@@ -43,6 +43,9 @@ pub fn run() {
             // F4: Channel add / remove
             commands::channel_add,
             commands::channel_remove,
+            // R2: Coexistence teardown
+            commands::coexist_status,
+            commands::coexist_disable,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

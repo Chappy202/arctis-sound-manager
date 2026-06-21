@@ -4,6 +4,7 @@
   import { engineState, loadError, init, destroy } from "../stores.js";
   import { deriveConnectionStatus, connectionLabel as getConnectionLabel } from "../connection.js";
   import ProfilesDropdown from "./ProfilesDropdown.svelte";
+  import CoexistBanner from "./CoexistBanner.svelte";
 
   interface Props {
     children?: Snippet;
@@ -109,6 +110,9 @@
         <ProfilesDropdown />
       </div>
     </header>
+
+    <!-- Coexistence warning banner (shown when legacy RPM stack detected) -->
+    <CoexistBanner />
 
     <!-- Content area -->
     <main class="content-area" id="main-content">

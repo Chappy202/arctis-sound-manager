@@ -78,6 +78,11 @@ enum Command {
         #[command(subcommand)]
         action: SurroundAction,
     },
+    /// Coexistence with the legacy arctis-sound-manager RPM stack.
+    Coexist {
+        #[command(subcommand)]
+        action: CoexistAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -377,6 +382,18 @@ enum HrirAction {
     Set {
         /// Profile stem, e.g. 02-dh-dolby-headphone
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CoexistAction {
+    /// Print the detected legacy arctis-sound-manager stack status.
+    Status,
+    /// Disable the legacy arctis-sound-manager stack (stop+disable services, destroy live nodes).
+    Disable {
+        /// Preview actions without executing them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1171,6 +1188,7 @@ fn main() -> ExitCode {
         Command::Mic { action } => dispatch_mic(action),
         Command::Surround { action } => dispatch_surround(action),
         Command::Profile { action } => dispatch_profile(action),
+        Command::Coexist { action } => dispatch_coexist(action),
         Command::Apply => dispatch_apply(),
         Command::Daemon { foreground: _ } => {
             // Coexist check: scan for legacy nodes using pw-cli ls Node output.
@@ -1658,6 +1676,150 @@ fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
                 }
             }
         }
+    }
+}
+
+fn dispatch_coexist(action: CoexistAction) -> ExitCode {
+    match action {
+        CoexistAction::Status => {
+            // Proxy through daemon if available; else run detection directly.
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::CoexistStatus) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(report) = resp.coexist_report {
+                            if !report.any_detected {
+                                println!("no legacy stack detected");
+                            } else {
+                                println!("legacy stack detected:");
+                                if !report.legacy_loopbacks.is_empty() {
+                                    println!(
+                                        "  loopback nodes: {}",
+                                        report.legacy_loopbacks.join(", ")
+                                    );
+                                }
+                                if report.hrir_switch_present {
+                                    println!("  hrir-switch: present at ~/.local/bin/hrir-switch");
+                                }
+                                if report.rpm_daemon_running {
+                                    println!("  legacy daemon: running");
+                                }
+                                println!(
+                                    "  run `asm-cli coexist disable` to stop+disable the legacy stack"
+                                );
+                            }
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through to direct detection
+                }
+            }
+            // Direct detection (no daemon).
+            let node_stdout = std::process::Command::new("pw-cli")
+                .args(["ls", "Node"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+            let report = coexist::detect_from(&node_stdout, &home);
+            match coexist::warning(&report) {
+                None => println!("no legacy stack detected"),
+                Some(w) => {
+                    println!("{w}");
+                    println!("  run `asm-cli coexist disable` to stop+disable the legacy stack");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        CoexistAction::Disable { dry_run } => {
+            // Proxy through daemon if available; else run directly.
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::CoexistDisable { dry_run }) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(result) = resp.coexist_result {
+                            print_coexist_result(&result, dry_run);
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through to direct path
+                }
+            }
+            // Direct path (no daemon).
+            let node_stdout = std::process::Command::new("pw-cli")
+                .args(["ls", "Node"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
+            let report = coexist::detect_from(&node_stdout, &home);
+            let plan = coexist::teardown_plan(&report);
+            let mut runner = arctis_audio::RealRunner;
+            let tr = coexist::run_teardown(&mut runner, &plan, dry_run);
+            let tr_all_ok = tr.all_ok();
+            // Convert to protocol type for uniform printing.
+            let result = arctis_client::CoexistDisableResult {
+                dry_run: tr.dry_run,
+                actions_attempted: tr.actions_attempted,
+                successes: tr.successes,
+                failures: tr
+                    .failures
+                    .into_iter()
+                    .map(|f| arctis_client::CoexistActionResult {
+                        description: f.description,
+                        ok: f.ok,
+                        error: f.error,
+                    })
+                    .collect(),
+                all_ok: tr_all_ok,
+                owner_note: "To fully remove the legacy RPM package, run as root: \
+                             sudo dnf remove arctis-sound-manager"
+                    .to_string(),
+            };
+            print_coexist_result(&result, dry_run);
+            if result.all_ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn print_coexist_result(result: &arctis_client::CoexistDisableResult, dry_run: bool) {
+    if dry_run {
+        println!(
+            "dry-run: would perform {} action(s):",
+            result.actions_attempted
+        );
+    } else {
+        println!(
+            "teardown: {}/{} actions succeeded",
+            result.successes, result.actions_attempted
+        );
+    }
+    if !result.failures.is_empty() {
+        println!("failures:");
+        for f in &result.failures {
+            println!(
+                "  - {}: {}",
+                f.description,
+                f.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
+    if !result.owner_note.is_empty() {
+        println!("note: {}", result.owner_note);
     }
 }
 
@@ -2627,5 +2789,41 @@ mod tests {
             result.is_err(),
             "channels remove with no id should fail to parse"
         );
+    }
+
+    // ── R2: coexist subcommand arg-parse tests ─────────────────────────────────
+
+    #[test]
+    fn coexist_status_parses() {
+        let cmd = parse(&["coexist", "status"]).expect("coexist status should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Coexist {
+                action: super::CoexistAction::Status
+            }
+        ));
+    }
+
+    #[test]
+    fn coexist_disable_no_dry_run_parses() {
+        let cmd = parse(&["coexist", "disable"]).expect("coexist disable should parse");
+        match cmd {
+            super::Command::Coexist {
+                action: super::CoexistAction::Disable { dry_run },
+            } => assert!(!dry_run, "dry_run must default to false"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coexist_disable_with_dry_run_parses() {
+        let cmd =
+            parse(&["coexist", "disable", "--dry-run"]).expect("coexist disable --dry-run should parse");
+        match cmd {
+            super::Command::Coexist {
+                action: super::CoexistAction::Disable { dry_run },
+            } => assert!(dry_run, "dry_run must be true when --dry-run is passed"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
