@@ -161,7 +161,7 @@
     try {
       const next = await profileImport(toml);
       engineState.set(next);
-      showFeedback(`Profile imported as "${next.active_profile}"`);
+      showFeedback("Profile imported successfully");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       showFeedback(`Import failed: ${msg}`);

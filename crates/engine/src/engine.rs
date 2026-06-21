@@ -766,6 +766,11 @@ impl<R: CommandRunner> Engine<R> {
             } else {
                 let mut n = 2u32;
                 loop {
+                    if n > 1000 {
+                        return Err(EngineError::BadRequest(
+                            "too many name collisions for imported profile".to_string(),
+                        ));
+                    }
                     let candidate = format!("{base_name}-imported({n})");
                     if self.config.profile(&candidate).is_none() {
                         break candidate;
@@ -3156,6 +3161,226 @@ mod tests {
         let result = engine.new_profile("default"); // "default" already exists
         assert!(result.is_err(), "duplicate profile name must error");
         assert!(!tmp.exists(), "no disk write on error");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // TDD: F3 profile management — rename active, EQ preset unit tests
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn rename_active_profile_updates_active_profile_field() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("rename_active");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify initial active profile
+        assert_eq!(engine.state().active_profile, "default");
+
+        engine
+            .rename_profile("default", "my-renamed")
+            .expect("rename_profile should succeed");
+
+        // active_profile in state must reflect the new name
+        assert_eq!(
+            engine.state().active_profile,
+            "my-renamed",
+            "state().active_profile must be updated after renaming the active profile"
+        );
+        // Old name must be gone, new name must exist
+        let names = engine.config().profile_names();
+        assert!(
+            !names.contains(&"default".to_string()),
+            "old profile name must not exist"
+        );
+        assert!(
+            names.contains(&"my-renamed".to_string()),
+            "new profile name must exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn save_eq_preset_captures_channel_bands_into_named_preset() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_save");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        // Give the game channel two EQ bands
+        cfg.profiles[0].channels[0].eq = vec![
+            EqBandConfig {
+                kind: "peaking".into(),
+                freq_hz: 200.0,
+                q: 1.0,
+                gain_db: 4.0,
+            },
+            EqBandConfig {
+                kind: "highshelf".into(),
+                freq_hz: 6000.0,
+                q: 0.7,
+                gain_db: -2.0,
+            },
+        ];
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        engine
+            .save_eq_preset("my-preset", "game")
+            .expect("save_eq_preset should succeed");
+
+        // Preset must exist in config with the correct bands
+        let preset = engine
+            .config()
+            .eq_presets
+            .iter()
+            .find(|p| p.name == "my-preset")
+            .expect("preset must exist in config after save");
+        assert_eq!(preset.bands.len(), 2, "preset must have 2 bands");
+        assert_eq!(preset.bands[0].freq_hz, 200.0, "first band freq must match");
+        assert_eq!(preset.bands[0].gain_db, 4.0, "first band gain must match");
+        assert_eq!(
+            preset.bands[1].kind, "highshelf",
+            "second band kind must match"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn apply_eq_preset_copies_bands_to_channel_and_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_apply");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let preset_bands = vec![EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 500.0,
+            q: 1.5,
+            gain_db: 6.0,
+        }];
+
+        let mut cfg = make_config_no_eq_no_routes();
+        // Inject the preset directly into config
+        cfg.eq_presets.push(arctis_config::EqPreset {
+            name: "test-preset".into(),
+            kind_hint: None,
+            bands: preset_bands.clone(),
+        });
+
+        // apply_eq_preset → apply_all: 1 ls (find_node_id) + 10 band set calls
+        let ls = ls_all_present();
+        let mut runner = MockRunner::new();
+        runner = runner.with_output(0, &ls, ""); // find_node_id
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", ""); // band Props sets
+        }
+
+        let mut engine = Engine::new(runner, cfg);
+
+        engine
+            .apply_eq_preset("test-preset", "game")
+            .expect("apply_eq_preset should succeed");
+
+        // Channel EQ in config must equal preset bands
+        let active = engine.config().active_profile.clone();
+        let profile = engine
+            .config()
+            .profile(&active)
+            .expect("active profile must exist");
+        let channel = profile
+            .channels
+            .iter()
+            .find(|c| c.id == "game")
+            .expect("game channel must exist");
+        assert_eq!(channel.eq.len(), 1, "channel must have 1 band after apply");
+        assert_eq!(
+            channel.eq[0].freq_hz, 500.0,
+            "channel band freq must match preset"
+        );
+        assert_eq!(
+            channel.eq[0].gain_db, 6.0,
+            "channel band gain must match preset"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn delete_eq_preset_removes_it_from_config() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_preset_delete");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.eq_presets.push(arctis_config::EqPreset {
+            name: "to-delete".into(),
+            kind_hint: None,
+            bands: vec![],
+        });
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify it exists before delete
+        assert!(
+            engine
+                .config()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must exist before delete"
+        );
+
+        engine
+            .delete_eq_preset("to-delete")
+            .expect("delete_eq_preset should succeed");
+
+        // Must be gone from config
+        assert!(
+            !engine
+                .config()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must be removed from config after delete"
+        );
+
+        // Must be gone from state
+        assert!(
+            !engine
+                .state()
+                .eq_presets
+                .iter()
+                .any(|p| p.name == "to-delete"),
+            "preset must not appear in state after delete"
+        );
+
+        // Persisted to disk
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");

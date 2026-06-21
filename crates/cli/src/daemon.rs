@@ -1494,6 +1494,111 @@ mod tests {
         assert!(resp.error.is_some());
     }
 
+    #[test]
+    fn handle_eq_preset_apply_returns_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_apply_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // apply_eq_preset calls apply_all for the channel: 1 ls (find_node_id) + 10 band sets
+        let mut runner = MockRunner::new();
+        // save_eq_preset: no runner calls needed
+        // apply_eq_preset → apply_all → find_node_id ls + 10 band set calls
+        runner = runner.with_output(0, &ls, ""); // find_node_id
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", ""); // band set Props
+        }
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        // First save a preset from the game channel
+        let save_resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(save_resp.ok, "save must succeed before apply");
+
+        // Then apply the preset to the chat channel
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "chat".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "eq preset apply must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present after apply");
+        // Preset still visible in state
+        assert!(
+            state.eq_presets.iter().any(|p| p.name == "my-preset"),
+            "applied preset must still appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_eq_preset_apply_unknown_preset_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "nonexistent-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(!resp.ok, "applying nonexistent preset must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_eq_preset_apply_unknown_channel_errors() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f3a_applych_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Save a preset first
+        let save_resp = handle_request(
+            &mut engine,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into(),
+            },
+        );
+        assert!(save_resp.ok);
+
+        // Apply to nonexistent channel
+        let resp = handle_request(
+            &mut engine,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "nonexistent".into(),
+            },
+        );
+        assert!(
+            !resp.ok,
+            "applying to nonexistent channel must return ok:false"
+        );
+        assert!(resp.error.is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
     // ── F2.1: SetChannelVolume / SetChannelMute dispatch tests ───────────────
 
     #[test]
