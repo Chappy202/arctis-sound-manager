@@ -285,6 +285,7 @@ where
 /// On shutdown the loop breaks IMMEDIATELY after the connection that sent
 /// the shutdown request (no blocking accept()). Then `engine.shutdown()` is
 /// called for deterministic child teardown, and the socket file is removed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
     engine: &mut Engine<R>,
     path: &std::path::Path,
@@ -337,6 +338,70 @@ pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
     Ok(())
 }
 
+/// Production accept loop variant that accepts an `Arc<Mutex<Engine>>` so the engine
+/// mutex can be released between connections, letting the dial-consumer thread
+/// acquire the lock to apply balance updates.
+///
+/// Mirrors `run_daemon_with_engine` logic but acquires the engine lock only for
+/// the duration of `serve_connection` (not while blocked in `accept()`).
+fn run_daemon_accept_loop(
+    engine_arc: std::sync::Arc<std::sync::Mutex<Engine<RealRunner>>>,
+    path: &std::path::Path,
+) -> Result<(), EngineError> {
+    use std::io::BufReader;
+
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .map_err(|e| EngineError::Ipc(e.to_string()))?;
+
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("daemon: accept error (continuing): {e}");
+                continue;
+            }
+        };
+        let writer_stream = match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("daemon: try_clone error (continuing): {e}");
+                continue;
+            }
+        };
+        let mut reader = BufReader::new(stream);
+        let mut writer = writer_stream;
+        // Acquire the engine lock only for serving this connection.
+        let shutdown = match engine_arc.lock() {
+            Ok(mut eng) => match serve_connection(&mut reader, &mut writer, &mut *eng) {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(e) => {
+                    eprintln!("daemon: connection error (continuing): {e}");
+                    false
+                }
+            },
+            Err(e) => {
+                eprintln!("daemon: engine lock poisoned (continuing): {e}");
+                false
+            }
+        };
+        if shutdown {
+            break;
+        }
+    }
+
+    // Deterministic teardown.
+    let engine_shutdown_result = engine_arc
+        .lock()
+        .map_err(|e| EngineError::Ipc(format!("engine lock poisoned during shutdown: {e}")))
+        .and_then(|mut eng| eng.shutdown());
+    if let Err(e) = engine_shutdown_result {
+        eprintln!("daemon: shutdown warning: {e}");
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Real device opener: discovers the Nova Pro on the hidraw interface and opens it.
 struct HidOpener;
 
@@ -370,6 +435,40 @@ impl arctis_engine::DeviceOpener for HidOpener {
     }
 }
 
+/// Install SIGTERM + SIGINT handlers that write one byte to `write_fd`.
+///
+/// # Safety
+/// `sigaction` is async-signal-safe when the handler only calls `write(2)`.
+/// The global `SIGNAL_PIPE_WFD` is written once during setup and then only
+/// read inside the signal handler — no races after install.
+///
+/// This function must be called exactly once before `run_daemon_with_engine`.
+unsafe fn install_signal_pipe(write_fd: libc::c_int) {
+    // Store the fd globally so the signal handler can access it.
+    SIGNAL_PIPE_WFD.store(write_fd, std::sync::atomic::Ordering::Relaxed);
+
+    unsafe extern "C" fn handler(_sig: libc::c_int) {
+        let fd = SIGNAL_PIPE_WFD.load(std::sync::atomic::Ordering::Relaxed);
+        if fd >= 0 {
+            // Write a single byte — async-signal-safe. Ignore error (EAGAIN/EBADF).
+            let buf: u8 = 1;
+            unsafe {
+                let _ = libc::write(fd, &buf as *const u8 as *const libc::c_void, 1);
+            }
+        }
+    }
+
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+    libc::sigemptyset(&mut sa.sa_mask);
+    sa.sa_flags = 0;
+    libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+}
+
+/// Global write-end fd for the signal self-pipe. -1 = not installed.
+static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 pub fn run_daemon() -> Result<(), EngineError> {
     let path = socket_path();
     if path.exists() {
@@ -377,16 +476,48 @@ pub fn run_daemon() -> Result<(), EngineError> {
     }
 
     let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
+    let dial_controls_balance = cfg.dial_controls_balance;
     let mut engine = Engine::new(RealRunner, cfg);
     if let Err(e) = engine.reconcile() {
         eprintln!("warning: reconcile on start failed: {e}");
     }
 
-    // Spawn the DeviceWorker read-loop on a dedicated thread.
-    // Create the write-command channel so writes are serialized through the worker.
-    let device_shared = engine.device_shared();
+    // ── Self-pipe for SIGTERM/SIGINT ────────────────────────────────────────
+    // Create an OS pipe. Signal handler writes to the write-end; a watcher
+    // thread reads from the read-end and sends a Shutdown request to our own
+    // socket, triggering the normal graceful shutdown path.
+    let (pipe_read_fd, pipe_write_fd) = {
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(EngineError::Ipc(format!(
+                "failed to create signal pipe: errno {}",
+                unsafe { *libc::__errno_location() }
+            )));
+        }
+        (fds[0], fds[1])
+    };
+    // SAFETY: one-time setup; signal handler only calls write(2) — async-signal-safe.
+    unsafe { install_signal_pipe(pipe_write_fd) };
+
+    // ── Dial-balance consumer: shares DeviceShared, applies volume live ─────
+    // Wrap the engine in Arc<Mutex> for sharing with the consumer thread.
+    // The accept-loop thread gets exclusive `&mut Engine` via a lock guard.
+    let engine_arc = std::sync::Arc::new(std::sync::Mutex::new(engine));
+    let device_shared_for_dial = {
+        let g = engine_arc.lock().unwrap();
+        g.device_shared()
+    };
+
+    // ── DeviceWorker ────────────────────────────────────────────────────────
+    let device_shared_for_worker = {
+        let g = engine_arc.lock().unwrap();
+        g.device_shared()
+    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<arctis_engine::DeviceCommand>();
-    engine.set_device_tx(cmd_tx);
+    {
+        let mut g = engine_arc.lock().unwrap();
+        g.set_device_tx(cmd_tx);
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_worker = std::sync::Arc::clone(&stop);
     let worker_handle = std::thread::Builder::new()
@@ -394,8 +525,8 @@ pub fn run_daemon() -> Result<(), EngineError> {
         .spawn(move || {
             arctis_engine::device::run_read_loop(
                 HidOpener,
-                device_shared,
-                None, // no event forwarding in daemon (events go through engine event_sink in future)
+                device_shared_for_worker,
+                None,
                 std::time::Duration::from_secs(2),
                 stop_worker,
                 Some(cmd_rx),
@@ -403,12 +534,91 @@ pub fn run_daemon() -> Result<(), EngineError> {
         })
         .map_err(|e| EngineError::Ipc(format!("failed to spawn device worker: {e}")))?;
 
-    let result = run_daemon_with_engine(&mut engine, &path);
+    // ── Dial-balance consumer thread ────────────────────────────────────────
+    let engine_for_dial = std::sync::Arc::clone(&engine_arc);
+    let stop_dial = std::sync::Arc::clone(&stop);
+    let dial_handle = std::thread::Builder::new()
+        .name("dial-balance".into())
+        .spawn(move || {
+            let mut last_chat_mix: Option<i64> = None;
+            while !stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
+                // Read chat_mix from shared device state (updated by device-worker).
+                let chat_mix_opt: Option<i64> = {
+                    if let Ok(g) = device_shared_for_dial.lock() {
+                        g.fields.get("chat_mix").and_then(|s| s.parse::<i64>().ok())
+                    } else {
+                        None
+                    }
+                };
 
-    // Signal the worker to stop and join it.
+                if let Some(chat_mix) = chat_mix_opt {
+                    if let Ok(mut eng) = engine_for_dial.lock() {
+                        if let Err(e) = crate::dial::apply_dial_balance(
+                            &mut *eng,
+                            chat_mix,
+                            &mut last_chat_mix,
+                            dial_controls_balance,
+                        ) {
+                            eprintln!("daemon: dial-balance apply error (ignoring): {e}");
+                        }
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        })
+        .map_err(|e| EngineError::Ipc(format!("failed to spawn dial-balance thread: {e}")))?;
+
+    // ── Signal watcher thread ───────────────────────────────────────────────
+    // Waits for a byte on the read-end of the signal pipe, then sends a
+    // Shutdown request to our own socket so run_daemon_with_engine exits
+    // through the normal graceful path (engine.shutdown() + socket removal).
+    let socket_path_for_watcher = path.clone();
+    let signal_watcher = std::thread::Builder::new()
+        .name("signal-watcher".into())
+        .spawn(move || {
+            // Block until a byte arrives (signal fired) or the read-fd is closed (daemon exit).
+            let mut buf = [0u8; 1];
+            let n = unsafe { libc::read(pipe_read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+            if n <= 0 {
+                // Pipe closed (normal daemon exit path) — nothing to do.
+                unsafe { libc::close(pipe_read_fd) };
+                return;
+            }
+            unsafe { libc::close(pipe_read_fd) };
+            // Connect to our own socket and send Shutdown — this wakes up the accept loop.
+            eprintln!("daemon: signal received, initiating graceful shutdown");
+            if let Ok(mut stream) =
+                std::os::unix::net::UnixStream::connect(&socket_path_for_watcher)
+            {
+                use std::io::Write;
+                let _ = writeln!(stream, r#"{{"cmd":"shutdown"}}"#);
+            }
+        })
+        .map_err(|e| EngineError::Ipc(format!("failed to spawn signal watcher: {e}")))?;
+
+    // ── Accept loop ─────────────────────────────────────────────────────────
+    // Bind the listener here (not via run_daemon_with_engine) so we can release
+    // the engine lock between accept() calls, letting the dial-consumer thread
+    // acquire it in between connections.
+    let result = run_daemon_accept_loop(engine_arc.clone(), &path);
+
+    // ── Teardown ────────────────────────────────────────────────────────────
+    // Signal the worker + dial threads to stop.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Close the write-end of the pipe so the signal-watcher thread unblocks.
+    SIGNAL_PIPE_WFD.store(-1, std::sync::atomic::Ordering::Relaxed);
+    unsafe { libc::close(pipe_write_fd) };
+
     if let Err(e) = worker_handle.join() {
         eprintln!("daemon: device worker panicked: {:?}", e);
+    }
+    if let Err(e) = dial_handle.join() {
+        eprintln!("daemon: dial-balance thread panicked: {:?}", e);
+    }
+    if let Err(e) = signal_watcher.join() {
+        eprintln!("daemon: signal watcher panicked: {:?}", e);
     }
 
     result
@@ -475,6 +685,7 @@ mod tests {
                 },
             ],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 

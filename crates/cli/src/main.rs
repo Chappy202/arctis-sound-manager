@@ -1,5 +1,6 @@
 mod coexist;
 mod daemon;
+mod dial;
 
 use arctis_audio::{
     AppMatch, AudioBackend, BandKind, ChannelManager, ChannelSetConfig, EqBand, EqModel,

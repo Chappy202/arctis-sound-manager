@@ -119,6 +119,7 @@ dependencies = [
  "arctis-domain",
  "arctis-engine",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "toml 0.8.23",
