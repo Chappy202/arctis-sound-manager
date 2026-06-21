@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn apply_dial_balance_skips_when_flag_off() {
         let cfg = make_config_with_game_chat();
-        // If apply happens, the MockRunner will fail on unexpected runner calls
+        // Early-return is proven by `last` remaining None and zero runner calls.
         let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
         let mut last: Option<i64> = None;
 

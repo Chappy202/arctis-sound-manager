@@ -400,12 +400,11 @@ export const onStateChanged = (cb: (s: EngineState) => void): Promise<UnlistenFn
  *
  * Keys are PipeWire `node.name` strings for the Arctis virtual sinks and the
  * clean-mic source (e.g. "Arctis_Game", "Arctis_Chat", "Arctis_Media",
- * "arctis_clean_mic").  Values are linear volume scalars in [0.0, 1.0].
+ * "arctis_clean_mic").  Values are real-time PCM signal peaks in [0.0, 1.0].
  *
- * IMPORTANT: These values represent the *configured software volume* sampled
- * from `pw-dump` Props.channelVolumes — NOT real-time audio signal peaks or
- * RMS.  They reflect what the engine has set, not signal activity.  True peak
- * metering requires a native pipewire-rs capture stream (follow-up task).
+ * These are true signal peaks captured via a short pw-record capture stream
+ * per node, sampled at ~25 Hz.  They reflect actual audio activity, not the
+ * configured software volume.
  */
 export type LevelsPayload = Record<string, number>;
 

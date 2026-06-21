@@ -375,10 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn run_teardown_runner_error_collected_as_failure() {
-        // MockRunner with no queued outputs returns status=0 by default —
-        // to simulate a spawn error we need a custom error. Instead verify the
-        // error-path via a non-zero status.
+    fn run_teardown_nonzero_exit_collected_as_failure() {
+        // Tests the non-zero-exit-status failure arm: each action returns
+        // status 127 and the error is collected in `result.failures`.
+        // (The spawn-Err arm is exercised by RealRunner in production; the
+        // MockRunner always succeeds at spawning.)
         let mut runner = MockRunner::new();
         for _ in 0..LEGACY_USER_SERVICES.len() {
             runner = runner.with_output(127, "", "command not found");

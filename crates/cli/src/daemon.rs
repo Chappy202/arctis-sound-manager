@@ -572,18 +572,24 @@ pub fn run_daemon() -> Result<(), EngineError> {
     // The accept-loop thread gets exclusive `&mut Engine` via a lock guard.
     let engine_arc = std::sync::Arc::new(std::sync::Mutex::new(engine));
     let device_shared_for_dial = {
-        let g = engine_arc.lock().unwrap();
+        let g = engine_arc
+            .lock()
+            .expect("engine mutex uncontended during daemon setup");
         g.device_shared()
     };
 
     // ── DeviceWorker ────────────────────────────────────────────────────────
     let device_shared_for_worker = {
-        let g = engine_arc.lock().unwrap();
+        let g = engine_arc
+            .lock()
+            .expect("engine mutex uncontended during daemon setup");
         g.device_shared()
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<arctis_engine::DeviceCommand>();
     {
-        let mut g = engine_arc.lock().unwrap();
+        let mut g = engine_arc
+            .lock()
+            .expect("engine mutex uncontended during daemon setup");
         g.set_device_tx(cmd_tx);
     }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

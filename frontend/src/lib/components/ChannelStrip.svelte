@@ -194,8 +194,8 @@
 
     <div class="fader-readout">{formatDb(channel.volume_db)}</div>
 
-    <!-- R3: Level meter — shows configured volume via levels event.
-         Note: reflects volume setting, not signal peak. See meter.ts. -->
+    <!-- R3b: Level meter — shows real-time signal peak via levels event.
+         Note: reflects real-time signal peak (from pw-record). See meter.ts. -->
     <LevelMeter
       nodeName={channel.node_name}
       orientation="vertical"
