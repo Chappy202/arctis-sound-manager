@@ -104,3 +104,59 @@ pub async fn device_set(
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::DeviceSet { control, value }).await
 }
+
+#[tauri::command]
+pub async fn mic_enable(
+    enabled: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MicEnable { enabled }).await
+}
+
+#[tauri::command]
+pub async fn mic_stage(
+    stage: String,
+    enabled: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MicStage { stage, enabled }).await
+}
+
+#[tauri::command]
+pub async fn mic_set(
+    param: String,
+    value: f32,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MicSet { param, value }).await
+}
+
+#[tauri::command]
+pub async fn mic_eq_band(
+    band: usize,
+    kind: String,
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(
+        &state,
+        Request::MicEqBand {
+            band,
+            kind,
+            freq_hz,
+            q,
+            gain_db,
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mic_hw_mic(
+    device: Option<String>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MicHwMic { device }).await
+}

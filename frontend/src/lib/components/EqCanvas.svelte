@@ -52,6 +52,13 @@
     selectedBandIndex?: number;
     onBandChange?: (index: number, band: Band) => void;
     onSelectBand?: (index: number) => void;
+    /**
+     * Optional override for the IPC flush call.
+     * When provided, called instead of the internal `setEqBand(channelId, ...)` — allows
+     * reuse of EqCanvas on the Mic page without forking (E4).
+     * When absent, behavior is byte-identical to before this prop was added.
+     */
+    onFlush?: (index: number, band: Band) => void;
   }
 
   let {
@@ -60,6 +67,7 @@
     selectedBandIndex = $bindable(-1),
     onBandChange,
     onSelectBand,
+    onFlush,
   }: Props = $props();
 
   // ---------------------------------------------------------------------------
@@ -348,9 +356,14 @@
   // ---------------------------------------------------------------------------
 
   function flushBand(index: number, band: Band) {
-    setEqBand(channelId, index, band.kind, band.freqHz, band.q, band.gainDb).catch(
-      (e) => console.warn("[EqCanvas] setEqBand failed:", e),
-    );
+    if (onFlush) {
+      // Caller-supplied override (e.g. MicPage uses micEqBand instead of setEqBand).
+      onFlush(index, band);
+    } else {
+      setEqBand(channelId, index, band.kind, band.freqHz, band.q, band.gainDb).catch(
+        (e) => console.warn("[EqCanvas] setEqBand failed:", e),
+      );
+    }
   }
 
   function throttledFlush(index: number, band: Band) {

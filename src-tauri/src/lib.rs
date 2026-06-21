@@ -18,6 +18,11 @@ pub fn run() {
             commands::set_channel_output,
             commands::profile_new,
             commands::device_set,
+            commands::mic_enable,
+            commands::mic_stage,
+            commands::mic_set,
+            commands::mic_eq_band,
+            commands::mic_hw_mic,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
