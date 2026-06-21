@@ -1,6 +1,6 @@
 use arctis_audio::{CommandRunner, RealRunner, StageKind};
 use arctis_config::{Config, EqBandConfig};
-use arctis_engine::{Engine, EngineError, MicParam};
+use arctis_engine::{Engine, EngineError, MicParam, SuppressionBackend};
 
 // Re-export protocol types and client from arctis-client so that `main.rs`
 // can continue to reference `daemon::Request`, `daemon::send_request`, etc.
@@ -39,6 +39,18 @@ fn parse_mic_param(s: &str) -> Result<MicParam, EngineError> {
         "comp_makeup_db" => Ok(MicParam::CompMakeupDb),
         other => Err(EngineError::BadRequest(format!(
             "unknown mic param '{other}' (use: gain_db|highpass_freq|attenuation_limit_db|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db)"
+        ))),
+    }
+}
+
+/// Map a canonical backend string to a `SuppressionBackend`.
+/// Returns `EngineError::BadRequest` for unknown strings.
+fn parse_suppression_backend(s: &str) -> Result<SuppressionBackend, EngineError> {
+    match s {
+        "deep_filter" => Ok(SuppressionBackend::DeepFilter),
+        "rnnoise" => Ok(SuppressionBackend::Rnnoise),
+        other => Err(EngineError::BadRequest(format!(
+            "unknown suppression backend '{other}' (use: deep_filter|rnnoise)"
         ))),
     }
 }
@@ -134,6 +146,13 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
         },
         Request::MicEnable { enabled } => match engine.mic_set_enabled(enabled) {
             Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::MicSuppressionBackend { backend } => match parse_suppression_backend(&backend) {
+            Ok(b) => match engine.mic_set_suppression_backend(b) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            },
             Err(e) => Response::err(e.to_string()),
         },
     }
@@ -695,6 +714,109 @@ mod tests {
 
         drop(engine);
         worker.join().expect("fake worker must not panic");
+    }
+
+    // ── Task 3: parse_suppression_backend unit tests ────────────────────────
+
+    #[test]
+    fn parse_suppression_backend_deep_filter() {
+        use arctis_engine::SuppressionBackend;
+        assert!(matches!(
+            super::parse_suppression_backend("deep_filter"),
+            Ok(SuppressionBackend::DeepFilter)
+        ));
+    }
+
+    #[test]
+    fn parse_suppression_backend_rnnoise() {
+        use arctis_engine::SuppressionBackend;
+        assert!(matches!(
+            super::parse_suppression_backend("rnnoise"),
+            Ok(SuppressionBackend::Rnnoise)
+        ));
+    }
+
+    #[test]
+    fn parse_suppression_backend_unknown_returns_bad_request() {
+        let e = super::parse_suppression_backend("invalid_backend").unwrap_err();
+        assert!(
+            matches!(e, EngineError::BadRequest(_)),
+            "unknown backend must be BadRequest"
+        );
+        assert!(
+            e.to_string().contains("invalid_backend"),
+            "error must include input"
+        );
+    }
+
+    // ── Task 3: MicSuppressionBackend dispatch test ──────────────────────────
+
+    #[test]
+    fn handle_mic_suppression_backend_deep_filter_returns_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_t3_dfbe_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::MicSuppressionBackend {
+                backend: "deep_filter".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "MicSuppressionBackend deep_filter must return ok:true, got: {:?}",
+            resp.error
+        );
+        assert!(resp.state.is_some(), "state must be present in response");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_mic_suppression_backend_rnnoise_returns_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_t3_rnbe_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::MicSuppressionBackend {
+                backend: "rnnoise".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "MicSuppressionBackend rnnoise must return ok:true, got: {:?}",
+            resp.error
+        );
+        assert!(resp.state.is_some(), "state must be present in response");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_mic_suppression_backend_unknown_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::MicSuppressionBackend {
+                backend: "bogus_backend".into(),
+            },
+        );
+        assert!(!resp.ok, "unknown backend must return ok:false");
+        assert!(resp.error.is_some(), "error must be present");
+        assert!(
+            resp.error.as_deref().unwrap().contains("bogus_backend"),
+            "error must include input"
+        );
     }
 
     // ── Task 5: parse_mic_stage unit tests ──────────────────────────────────

@@ -214,19 +214,19 @@ enum MicAction {
     On,
     /// Disable the whole mic chain (master switch off).
     Off,
-    /// Enable a mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
+    /// Enable a mic DSP stage (gain|highpass|suppression|compressor|gate|eq).
     Enable {
-        /// Stage name: gain|highpass|rnnoise|compressor|gate|eq
+        /// Stage name: gain|highpass|suppression|compressor|gate|eq (alias: rnnoise)
         stage: String,
     },
-    /// Disable a mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
+    /// Disable a mic DSP stage (gain|highpass|suppression|compressor|gate|eq).
     Disable {
-        /// Stage name: gain|highpass|rnnoise|compressor|gate|eq
+        /// Stage name: gain|highpass|suppression|compressor|gate|eq (alias: rnnoise)
         stage: String,
     },
     /// Set a mic DSP parameter live (no restart).
     Set {
-        /// Param name: gain_db|highpass_freq|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db
+        /// Param name: gain_db|highpass_freq|attenuation_limit_db|vad_threshold|vad_grace_ms|vad_retro_grace_ms|gate_threshold|comp_threshold_db|comp_ratio|comp_makeup_db
         param: String,
         /// Parameter value (float; negative values accepted for dB params)
         #[arg(allow_negative_numbers = true)]
@@ -254,6 +254,11 @@ enum MicAction {
     HwMic {
         /// Hardware mic node.name to capture from; omit to clear the pin.
         device: Option<String>,
+    },
+    /// Select the noise-suppression backend (deep_filter|rnnoise).
+    Backend {
+        /// Backend name: deep_filter|rnnoise
+        backend: String,
     },
 }
 
@@ -322,6 +327,14 @@ fn device_set_via_daemon(control: &str, value: i64) -> ExitCode {
     }
 }
 
+fn suppression_backend_str(backend: arctis_engine::SuppressionBackend) -> &'static str {
+    use arctis_engine::SuppressionBackend;
+    match backend {
+        SuppressionBackend::DeepFilter => "deep_filter",
+        SuppressionBackend::Rnnoise => "rnnoise",
+    }
+}
+
 fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
     use arctis_engine::StageName;
     match kind {
@@ -371,6 +384,7 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
             gain_db: gain,
         },
         MicAction::HwMic { device } => daemon::Request::MicHwMic { device },
+        MicAction::Backend { backend } => daemon::Request::MicSuppressionBackend { backend },
     };
 
     match daemon::send_request(&req) {
@@ -394,6 +408,23 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
                             if stage.enabled { "enabled" } else { "disabled" },
                             avail_str
                         );
+                        // For the suppression stage, show backend info inline.
+                        if stage.kind == arctis_engine::StageName::Suppression {
+                            let active = suppression_backend_str(mic.suppression_backend);
+                            let avail_backends: Vec<&str> = mic
+                                .available_suppression_backends
+                                .iter()
+                                .map(|b| suppression_backend_str(*b))
+                                .collect();
+                            let avail_display = if avail_backends.is_empty() {
+                                "none found".to_string()
+                            } else {
+                                avail_backends.join(", ")
+                            };
+                            println!(
+                                "    suppression_backend: {active} (available: {avail_display})"
+                            );
+                        }
                         for (k, v) in &stage.params {
                             println!("    {k}: {v}");
                         }
@@ -1510,6 +1541,46 @@ mod tests {
             super::Command::Mic {
                 action: super::MicAction::HwMic { device },
             } => assert_eq!(device, None),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── Task 3: mic backend + attenuation_limit_db CLI parse tests ──────────
+
+    #[test]
+    fn mic_backend_deep_filter_parses() {
+        let cmd = parse(&["mic", "backend", "deep_filter"])
+            .expect("mic backend deep_filter should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Backend { backend },
+            } => assert_eq!(backend, "deep_filter"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_backend_rnnoise_parses() {
+        let cmd = parse(&["mic", "backend", "rnnoise"]).expect("mic backend rnnoise should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Backend { backend },
+            } => assert_eq!(backend, "rnnoise"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mic_set_attenuation_limit_db_parses() {
+        let cmd = parse(&["mic", "set", "attenuation_limit_db", "24"])
+            .expect("mic set attenuation_limit_db 24 should parse");
+        match cmd {
+            super::Command::Mic {
+                action: super::MicAction::Set { param, value },
+            } => {
+                assert_eq!(param, "attenuation_limit_db");
+                assert!((value - 24.0).abs() < f32::EPSILON);
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
