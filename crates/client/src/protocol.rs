@@ -44,6 +44,34 @@ pub enum Request {
     },
     Reload,
     Shutdown,
+    /// Return the current mic DSP chain snapshot (EngineState.mic).
+    MicStatus,
+    /// Enable or disable a named mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq).
+    MicStage {
+        stage: String,
+        enabled: bool,
+    },
+    /// Set a named mic DSP parameter (gain_db|highpass_freq|vad_threshold|…).
+    MicSet {
+        param: String,
+        value: f32,
+    },
+    /// Set one band of the mic EQ (live, no restart).
+    MicEqBand {
+        band: usize,
+        kind: String,
+        freq_hz: f32,
+        q: f32,
+        gain_db: f32,
+    },
+    /// Set (or clear) the hardware mic capture source.
+    MicHwMic {
+        device: Option<String>,
+    },
+    /// Enable or disable the whole mic chain (master switch).
+    MicEnable {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -334,6 +362,181 @@ mod tests {
             value: -1,
         };
         let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task 5: mic verb wire-tag parse tests ────────────────────────────────
+
+    #[test]
+    fn parse_mic_status_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-status"}"#).unwrap();
+        assert_eq!(req, Request::MicStatus);
+    }
+
+    #[test]
+    fn parse_mic_stage_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"mic-stage","stage":"rnnoise","enabled":true}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::MicStage {
+                stage: "rnnoise".into(),
+                enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mic_set_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"mic-set","param":"vad_threshold","value":40.0}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::MicSet {
+                param: "vad_threshold".into(),
+                value: 40.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mic_eq_band_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"mic-eq-band","band":2,"kind":"peaking","freq_hz":1000.0,"q":1.0,"gain_db":-3.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::MicEqBand {
+                band: 2,
+                kind: "peaking".into(),
+                freq_hz: 1000.0,
+                q: 1.0,
+                gain_db: -3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mic_hw_mic_with_device_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"mic-hw-mic","device":"alsa_input.usb-SteelSeries"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::MicHwMic {
+                device: Some("alsa_input.usb-SteelSeries".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mic_hw_mic_none_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-hw-mic","device":null}"#).unwrap();
+        assert_eq!(req, Request::MicHwMic { device: None });
+    }
+
+    // ── Task 5: mic verb round-trip tests ────────────────────────────────────
+
+    #[test]
+    fn request_mic_status_round_trips() {
+        let req = Request::MicStatus;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-status"), "cmd tag must be mic-status");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_stage_round_trips() {
+        let req = Request::MicStage {
+            stage: "gain".into(),
+            enabled: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-stage"), "cmd tag must be mic-stage");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_set_round_trips() {
+        let req = Request::MicSet {
+            param: "vad_threshold".into(),
+            value: 40.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-set"), "cmd tag must be mic-set");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_eq_band_round_trips() {
+        let req = Request::MicEqBand {
+            band: 3,
+            kind: "peaking".into(),
+            freq_hz: 1000.0,
+            q: 1.0,
+            gain_db: -3.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-eq-band"), "cmd tag must be mic-eq-band");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_hw_mic_some_round_trips() {
+        let req = Request::MicHwMic {
+            device: Some("alsa_input.usb-SteelSeries".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-hw-mic"), "cmd tag must be mic-hw-mic");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_hw_mic_none_round_trips() {
+        let req = Request::MicHwMic { device: None };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-hw-mic"), "cmd tag must be mic-hw-mic");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task 5b: MicEnable wire-tag parse test ───────────────────────────────
+
+    #[test]
+    fn parse_mic_enable_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-enable","enabled":true}"#).unwrap();
+        assert_eq!(req, Request::MicEnable { enabled: true });
+    }
+
+    #[test]
+    fn parse_mic_enable_false_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"mic-enable","enabled":false}"#).unwrap();
+        assert_eq!(req, Request::MicEnable { enabled: false });
+    }
+
+    #[test]
+    fn request_mic_enable_true_round_trips() {
+        let req = Request::MicEnable { enabled: true };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_mic_enable_false_round_trips() {
+        let req = Request::MicEnable { enabled: false };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

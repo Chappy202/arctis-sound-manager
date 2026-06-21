@@ -28,6 +28,19 @@ export interface ChannelSnapshot {
   eq_bands: EqBandSnapshot[];
 }
 
+export interface MicStageSnapshot {
+  kind: string; // serde snake_case StageName: "gain"|"highpass"|"rnnoise"|"compressor"|"gate"|"mic_eq"
+  enabled: boolean;
+  available: boolean;
+  params: Record<string, number>; // BTreeMap<String,f32>; keys per engine state() builder
+}
+
+export interface MicSnapshot {
+  enabled: boolean;
+  stages: MicStageSnapshot[];
+  eq_bands: EqBandSnapshot[]; // reuse existing EqBandSnapshot
+}
+
 export interface EngineState {
   active_profile: string;
   profiles: string[];
@@ -36,6 +49,7 @@ export interface EngineState {
   routes: [string, string][];
   device_present: boolean;
   device_fields: Record<string, string>;
+  mic: MicSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +90,19 @@ export function buildDeviceSetArgs(
   value: number,
 ): { control: string; value: number } {
   return { control, value };
+}
+
+/** Builds the camelCase arg object for the mic_eq_band command.
+ * Tauri v2 converts these camelCase keys back to the Rust command's snake_case params
+ * at the invoke boundary — the same round-trip as buildSetEqBandArgs; this is intentional. */
+export function buildMicEqBandArgs(
+  band: number,
+  kind: string,
+  freq_hz: number,
+  q: number,
+  gain_db: number,
+): { band: number; kind: string; freqHz: number; q: number; gainDb: number } {
+  return { band, kind, freqHz: freq_hz, q, gainDb: gain_db };
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +150,32 @@ export const setRoute = (app_binary: string, target_sink: string): Promise<Engin
  */
 export const deviceSet = (control: string, value: number): Promise<EngineState> =>
   invoke<EngineState>("device_set", buildDeviceSetArgs(control, value));
+
+/** Enable or disable the whole mic chain (master switch). */
+export const micEnable = (enabled: boolean): Promise<EngineState> =>
+  invoke<EngineState>("mic_enable", { enabled });
+
+/** Enable or disable a named mic DSP stage (gain|highpass|rnnoise|compressor|gate|eq). */
+export const micStage = (stage: string, enabled: boolean): Promise<EngineState> =>
+  invoke<EngineState>("mic_stage", { stage, enabled });
+
+/** Set a named mic DSP parameter (gain_db|highpass_freq|vad_threshold|…). */
+export const micSet = (param: string, value: number): Promise<EngineState> =>
+  invoke<EngineState>("mic_set", { param, value });
+
+/** Set one band of the mic EQ (live, no restart). */
+export const micEqBand = (
+  band: number,
+  kind: string,
+  freq_hz: number,
+  q: number,
+  gain_db: number,
+): Promise<EngineState> =>
+  invoke<EngineState>("mic_eq_band", buildMicEqBandArgs(band, kind, freq_hz, q, gain_db));
+
+/** Set (or clear) the hardware mic capture source. */
+export const micHwMic = (device: string | null): Promise<EngineState> =>
+  invoke<EngineState>("mic_hw_mic", { device });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

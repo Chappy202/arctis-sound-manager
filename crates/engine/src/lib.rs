@@ -13,4 +13,7 @@ pub use children::ChildOwner;
 pub use device::{DeviceCommand, DeviceOpener};
 pub use engine::Engine;
 pub use error::EngineError;
-pub use state::{ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, Event};
+pub use state::{
+    ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, Event, MicParam, MicSnapshot,
+    MicStageSnapshot, StageAvailability, StageName,
+};

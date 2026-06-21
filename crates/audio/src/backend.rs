@@ -146,8 +146,8 @@ impl<R: CommandRunner> AudioBackend<R> {
 }
 
 /// Parse the numeric id of the node whose block declares `node.name = "<name>"`
-/// in `pw-cli ls Node` output.
-fn parse_node_id(stdout: &str, node_name: &str) -> Result<String, AudioError> {
+/// in `pw-cli ls Node` output. Shared with `MicBackend`.
+pub(crate) fn parse_node_id(stdout: &str, node_name: &str) -> Result<String, AudioError> {
     let needle = format!("node.name = \"{node_name}\"");
     let mut current_id: Option<String> = None;
     for line in stdout.lines() {

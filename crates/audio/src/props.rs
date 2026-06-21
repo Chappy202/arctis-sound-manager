@@ -51,6 +51,33 @@ pub fn set_band_props_argv(
     ])
 }
 
+/// The `<param-json>` for `pw-cli s <id> Props <json>` that updates a single
+/// control by `<node_name>:<control>` address (live; no restart).
+pub fn control_props_json(node_name: &str, control: &str, value: f32) -> String {
+    format!(
+        "{{ params = [ \"{node_name}:{control}\" {} ] }}",
+        fmt_f(value)
+    )
+}
+
+/// Full argv (after the `pw-cli` program) to apply one control live.
+pub fn set_control_props_argv(
+    node_id: &str,
+    node_name: &str,
+    control: &str,
+    value: f32,
+) -> Result<Vec<String>, AudioError> {
+    if node_id.trim().is_empty() {
+        return Err(AudioError::Invalid("empty node id".into()));
+    }
+    Ok(vec![
+        "s".to_string(),
+        node_id.to_string(),
+        "Props".to_string(),
+        control_props_json(node_name, control, value),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +116,33 @@ mod tests {
     fn rejects_invalid_band() {
         let b = EqBand::new(BandKind::Peaking, 1000.0, 1.0, 999.0);
         assert!(band_props_json(0, &b).is_err());
+    }
+
+    #[test]
+    fn control_props_json_formats_single_control() {
+        let json = control_props_json("mic_rnnoise", "VAD Threshold (%)", 40.0);
+        assert_eq!(
+            json,
+            "{ params = [ \"mic_rnnoise:VAD Threshold (%)\" 40.0 ] }"
+        );
+    }
+
+    #[test]
+    fn set_control_props_argv_is_s_id_props_json() {
+        let argv = set_control_props_argv("57", "mic_rnnoise", "VAD Threshold (%)", 40.0).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "s".to_string(),
+                "57".to_string(),
+                "Props".to_string(),
+                "{ params = [ \"mic_rnnoise:VAD Threshold (%)\" 40.0 ] }".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_control_props_argv_rejects_empty_node_id() {
+        assert!(set_control_props_argv("  ", "mic_gain", "Mult", 1.0).is_err());
     }
 }

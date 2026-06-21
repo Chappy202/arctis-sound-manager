@@ -1,5 +1,10 @@
 use arctis_domain::eq_bounds::{
     EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +19,192 @@ pub struct EqBandConfig {
     pub freq_hz: f32,
     pub q: f32,
     pub gain_db: f32,
+}
+
+// ── Mic-chain config ─────────────────────────────────────────────────────────
+
+fn default_hp_hz() -> f32 {
+    90.0
+}
+fn default_vad() -> f32 {
+    40.0
+}
+fn default_grace() -> f32 {
+    800.0
+}
+fn default_retro_grace() -> f32 {
+    100.0
+}
+fn default_gate_thresh() -> f32 {
+    0.003
+}
+fn default_comp_threshold() -> f32 {
+    -18.0
+}
+fn default_comp_ratio() -> f32 {
+    2.0
+}
+fn default_comp_makeup() -> f32 {
+    4.0
+}
+
+/// Gain stage config: amplify/attenuate the raw mic signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicGainStage {
+    /// Whether the gain stage is active. Defaults to false (passthrough).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Gain in dB. 0.0 = unity when active.
+    #[serde(default)]
+    pub gain_db: f32,
+}
+
+impl Default for MicGainStage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gain_db: 0.0,
+        }
+    }
+}
+
+/// High-pass filter stage to remove low-frequency rumble.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicHighpassStage {
+    /// Whether the highpass stage is active. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cutoff frequency in Hz. Conservative default: 90 Hz.
+    #[serde(default = "default_hp_hz")]
+    pub freq_hz: f32,
+}
+
+impl Default for MicHighpassStage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            freq_hz: default_hp_hz(),
+        }
+    }
+}
+
+/// RNNoise-based noise suppression stage (LADSPA `noise_suppressor_mono`).
+/// Conservative defaults chosen to avoid the "tinny" artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicRnnoiseStage {
+    /// Whether the RNNoise stage is active. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// VAD threshold %. Lower = less suppression = less tinny. Default 40 (below plugin default of 49.5).
+    #[serde(default = "default_vad")]
+    pub vad_threshold: f32,
+    /// VAD grace period in ms. Longer = less clipping of trailing speech. Default 800 ms.
+    #[serde(default = "default_grace")]
+    pub vad_grace_ms: f32,
+    /// Retroactive VAD grace in ms. Default 100 ms.
+    #[serde(default = "default_retro_grace")]
+    pub vad_retro_grace_ms: f32,
+}
+
+impl Default for MicRnnoiseStage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vad_threshold: default_vad(),
+            vad_grace_ms: default_grace(),
+            vad_retro_grace_ms: default_retro_grace(),
+        }
+    }
+}
+
+/// Optional compressor stage (requires `sc4m` LADSPA plugin).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicCompressorStage {
+    /// Whether the compressor stage is active. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Compressor threshold in dB. Default -18 dB.
+    #[serde(default = "default_comp_threshold")]
+    pub threshold_db: f32,
+    /// Compression ratio (1:n). Default 2.0.
+    #[serde(default = "default_comp_ratio")]
+    pub ratio: f32,
+    /// Makeup gain in dB. Default 4.0.
+    #[serde(default = "default_comp_makeup")]
+    pub makeup_db: f32,
+}
+
+impl Default for MicCompressorStage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_db: default_comp_threshold(),
+            ratio: default_comp_ratio(),
+            makeup_db: default_comp_makeup(),
+        }
+    }
+}
+
+/// Noise gate stage to silence below-threshold signals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicGateStage {
+    /// Whether the noise gate is active. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Open threshold (linear 0..1). Conservative default 0.003.
+    #[serde(default = "default_gate_thresh")]
+    pub threshold: f32,
+}
+
+impl Default for MicGateStage {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_gate_thresh(),
+        }
+    }
+}
+
+/// Per-profile microphone DSP chain configuration.
+/// Default = **clean passthrough** — all stages disabled, no external plugin needed.
+/// Old configs lacking a `[profiles.*.mic]` block deserialize cleanly to passthrough
+/// via `#[serde(default)]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MicChainConfig {
+    /// Master switch. false => Clean Mic source not built at all. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Hardware mic node.name to capture from. None => follow default source.
+    #[serde(default)]
+    pub hw_mic: Option<String>,
+    /// Gain stage.
+    #[serde(default)]
+    pub gain: MicGainStage,
+    /// High-pass filter stage.
+    #[serde(default)]
+    pub highpass: MicHighpassStage,
+    /// RNNoise noise suppression stage.
+    #[serde(default)]
+    pub rnnoise: MicRnnoiseStage,
+    /// Optional compressor stage (sc4m LADSPA).
+    #[serde(default)]
+    pub compressor: MicCompressorStage,
+    /// Noise gate stage.
+    #[serde(default)]
+    pub gate: MicGateStage,
+    /// Whether the mic parametric EQ stage is active.
+    #[serde(default)]
+    pub eq_enabled: bool,
+    /// Mic EQ bands. Reuses `EqBandConfig` from the channel EQ. Empty = EQ stage off.
+    #[serde(default)]
+    pub eq: Vec<EqBandConfig>,
+}
+
+impl MicChainConfig {
+    /// Explicit passthrough constructor: all stages disabled, empty EQ.
+    pub fn passthrough() -> Self {
+        Self::default()
+    }
 }
 
 /// A single virtual audio channel routed through PipeWire.
@@ -42,6 +233,10 @@ pub struct Profile {
     pub channels: Vec<ChannelConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Mic DSP chain config. Defaults to passthrough (all stages off).
+    /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub mic: MicChainConfig,
 }
 
 /// Root configuration object. Versioned for forward-compatibility checking.
@@ -87,6 +282,7 @@ impl Config {
                 name: "default".to_string(),
                 channels,
                 routes: Vec::new(),
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -154,6 +350,123 @@ impl Config {
                         return Err(ConfigError::Invalid(format!(
                             "EQ band gain_db {} dB out of range {}..={} in channel '{}'",
                             band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, channel.id
+                        )));
+                    }
+                }
+            }
+
+            // Mic-chain validation: only range-check enabled stages.
+            let mic = &profile.mic;
+            if mic.gain.enabled && !(MIC_GAIN_MIN_DB..=MIC_GAIN_MAX_DB).contains(&mic.gain.gain_db)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mic gain_db {} dB out of range {}..={} in profile '{}'",
+                    mic.gain.gain_db, MIC_GAIN_MIN_DB, MIC_GAIN_MAX_DB, profile.name
+                )));
+            }
+            if mic.highpass.enabled
+                && !(MIC_HIGHPASS_MIN_HZ..=MIC_HIGHPASS_MAX_HZ).contains(&mic.highpass.freq_hz)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mic highpass freq_hz {} Hz out of range {}..={} in profile '{}'",
+                    mic.highpass.freq_hz, MIC_HIGHPASS_MIN_HZ, MIC_HIGHPASS_MAX_HZ, profile.name
+                )));
+            }
+            if mic.rnnoise.enabled {
+                if !(MIC_VAD_THRESHOLD_MIN..=MIC_VAD_THRESHOLD_MAX)
+                    .contains(&mic.rnnoise.vad_threshold)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic vad_threshold {} out of range {}..={} in profile '{}'",
+                        mic.rnnoise.vad_threshold,
+                        MIC_VAD_THRESHOLD_MIN,
+                        MIC_VAD_THRESHOLD_MAX,
+                        profile.name
+                    )));
+                }
+                if !(MIC_VAD_GRACE_MIN_MS..=MIC_VAD_GRACE_MAX_MS)
+                    .contains(&mic.rnnoise.vad_grace_ms)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic vad_grace_ms {} ms out of range {}..={} in profile '{}'",
+                        mic.rnnoise.vad_grace_ms,
+                        MIC_VAD_GRACE_MIN_MS,
+                        MIC_VAD_GRACE_MAX_MS,
+                        profile.name
+                    )));
+                }
+                if !(MIC_VAD_RETRO_GRACE_MIN_MS..=MIC_VAD_RETRO_GRACE_MAX_MS)
+                    .contains(&mic.rnnoise.vad_retro_grace_ms)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic vad_retro_grace_ms {} ms out of range {}..={} in profile '{}'",
+                        mic.rnnoise.vad_retro_grace_ms,
+                        MIC_VAD_RETRO_GRACE_MIN_MS,
+                        MIC_VAD_RETRO_GRACE_MAX_MS,
+                        profile.name
+                    )));
+                }
+            }
+            if mic.gate.enabled
+                && !(MIC_GATE_THRESHOLD_MIN..=MIC_GATE_THRESHOLD_MAX).contains(&mic.gate.threshold)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mic gate threshold {} out of range {}..={} in profile '{}'",
+                    mic.gate.threshold,
+                    MIC_GATE_THRESHOLD_MIN,
+                    MIC_GATE_THRESHOLD_MAX,
+                    profile.name
+                )));
+            }
+            if mic.compressor.enabled {
+                if !(MIC_COMP_THRESHOLD_MIN_DB..=MIC_COMP_THRESHOLD_MAX_DB)
+                    .contains(&mic.compressor.threshold_db)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor threshold_db {} dB out of range {}..={} in profile '{}'",
+                        mic.compressor.threshold_db,
+                        MIC_COMP_THRESHOLD_MIN_DB,
+                        MIC_COMP_THRESHOLD_MAX_DB,
+                        profile.name
+                    )));
+                }
+                if !(MIC_COMP_RATIO_MIN..=MIC_COMP_RATIO_MAX).contains(&mic.compressor.ratio) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor ratio {} out of range {}..={} in profile '{}'",
+                        mic.compressor.ratio, MIC_COMP_RATIO_MIN, MIC_COMP_RATIO_MAX, profile.name
+                    )));
+                }
+                if !(MIC_COMP_MAKEUP_MIN_DB..=MIC_COMP_MAKEUP_MAX_DB)
+                    .contains(&mic.compressor.makeup_db)
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "mic compressor makeup_db {} dB out of range {}..={} in profile '{}'",
+                        mic.compressor.makeup_db,
+                        MIC_COMP_MAKEUP_MIN_DB,
+                        MIC_COMP_MAKEUP_MAX_DB,
+                        profile.name
+                    )));
+                }
+            }
+            // Mic EQ bands reuse the existing EQ bounds.
+            if mic.eq_enabled {
+                for band in &mic.eq {
+                    if !(EQ_FREQ_MIN_HZ..=EQ_FREQ_MAX_HZ).contains(&band.freq_hz) {
+                        return Err(ConfigError::Invalid(format!(
+                            "mic EQ band freq_hz {} Hz out of range {}..={} in profile '{}'",
+                            band.freq_hz, EQ_FREQ_MIN_HZ, EQ_FREQ_MAX_HZ, profile.name
+                        )));
+                    }
+                    if !(EQ_Q_MIN..=EQ_Q_MAX).contains(&band.q) {
+                        return Err(ConfigError::Invalid(format!(
+                            "mic EQ band Q {} out of range {}..={} in profile '{}'",
+                            band.q, EQ_Q_MIN, EQ_Q_MAX, profile.name
+                        )));
+                    }
+                    if !(EQ_GAIN_MIN_DB..=EQ_GAIN_MAX_DB).contains(&band.gain_db) {
+                        return Err(ConfigError::Invalid(format!(
+                            "mic EQ band gain_db {} dB out of range {}..={} in profile '{}'",
+                            band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, profile.name
                         )));
                     }
                 }
@@ -341,6 +654,265 @@ mod tests {
         let err = make_channel_with_band(band(20_000.1, 1.0, 0.0))
             .validate()
             .expect_err("20000.1 Hz should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    // ── Task 2c: Mic-chain config tests ──────────────────────────────────────
+
+    /// 1. `MicChainConfig::default()` is passthrough: master off, all stages off, empty eq.
+    #[test]
+    fn mic_default_is_passthrough() {
+        let mic = MicChainConfig::default();
+        assert!(!mic.enabled, "master switch should be off");
+        assert!(!mic.gain.enabled, "gain should be off");
+        assert!(!mic.highpass.enabled, "highpass should be off");
+        assert!(!mic.rnnoise.enabled, "rnnoise should be off");
+        assert!(!mic.compressor.enabled, "compressor should be off");
+        assert!(!mic.gate.enabled, "gate should be off");
+        assert!(!mic.eq_enabled, "eq_enabled should be off");
+        assert!(mic.eq.is_empty(), "eq bands should be empty");
+        assert_eq!(
+            mic,
+            MicChainConfig::passthrough(),
+            "default == passthrough()"
+        );
+    }
+
+    /// 2. A TOML profile without any mic block deserializes to passthrough.
+    #[test]
+    fn old_config_without_mic_block_deserializes_to_passthrough() {
+        // This TOML has no [profiles.mic] entry — simulates a pre-mic-chain config.
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("should deserialize old config");
+        let profile = cfg.active().expect("active profile");
+        assert_eq!(
+            profile.mic,
+            MicChainConfig::passthrough(),
+            "old config without mic block must deserialize to passthrough"
+        );
+    }
+
+    /// 3. A fully enabled mic chain serializes and deserializes identically (round-trip).
+    #[test]
+    fn mic_toml_round_trips() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic = MicChainConfig {
+            enabled: true,
+            hw_mic: Some("alsa_input.usb_headset".to_string()),
+            gain: MicGainStage {
+                enabled: true,
+                gain_db: 3.0,
+            },
+            highpass: MicHighpassStage {
+                enabled: true,
+                freq_hz: 80.0,
+            },
+            rnnoise: MicRnnoiseStage {
+                enabled: true,
+                vad_threshold: 40.0,
+                vad_grace_ms: 800.0,
+                vad_retro_grace_ms: 100.0,
+            },
+            compressor: MicCompressorStage {
+                enabled: false,
+                threshold_db: -18.0,
+                ratio: 2.0,
+                makeup_db: 4.0,
+            },
+            gate: MicGateStage {
+                enabled: true,
+                threshold: 0.003,
+            },
+            eq_enabled: true,
+            eq: vec![EqBandConfig {
+                kind: "lowshelf".to_string(),
+                freq_hz: 120.0,
+                q: 0.7,
+                gain_db: 3.0,
+            }],
+        };
+
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            cfg, deserialized,
+            "mic TOML round-trip must preserve config"
+        );
+    }
+
+    /// 4. Enabled RNNoise with out-of-range VAD threshold → ConfigError::Invalid.
+    #[test]
+    fn validate_rejects_out_of_range_enabled_vad() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 150.0; // above max 99.0
+        let err = cfg
+            .validate()
+            .expect_err("out-of-range VAD threshold should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 5. Disabled RNNoise with out-of-range VAD threshold → Ok (disabled stages not validated).
+    #[test]
+    fn validate_ignores_out_of_range_disabled_stage() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = false;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 150.0; // would be invalid if enabled
+        assert!(
+            cfg.validate().is_ok(),
+            "disabled stage with out-of-range param should pass validation"
+        );
+    }
+
+    /// 6. `Config::default_config()` validates and every profile's mic is passthrough.
+    #[test]
+    fn default_config_includes_mic_passthrough() {
+        let cfg = Config::default_config();
+        assert!(cfg.validate().is_ok(), "default_config must be valid");
+        for profile in &cfg.profiles {
+            assert_eq!(
+                profile.mic,
+                MicChainConfig::passthrough(),
+                "profile '{}' mic should be passthrough",
+                profile.name
+            );
+        }
+    }
+
+    // ── Compressor validation tests ───────────────────────────────────────────
+
+    fn make_enabled_compressor(threshold_db: f32, ratio: f32, makeup_db: f32) -> Config {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.compressor = MicCompressorStage {
+            enabled: true,
+            threshold_db,
+            ratio,
+            makeup_db,
+        };
+        cfg
+    }
+
+    /// Enabled compressor with ratio below minimum (0.0 < 1.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_ratio_below_min() {
+        let err = make_enabled_compressor(-18.0, 0.0, 4.0)
+            .validate()
+            .expect_err("ratio=0.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with threshold_db above maximum (100.0 > 0.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_threshold_above_max() {
+        let err = make_enabled_compressor(100.0, 2.0, 4.0)
+            .validate()
+            .expect_err("threshold_db=100.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with makeup_db above maximum (25.0 > 24.0) → rejected.
+    #[test]
+    fn validate_rejects_enabled_compressor_makeup_above_max() {
+        let err = make_enabled_compressor(-18.0, 2.0, 25.0)
+            .validate()
+            .expect_err("makeup_db=25.0 should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// Enabled compressor with all params in range → accepted.
+    #[test]
+    fn validate_accepts_enabled_compressor_in_range() {
+        assert!(
+            make_enabled_compressor(-18.0, 2.0, 4.0).validate().is_ok(),
+            "in-range enabled compressor should pass validation"
+        );
+    }
+
+    /// Enabled compressor at exact boundary values → accepted.
+    #[test]
+    fn validate_accepts_enabled_compressor_at_boundaries() {
+        // threshold min=-30, ratio min=1, makeup min=0
+        assert!(
+            make_enabled_compressor(-30.0, 1.0, 0.0).validate().is_ok(),
+            "compressor at lower bounds should pass"
+        );
+        // threshold max=0, ratio max=20, makeup max=24
+        assert!(
+            make_enabled_compressor(0.0, 20.0, 24.0).validate().is_ok(),
+            "compressor at upper bounds should pass"
+        );
+    }
+
+    /// Disabled compressor with out-of-range params → accepted (disabled stages skipped).
+    #[test]
+    fn validate_ignores_disabled_compressor_out_of_range() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.compressor = MicCompressorStage {
+            enabled: false,
+            threshold_db: 100.0, // out of range
+            ratio: 0.0,          // out of range
+            makeup_db: 99.0,     // out of range
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "disabled compressor with out-of-range params should pass validation"
+        );
+    }
+
+    // ── VAD threshold boundary tests ──────────────────────────────────────────
+
+    /// VAD threshold at exact max (99.0) → accepted.
+    #[test]
+    fn validate_accepts_vad_threshold_at_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.0;
+        assert!(
+            cfg.validate().is_ok(),
+            "vad_threshold=99.0 (max) should be accepted"
+        );
+    }
+
+    /// VAD threshold just above max (99.01) → rejected.
+    #[test]
+    fn validate_rejects_vad_threshold_just_above_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 99.01;
+        let err = cfg
+            .validate()
+            .expect_err("vad_threshold=99.01 should be rejected");
         assert!(
             matches!(err, ConfigError::Invalid(_)),
             "expected Invalid, got: {err}"

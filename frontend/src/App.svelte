@@ -3,6 +3,7 @@
   import MixerPage from './lib/components/MixerPage.svelte';
   import EqPage from './lib/components/EqPage.svelte';
   import DevicePage from './lib/components/DevicePage.svelte';
+  import MicPage from './lib/components/MicPage.svelte';
   import { currentPage } from './lib/stores/page.js';
 </script>
 
@@ -20,11 +21,7 @@
       <p class="page-hint">Spatial page — coming in a future task</p>
     </div>
   {:else if $currentPage === 'mic'}
-    <div class="placeholder-page">
-      <h1 class="page-title">MIC</h1>
-      <p class="page-desc">Input level · Gain · Sidetone · Noise suppression</p>
-      <p class="page-hint">Mic page — coming in a future task</p>
-    </div>
+    <MicPage />
   {/if}
 </AppShell>
 

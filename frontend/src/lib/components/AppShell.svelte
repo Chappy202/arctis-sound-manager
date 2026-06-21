@@ -23,7 +23,7 @@
     { id: 'eq',      label: 'EQ',      icon: '〰' },
     { id: 'device',  label: 'DEVICE',  icon: '◉' },
     { id: 'spatial', label: 'SPATIAL', icon: '◎', disabled: true },
-    { id: 'mic',     label: 'MIC',     icon: '⏺', disabled: true },
+    { id: 'mic',     label: 'MIC',     icon: '⏺' },
   ];
 
   function navigate(page: Page) {

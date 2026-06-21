@@ -1,9 +1,19 @@
 use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
-    AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, RouteRule, Router,
+    AppMatch, AudioBackend, ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend,
+    PluginProbe, RouteRule, Router, StageKind,
 };
 use arctis_config::{Config, EqBandConfig};
+use arctis_domain::{
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
+};
 use std::sync::Arc;
+
+pub use crate::state::MicParam;
 
 /// A reconcile-step descriptor used for pure planning + test assertions before any I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +77,10 @@ pub struct Engine<R: CommandRunner> {
     device: std::sync::Arc<std::sync::Mutex<crate::state::DeviceShared>>,
     /// Sender to the DeviceWorker write-command channel. Set after the worker is spawned.
     device_tx: Option<std::sync::mpsc::Sender<crate::device::DeviceCommand>>,
+    /// Plugin probe for availability detection (injected — default = FsPluginProbe).
+    probe: Box<dyn PluginProbe>,
+    /// Last-reconcile mic stage availability (stored for state() snapshot).
+    mic_availability: Vec<crate::state::StageAvailability>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -80,6 +94,26 @@ impl<R: CommandRunner> Engine<R> {
                 crate::state::DeviceShared::default(),
             )),
             device_tx: None,
+            probe: Box::new(FsPluginProbe),
+            mic_availability: Vec::new(),
+        }
+    }
+
+    /// Test constructor that allows injecting a custom `PluginProbe` for hermetic unit tests.
+    /// All existing `Engine::new(...)` call sites remain unchanged.
+    #[cfg(test)]
+    pub fn with_probe(runner: R, config: Config, probe: Box<dyn PluginProbe>) -> Self {
+        Self {
+            runner,
+            config,
+            children: ChildOwner::new(),
+            event_sink: None,
+            device: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::DeviceShared::default(),
+            )),
+            device_tx: None,
+            probe,
+            mic_availability: Vec::new(),
         }
     }
 
@@ -139,7 +173,9 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&self) -> crate::state::EngineState {
-        use crate::state::{ChannelSnapshot, EngineState, EqBandSnapshot};
+        use crate::state::{
+            ChannelSnapshot, EngineState, EqBandSnapshot, MicSnapshot, MicStageSnapshot, StageName,
+        };
         let active = self.config.active().ok();
         let channels = active
             .map(|p| {
@@ -172,6 +208,124 @@ impl<R: CommandRunner> Engine<R> {
             })
             .unwrap_or_default();
         let dev = self.device.lock().map(|g| g.clone()).unwrap_or_default();
+
+        // Build mic snapshot from active profile config + last reconcile availability.
+        let mic = if let Ok(p) = self.config.active() {
+            let mc = &p.mic;
+
+            // Build a lookup map from stage → available (from last reconcile).
+            let avail_map: std::collections::HashMap<StageName, bool> = self
+                .mic_availability
+                .iter()
+                .map(|a| (a.stage, a.available))
+                .collect();
+
+            // Emit a MicStageSnapshot for each stage (even if not requested).
+            let stages = vec![
+                {
+                    let avail = avail_map.get(&StageName::Gain).copied().unwrap_or(true);
+                    let mut params = std::collections::BTreeMap::new();
+                    if mc.gain.enabled {
+                        params.insert("gain_db".to_string(), mc.gain.gain_db);
+                    }
+                    MicStageSnapshot {
+                        kind: StageName::Gain,
+                        enabled: mc.gain.enabled,
+                        available: avail,
+                        params,
+                    }
+                },
+                {
+                    let avail = avail_map.get(&StageName::Highpass).copied().unwrap_or(true);
+                    let mut params = std::collections::BTreeMap::new();
+                    if mc.highpass.enabled {
+                        params.insert("freq_hz".to_string(), mc.highpass.freq_hz);
+                    }
+                    MicStageSnapshot {
+                        kind: StageName::Highpass,
+                        enabled: mc.highpass.enabled,
+                        available: avail,
+                        params,
+                    }
+                },
+                {
+                    let avail = avail_map.get(&StageName::Rnnoise).copied().unwrap_or(false);
+                    let mut params = std::collections::BTreeMap::new();
+                    if mc.rnnoise.enabled {
+                        params.insert("vad_threshold".to_string(), mc.rnnoise.vad_threshold);
+                        params.insert("vad_grace_ms".to_string(), mc.rnnoise.vad_grace_ms);
+                        params.insert(
+                            "vad_retro_grace_ms".to_string(),
+                            mc.rnnoise.vad_retro_grace_ms,
+                        );
+                    }
+                    MicStageSnapshot {
+                        kind: StageName::Rnnoise,
+                        enabled: mc.rnnoise.enabled,
+                        available: avail,
+                        params,
+                    }
+                },
+                {
+                    let avail = avail_map
+                        .get(&StageName::Compressor)
+                        .copied()
+                        .unwrap_or(false);
+                    let mut params = std::collections::BTreeMap::new();
+                    if mc.compressor.enabled {
+                        params.insert("threshold_db".to_string(), mc.compressor.threshold_db);
+                        params.insert("ratio".to_string(), mc.compressor.ratio);
+                        params.insert("makeup_db".to_string(), mc.compressor.makeup_db);
+                    }
+                    MicStageSnapshot {
+                        kind: StageName::Compressor,
+                        enabled: mc.compressor.enabled,
+                        available: avail,
+                        params,
+                    }
+                },
+                {
+                    let avail = avail_map.get(&StageName::Gate).copied().unwrap_or(true);
+                    let mut params = std::collections::BTreeMap::new();
+                    if mc.gate.enabled {
+                        params.insert("threshold".to_string(), mc.gate.threshold);
+                    }
+                    MicStageSnapshot {
+                        kind: StageName::Gate,
+                        enabled: mc.gate.enabled,
+                        available: avail,
+                        params,
+                    }
+                },
+                {
+                    let avail = avail_map.get(&StageName::MicEq).copied().unwrap_or(true);
+                    MicStageSnapshot {
+                        kind: StageName::MicEq,
+                        enabled: mc.eq_enabled,
+                        available: avail,
+                        params: std::collections::BTreeMap::new(),
+                    }
+                },
+            ];
+            let eq_bands = mc
+                .eq
+                .iter()
+                .map(|b| EqBandSnapshot {
+                    kind: b.kind.clone(),
+                    freq_hz: b.freq_hz,
+                    q: b.q,
+                    gain_db: b.gain_db,
+                })
+                .collect();
+            MicSnapshot {
+                enabled: mc.enabled,
+                stages,
+                eq_bands,
+            }
+        } else {
+            MicSnapshot::default()
+        };
+
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
@@ -179,6 +333,7 @@ impl<R: CommandRunner> Engine<R> {
             routes,
             device_present: dev.present,
             device_fields: dev.fields,
+            mic,
         }
     }
 
@@ -459,6 +614,35 @@ impl<R: CommandRunner> Engine<R> {
             router.save_persistent()?;
         }
 
+        // Step 5: mic source build/teardown (Clean Mic virtual Audio/Source).
+        // Build availability from the probe (disjoint borrow from self.runner).
+        let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+        self.mic_availability = availability;
+
+        if !profile.mic.enabled {
+            // Master switch off: remove the source (idempotent).
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            if let Err(e) = mic_be.remove() {
+                eprintln!("warning: reconcile mic remove failed (ignoring): {e}");
+            }
+        } else {
+            // Master switch on: create (idempotent — no-op if already present).
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            match mic_be.create(&nodes) {
+                Ok(handle) => {
+                    if let Some(token) = handle.child {
+                        self.children.track(token);
+                    }
+                }
+                Err(e) => {
+                    // Transient post-spawn find_node_id race is non-fatal (mirror channel pattern).
+                    eprintln!("warning: reconcile mic create failed (post-spawn race?): {e}");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -467,6 +651,303 @@ impl<R: CommandRunner> Engine<R> {
         self.children
             .kill_all(&mut self.runner)
             .map_err(EngineError::Audio)
+    }
+
+    // ── Mic engine methods ───────────────────────────────────────────────────
+
+    /// Enable or disable a specific mic DSP stage.
+    /// Topology change → full recreate (remove + respawn with new node list).
+    pub fn mic_set_stage_enabled(&mut self, stage: StageKind, on: bool) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            match stage {
+                StageKind::Gain => profile.mic.gain.enabled = on,
+                StageKind::Highpass => profile.mic.highpass.enabled = on,
+                StageKind::Rnnoise => profile.mic.rnnoise.enabled = on,
+                StageKind::Compressor => profile.mic.compressor.enabled = on,
+                StageKind::Gate => profile.mic.gate.enabled = on,
+                StageKind::MicEq => profile.mic.eq_enabled = on,
+            }
+        }
+        self.save_config()?;
+
+        // Only perform live graph I/O when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
+            let profile = self.config.active()?.clone();
+            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let handle = mic_be.recreate(&nodes)?;
+            if let Some(token) = handle.child {
+                self.children.track(token);
+            }
+        }
+
+        self.emit(Event::MicStageSet {
+            stage: crate::state::StageName::from(stage),
+            enabled: on,
+        });
+        Ok(())
+    }
+
+    /// Set a single mic DSP parameter live (in-place via `apply_control`).
+    /// Validates range against domain bounds; errors on out-of-range.
+    pub fn mic_set_param(&mut self, param: MicParam, value: f32) -> Result<(), EngineError> {
+        // Validate and mutate config
+        let control_name: &'static str;
+        let node_name: &'static str;
+        {
+            let engine_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&engine_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    engine_name.clone(),
+                ))
+            })?;
+            let mic = &mut profile.mic;
+            match param {
+                MicParam::GainDb => {
+                    if !(MIC_GAIN_MIN_DB..=MIC_GAIN_MAX_DB).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "gain_db {value} out of range {MIC_GAIN_MIN_DB}..={MIC_GAIN_MAX_DB}"
+                        )));
+                    }
+                    mic.gain.gain_db = value;
+                    node_name = "mic_gain";
+                    control_name = "Mult";
+                }
+                MicParam::HighpassFreq => {
+                    if !(MIC_HIGHPASS_MIN_HZ..=MIC_HIGHPASS_MAX_HZ).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "highpass_freq {value} Hz out of range {MIC_HIGHPASS_MIN_HZ}..={MIC_HIGHPASS_MAX_HZ}"
+                        )));
+                    }
+                    mic.highpass.freq_hz = value;
+                    node_name = "mic_highpass";
+                    control_name = "Freq";
+                }
+                MicParam::VadThreshold => {
+                    if !(MIC_VAD_THRESHOLD_MIN..=MIC_VAD_THRESHOLD_MAX).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "vad_threshold {value} out of range {MIC_VAD_THRESHOLD_MIN}..={MIC_VAD_THRESHOLD_MAX}"
+                        )));
+                    }
+                    mic.rnnoise.vad_threshold = value;
+                    node_name = "mic_rnnoise";
+                    control_name = "VAD Threshold (%)";
+                }
+                MicParam::VadGraceMs => {
+                    if !(MIC_VAD_GRACE_MIN_MS..=MIC_VAD_GRACE_MAX_MS).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "vad_grace_ms {value} ms out of range {MIC_VAD_GRACE_MIN_MS}..={MIC_VAD_GRACE_MAX_MS}"
+                        )));
+                    }
+                    mic.rnnoise.vad_grace_ms = value;
+                    node_name = "mic_rnnoise";
+                    control_name = "VAD Grace Period (ms)";
+                }
+                MicParam::VadRetroGraceMs => {
+                    if !(MIC_VAD_RETRO_GRACE_MIN_MS..=MIC_VAD_RETRO_GRACE_MAX_MS).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "vad_retro_grace_ms {value} ms out of range {MIC_VAD_RETRO_GRACE_MIN_MS}..={MIC_VAD_RETRO_GRACE_MAX_MS}"
+                        )));
+                    }
+                    mic.rnnoise.vad_retro_grace_ms = value;
+                    node_name = "mic_rnnoise";
+                    control_name = "Retroactive VAD Grace (ms)";
+                }
+                MicParam::GateThreshold => {
+                    if !(MIC_GATE_THRESHOLD_MIN..=MIC_GATE_THRESHOLD_MAX).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "gate_threshold {value} out of range {MIC_GATE_THRESHOLD_MIN}..={MIC_GATE_THRESHOLD_MAX}"
+                        )));
+                    }
+                    mic.gate.threshold = value;
+                    node_name = "mic_gate";
+                    control_name = "Threshold";
+                }
+                MicParam::CompThresholdDb => {
+                    if !(MIC_COMP_THRESHOLD_MIN_DB..=MIC_COMP_THRESHOLD_MAX_DB).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "comp_threshold_db {value} dB out of range {MIC_COMP_THRESHOLD_MIN_DB}..={MIC_COMP_THRESHOLD_MAX_DB}"
+                        )));
+                    }
+                    mic.compressor.threshold_db = value;
+                    node_name = "mic_compressor";
+                    control_name = "Threshold level (dB)";
+                }
+                MicParam::CompRatio => {
+                    if !(MIC_COMP_RATIO_MIN..=MIC_COMP_RATIO_MAX).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "comp_ratio {value} out of range {MIC_COMP_RATIO_MIN}..={MIC_COMP_RATIO_MAX}"
+                        )));
+                    }
+                    mic.compressor.ratio = value;
+                    node_name = "mic_compressor";
+                    control_name = "Ratio (1:n)";
+                }
+                MicParam::CompMakeupDb => {
+                    if !(MIC_COMP_MAKEUP_MIN_DB..=MIC_COMP_MAKEUP_MAX_DB).contains(&value) {
+                        return Err(EngineError::BadRequest(format!(
+                            "comp_makeup_db {value} dB out of range {MIC_COMP_MAKEUP_MIN_DB}..={MIC_COMP_MAKEUP_MAX_DB}"
+                        )));
+                    }
+                    mic.compressor.makeup_db = value;
+                    node_name = "mic_compressor";
+                    control_name = "Makeup gain (dB)";
+                }
+            }
+        }
+        self.save_config()?;
+
+        // Only perform live apply_control when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
+            // Apply live: use MicBackend::apply_control.
+            // For the gain stage, value needs to be converted to linear.
+            let apply_value = if param == MicParam::GainDb {
+                convert::db_to_linear(value)
+            } else {
+                value
+            };
+            let profile = self.config.active()?.clone();
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            if let Err(e) = mic_be.apply_control(node_name, control_name, apply_value) {
+                eprintln!("warning: mic_set_param apply_control failed (post-spawn race?): {e}");
+            }
+        }
+
+        self.emit(Event::MicParamSet { param, value });
+        Ok(())
+    }
+
+    /// Set a single mic EQ band live via `apply_control` (no restart).
+    pub fn mic_set_eq_band(&mut self, band: usize, cfg: EqBandConfig) -> Result<(), EngineError> {
+        // Validate band
+        let eq_band = convert::eq_band_from_cfg(&cfg)?;
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            while profile.mic.eq.len() <= band {
+                profile.mic.eq.push(EqBandConfig {
+                    kind: "peaking".to_string(),
+                    freq_hz: 1000.0,
+                    q: 1.0,
+                    gain_db: 0.0,
+                });
+            }
+            profile.mic.eq[band] = cfg.clone();
+        }
+        self.save_config()?;
+
+        // Only perform live apply_control when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        if self.config.active()?.mic.enabled {
+            let profile = self.config.active()?.clone();
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let node_name = convert::mic_eq_band_node_name(band);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            if let Err(e) = mic_be.apply_control(&node_name, "Freq", eq_band.freq_hz) {
+                eprintln!("warning: mic_set_eq_band Freq apply_control failed: {e}");
+            }
+            if let Err(e) = mic_be.apply_control(&node_name, "Q", eq_band.q) {
+                eprintln!("warning: mic_set_eq_band Q apply_control failed: {e}");
+            }
+            if let Err(e) = mic_be.apply_control(&node_name, "Gain", eq_band.gain_db) {
+                eprintln!("warning: mic_set_eq_band Gain apply_control failed: {e}");
+            }
+        }
+
+        self.emit(Event::MicEqBandSet { band });
+        Ok(())
+    }
+
+    /// Enable or disable the whole mic chain (master switch). Builds the Clean Mic
+    /// source when enabling, removes it when disabling. Persists + emits.
+    pub fn mic_set_enabled(&mut self, on: bool) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            profile.mic.enabled = on;
+        }
+        self.save_config()?;
+
+        // Apply: mirror reconcile step5 create/remove logic exactly.
+        {
+            let profile = self.config.active()?.clone();
+            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            if on {
+                match mic_be.create(&nodes) {
+                    Ok(handle) => {
+                        if let Some(token) = handle.child {
+                            self.children.track(token);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: mic_set_enabled create failed (post-spawn race?): {e}");
+                    }
+                }
+            } else {
+                if let Err(e) = mic_be.remove() {
+                    eprintln!("warning: mic_set_enabled remove failed (ignoring): {e}");
+                }
+            }
+        }
+
+        self.emit(Event::MicEnabledSet { enabled: on });
+        Ok(())
+    }
+
+    /// Set (or clear) the hardware mic capture target.
+    /// Capture target change → full recreate.
+    pub fn mic_set_hw_mic(&mut self, hw_mic: Option<String>) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            profile.mic.hw_mic = hw_mic;
+        }
+        self.save_config()?;
+
+        // Only perform live graph I/O (recreate) when the master switch is on.
+        // When off, the persisted config change takes effect the next time
+        // mic_set_enabled(true) or reconcile() builds the chain.
+        let hw_mic_snapshot = self.config.active()?.mic.hw_mic.clone();
+        if self.config.active()?.mic.enabled {
+            let profile = self.config.active()?.clone();
+            let (nodes, availability) = convert::mic_chain_nodes(&profile.mic, self.probe.as_ref());
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, FsPluginProbe, spec);
+            let handle = mic_be.recreate(&nodes)?;
+            if let Some(token) = handle.child {
+                self.children.track(token);
+            }
+        }
+        self.emit(Event::MicHwMicSet {
+            hw_mic: hw_mic_snapshot,
+        });
+        Ok(())
     }
 }
 
@@ -480,7 +961,7 @@ impl<R: CommandRunner> Drop for Engine<R> {
 mod tests {
     use super::*;
     use arctis_audio::MockRunner;
-    use arctis_config::{ChannelConfig, Config, Profile, RouteConfig};
+    use arctis_config::{ChannelConfig, Config, MicChainConfig, Profile, RouteConfig};
 
     /// Global mutex to serialize tests that mutate process-wide env vars (HOME, ASM_CONFIG_HOME).
     /// Tests setting those variables MUST hold this lock for their entire lifetime.
@@ -521,6 +1002,7 @@ mod tests {
                     },
                 ],
                 routes: vec![],
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -559,6 +1041,7 @@ mod tests {
                     app_binary: "firefox".into(),
                     target_sink: "Arctis_Media".into(),
                 }],
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -699,7 +1182,9 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", "");
+            .with_output(0, "", "")
+            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -736,8 +1221,8 @@ mod tests {
             "media eq find_node_id"
         );
 
-        // Total: 3 (up) + 3*(1+10) (apply) = 36
-        assert_eq!(calls.len(), 36, "expected 36 total pw-cli calls");
+        // Total: 3 (up) + 3*(1+10) (apply) + 1 (mic step5 source_exists) = 37
+        assert_eq!(calls.len(), 37, "expected 37 total pw-cli calls");
 
         // No spawned processes (sinks already present)
         assert!(
@@ -793,7 +1278,9 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", ""); // media 10 band sets
+            .with_output(0, "", "") // media 10 band sets
+            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -830,14 +1317,14 @@ mod tests {
             "media eq find_node_id"
         );
 
-        // Total: 3 (phase1 ls) + 3*11 (apply) = 36
+        // Total: 3 (phase1 ls) + 3*11 (apply) + 1 (mic step5 source_exists) = 37
         assert_eq!(
             calls.len(),
-            36,
-            "expected 36 total run calls (no spawns in calls)"
+            37,
+            "expected 37 total run calls (no spawns in calls)"
         );
 
-        // spawn_owned goes into `spawned` — 3 pipewire -c invocations
+        // spawn_owned goes into `spawned` — 3 pipewire -c invocations (channels only)
         let spawned = &engine.runner.spawned;
         assert_eq!(spawned.len(), 3, "3 pipewire -c instances spawned_owned");
         assert_eq!(spawned[0][0], "pipewire", "game spawn program");
@@ -901,7 +1388,9 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", "");
+            .with_output(0, "", "")
+            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls, "");
         // Phase 4: Router::save_persistent writes files — no runner calls.
 
         // Use a temp HOME so we don't touch real WirePlumber config.
@@ -945,6 +1434,7 @@ mod tests {
                     app_binary: "firefox".into(),
                     target_sink: "Arctis_Media".into(),
                 }],
+                mic: MicChainConfig::default(),
             }],
         };
         let mut engine = Engine::new(runner, simple_cfg);
@@ -1014,7 +1504,9 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", "");
+            .with_output(0, "", "")
+            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+            .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1054,6 +1546,7 @@ mod tests {
 
         // Phase 1: 3 ls-absent → spawn_owned per channel (tokens tracked)
         // Phase 2: 3 ls-absent for find_node_id → apply_all errors → non-fatal warn
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
         let runner = MockRunner::new()
             // Phase 1 ls checks (absent → spawns)
             .with_output(0, &ls_absent, "")
@@ -1062,7 +1555,9 @@ mod tests {
             // Phase 2: find_node_id for each channel — node absent → Parse error
             .with_output(0, &ls_absent, "") // game
             .with_output(0, &ls_absent, "") // chat
-            .with_output(0, &ls_absent, ""); // media
+            .with_output(0, &ls_absent, "") // media
+            // Phase 5: mic source_exists check
+            .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1083,11 +1578,11 @@ mod tests {
         // 3 tracked tokens
         assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
 
-        // 6 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id; no band sets since apply_all errored)
+        // 7 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 1 (mic step5 source_exists)
         assert_eq!(
             engine.runner.calls.len(),
-            6,
-            "expected 6 run calls: 3 ls-up + 3 ls-find-node (no band sets after find fails)"
+            7,
+            "expected 7 run calls: 3 ls-up + 3 ls-find-node + 1 mic source_exists"
         );
     }
 
@@ -1111,6 +1606,8 @@ mod tests {
                     runner = runner.with_output(0, "", "");
                 }
             }
+            // Phase 5: mic disabled → remove() → source_exists() → 1 ls
+            runner = runner.with_output(0, &ls, "");
         }
 
         let cfg = make_config_no_eq_no_routes();
@@ -1144,9 +1641,13 @@ mod tests {
     }
 
     /// Queue enough MockRunner outputs to survive `reconcile()` on a 3-channel,
-    /// no-EQ, no-routes config where all sinks are already present.
+    /// no-EQ, no-routes config where all sinks are already present AND mic disabled.
+    ///
+    /// Step 5 (mic): mic disabled → MicBackend::remove() → source_exists() → 1 ls Node
+    /// returning the "no mic" output (source absent, remove returns immediately).
     fn queue_reconcile_present(runner: MockRunner) -> MockRunner {
         let ls = ls_all_present();
+        let ls_no_mic = ls_all_present(); // "present" for channels but no mic node
         let mut r = runner;
         // Phase 1: 3 ls (all present)
         for _ in 0..3 {
@@ -1159,6 +1660,8 @@ mod tests {
                 r = r.with_output(0, "", "");
             }
         }
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node found)
+        r = r.with_output(0, &ls_no_mic, "");
         r
     }
 
@@ -1202,6 +1705,7 @@ mod tests {
                 },
             ],
             routes: vec![],
+            mic: MicChainConfig::default(),
         });
 
         // Use a temp ASM_CONFIG_HOME so we don't touch real config.
@@ -1384,6 +1888,7 @@ mod tests {
                     },
                 ],
                 routes: vec![],
+                mic: MicChainConfig::default(),
             }],
         }
     }
@@ -1754,5 +2259,646 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_home);
         std::env::remove_var("ASM_CONFIG_HOME");
         std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 4 TDD: mic source reconcile + engine methods
+    // ─────────────────────────────────────────────
+
+    use crate::engine::MicParam;
+    use arctis_audio::MockPluginProbe;
+
+    /// LS Node output containing the arctis_clean_mic source.
+    fn ls_with_mic() -> String {
+        [
+            "id 40, type PipeWire:Interface:Node/3\n    node.name = \"alsa_output.pci\"\n",
+            "id 71, type PipeWire:Interface:Node/3\n    node.name = \"arctis_clean_mic\"\n",
+            "id 72, type PipeWire:Interface:Node/3\n    node.name = \"arctis_clean_mic.capture\"\n",
+        ]
+        .concat()
+    }
+
+    /// LS Node output with NO mic node.
+    fn ls_without_mic() -> String {
+        "id 40, type PipeWire:Interface:Node/3\n    node.name = \"alsa_output.pci\"\n".to_string()
+    }
+
+    /// Build a MicChainConfig with master switch enabled but all stages off (clean passthrough).
+    fn mic_enabled_passthrough() -> arctis_config::MicChainConfig {
+        arctis_config::MicChainConfig {
+            enabled: true,
+            hw_mic: Some("alsa_input.hw_mic".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Build a 3-channel config with mic enabled passthrough (no stages).
+    fn make_config_mic_enabled() -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                ],
+                routes: vec![],
+                mic: mic_enabled_passthrough(),
+            }],
+        }
+    }
+
+    /// Queue outputs for a 3-channel reconcile with mic DISABLED.
+    fn queue_reconcile_with_mic_disabled(runner: MockRunner) -> MockRunner {
+        queue_reconcile_present(runner)
+    }
+
+    /// Queue outputs for a 3-channel reconcile with mic ENABLED and source absent.
+    /// Step5: create() → source_exists() (1 ls, absent) → spawn (goes to spawned)
+    fn queue_reconcile_with_mic_enabled_absent(runner: MockRunner) -> MockRunner {
+        let ls = ls_all_present();
+        let ls_mic_absent = ls_without_mic();
+        let mut r = runner;
+        // Phase 1: 3 ls (all present)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+        }
+        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+            for _ in 0..10 {
+                r = r.with_output(0, "", "");
+            }
+        }
+        // Phase 5: mic enabled → create() → source_exists() (absent) → spawn
+        r = r.with_output(0, &ls_mic_absent, "");
+        r
+    }
+
+    /// Test 1: reconcile with mic disabled calls MicBackend::remove() (source_exists only, no spawn).
+    #[test]
+    fn reconcile_passthrough_when_mic_disabled_removes_source() {
+        let ls = ls_all_present();
+        let ls_no_mic = ls_without_mic();
+
+        let runner = queue_reconcile_with_mic_disabled(MockRunner::new());
+        let cfg = make_config_no_eq_no_routes(); // mic.enabled = false by default
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // Verify step5 ran: last call is ls Node (source_exists check by remove())
+        let calls = &engine.runner.calls;
+        let last = calls.last().expect("at least one call");
+        assert_eq!(
+            last,
+            &vec!["pw-cli", "ls", "Node"],
+            "last call must be mic source_exists ls"
+        );
+
+        // No mic spawn (mic disabled → remove path, source absent → no destroy either)
+        // spawned is only channel sinks (none in this case since sinks are "present")
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "no spawns when mic is disabled and channels are present"
+        );
+
+        let _ = &ls;
+        let _ = &ls_no_mic; // suppress warnings
+    }
+
+    /// Test 2: reconcile with mic enabled (passthrough) → spawns arctis_clean_mic.conf.
+    #[test]
+    fn reconcile_builds_clean_mic_when_enabled() {
+        let ls_mic_absent = ls_without_mic();
+
+        // Queue outputs for mic-enabled reconcile
+        let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
+        let cfg = make_config_mic_enabled();
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+
+        // Count spawns before reconcile (channels absent → 3 channel spawns if absent)
+        // Since channels ARE "present" (queue_reconcile_with_mic_enabled_absent uses ls_all_present),
+        // only the mic spawn occurs.
+        engine.reconcile().expect("reconcile should succeed");
+
+        let spawned = &engine.runner.spawned;
+        // The mic source should be spawned
+        assert!(
+            spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "expected a spawn of arctis_clean_mic.conf, got: {spawned:?}"
+        );
+        // children tracks exactly the mic token (channels were already present → no channel tokens)
+        assert_eq!(engine.children.len(), 1, "only the mic source token");
+
+        let _ = &ls_mic_absent;
+    }
+
+    /// Test 3: rnnoise enabled but probe returns none → spawn still fires (chain minus rnnoise);
+    ///         state marks rnnoise unavailable.
+    #[test]
+    fn reconcile_drops_unavailable_rnnoise_but_still_builds() {
+        let mut cfg = make_config_mic_enabled();
+        // Enable rnnoise in config
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+
+        // Queue for mic-enabled absent reconcile (rnnoise probe is none → dropped from chain)
+        let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // Spawn still fires (chain has passthrough fallback)
+        let spawned = &engine.runner.spawned;
+        assert!(
+            spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "spawn must fire even when rnnoise is unavailable"
+        );
+
+        // state reports rnnoise unavailable
+        let state = engine.state();
+        let rnnoise_stage = state
+            .mic
+            .stages
+            .iter()
+            .find(|s| s.kind == crate::state::StageName::Rnnoise);
+        let s = rnnoise_stage.expect("rnnoise must appear in stages");
+        assert!(!s.available, "rnnoise must be marked unavailable");
+        assert!(s.enabled, "rnnoise must show as enabled in config");
+    }
+
+    /// Test 4: mic_set_stage_enabled → persists config + recreates (remove + spawn observed).
+    #[test]
+    fn mic_set_stage_enabled_recreates_and_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_stage_set");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_mic_enabled();
+        cfg.profiles[0].mic.gain.enabled = false; // start with gain OFF
+
+        // Queue for mic_set_stage_enabled(Gain, true):
+        //   recreate() = remove() + create()
+        //   remove(): source_exists() (1 ls, WITH mic) + find_node_id (1 ls) + destroy (1) + pkill (1) = 4 calls
+        //   create(): source_exists() (1 ls, absent after remove) + spawn = 1 call
+        let ls_with_mic = ls_with_mic();
+        let ls_absent = ls_without_mic();
+
+        let runner = MockRunner::new()
+            // remove: source_exists (present)
+            .with_output(0, &ls_with_mic, "")
+            // remove: find_node_id
+            .with_output(0, &ls_with_mic, "")
+            // remove: pw-cli destroy 71
+            .with_output(0, "", "")
+            // remove: pkill -f <conf>
+            .with_output(0, "", "")
+            // create: source_exists (absent after remove)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_stage_enabled(StageKind::Gain, true)
+            .expect("mic_set_stage_enabled should succeed");
+
+        // Config persisted to disk
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        // After reload, gain should be enabled (check raw TOML string)
+        assert!(
+            saved_str.contains("enabled = true"),
+            "persisted config must show gain enabled (enabled = true present)"
+        );
+
+        // remove was called (destroy present) and create spawned new conf
+        let calls = &engine.runner.calls;
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.len() >= 3 && c[0] == "pw-cli" && c[1] == "destroy"),
+            "destroy must be called during recreate"
+        );
+        let spawned = &engine.runner.spawned;
+        assert!(
+            spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "create must spawn arctis_clean_mic.conf after remove"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 5: mic_set_param emits exact pw-cli s <id> Props argv for VAD threshold.
+    #[test]
+    fn mic_set_param_emits_exact_props() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_param_set");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_mic_enabled();
+        cfg.profiles[0].mic.rnnoise.enabled = true;
+        cfg.profiles[0].mic.rnnoise.vad_threshold = 40.0;
+
+        let ls_with_mic = ls_with_mic();
+
+        // mic_set_param(VadThreshold, 55.0):
+        //   apply_control("mic_rnnoise", "VAD Threshold (%)", 55.0)
+        //   → find_node_id (1 ls) + pw-cli s 71 Props … (1 call)
+        let runner = MockRunner::new()
+            .with_output(0, &ls_with_mic, "") // find_node_id
+            .with_output(0, "", ""); // set Props
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_param(MicParam::VadThreshold, 55.0)
+            .expect("mic_set_param should succeed");
+
+        let calls = &engine.runner.calls;
+        // Last call should be: pw-cli s 71 Props { params = [ "mic_rnnoise:VAD Threshold (%)" 55.0 ] }
+        let last = calls.last().expect("at least one call");
+        assert_eq!(last[0], "pw-cli");
+        assert_eq!(last[1], "s");
+        assert_eq!(last[2], "71", "node id must be 71 (from ls fixture)");
+        assert_eq!(last[3], "Props");
+        assert_eq!(
+            last[4], "{ params = [ \"mic_rnnoise:VAD Threshold (%)\" 55.0 ] }",
+            "Props JSON must exactly match"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 6: shutdown kills the mic source token too.
+    #[test]
+    fn shutdown_kills_mic_source_too() {
+        let ls_absent = ls_without_mic();
+
+        // Reconcile with mic enabled and absent → spawn (mic token tracked in children)
+        let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
+        let cfg = make_config_mic_enabled();
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.reconcile().expect("reconcile should succeed");
+
+        // channels are present so only the mic spawn occurs
+        let initial_children = engine.children.len();
+        assert!(initial_children >= 1, "at least mic child tracked");
+
+        let initial_spawned = engine.runner.spawned.len();
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "mic must have been spawned"
+        );
+
+        // Shutdown kills all including the mic token
+        engine.shutdown().expect("shutdown should succeed");
+
+        assert_eq!(
+            engine.runner.killed.len(),
+            initial_spawned,
+            "shutdown must kill all spawned processes including mic source"
+        );
+        assert_eq!(
+            engine.children.len(),
+            0,
+            "children must be empty after shutdown"
+        );
+
+        let _ = &ls_absent;
+    }
+
+    /// Test 7: state().mic.stages reports rnnoise unavailable when probe is missing.
+    #[test]
+    fn state_reports_mic_stage_availability() {
+        let mut cfg = make_config_mic_enabled();
+        cfg.profiles[0].mic.rnnoise.enabled = true; // request rnnoise
+
+        // Queue for reconcile with mic enabled, rnnoise probe absent → rnnoise dropped
+        let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.reconcile().expect("reconcile should succeed");
+
+        let state = engine.state();
+        assert!(state.mic.enabled, "mic must show enabled");
+
+        let rnnoise = state
+            .mic
+            .stages
+            .iter()
+            .find(|s| s.kind == crate::state::StageName::Rnnoise)
+            .expect("rnnoise stage must be in state");
+
+        assert!(rnnoise.enabled, "rnnoise enabled in config");
+        assert!(
+            !rnnoise.available,
+            "rnnoise must be unavailable (probe returns false)"
+        );
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 5b TDD: mic_set_enabled (master switch)
+    // ─────────────────────────────────────────────
+
+    /// Build a 3-channel config with mic master switch DISABLED (default).
+    fn make_config_mic_disabled() -> Config {
+        Config {
+            version: arctis_config::CURRENT_VERSION,
+            active_profile: "default".into(),
+            profiles: vec![Profile {
+                name: "default".into(),
+                channels: vec![
+                    ChannelConfig {
+                        id: "game".into(),
+                        node_name: "Arctis_Game".into(),
+                        description: "Game".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "chat".into(),
+                        node_name: "Arctis_Chat".into(),
+                        description: "Chat".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                    ChannelConfig {
+                        id: "media".into(),
+                        node_name: "Arctis_Media".into(),
+                        description: "Media".into(),
+                        output_device: None,
+                        eq: vec![],
+                    },
+                ],
+                routes: vec![],
+                mic: arctis_config::MicChainConfig {
+                    enabled: false,
+                    hw_mic: Some("alsa_input.hw_mic".to_string()),
+                    ..Default::default()
+                },
+            }],
+        }
+    }
+
+    /// Test 5b-1: mic_set_enabled(true) from master-off spawns the mic source and persists.
+    #[test]
+    fn mic_set_enabled_true_builds_source_and_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_true");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_disabled(); // mic.enabled = false
+
+        // mic_set_enabled(true) → create():
+        //   source_exists() (1 ls, absent) → spawn
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_enabled(true)
+            .expect("mic_set_enabled(true) should succeed");
+
+        // Config persisted to disk with mic.enabled = true
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("enabled = true"),
+            "persisted config must show mic.enabled = true"
+        );
+
+        // Reload and confirm
+        let reloaded = arctis_config::store::load().expect("reload must succeed");
+        assert!(
+            reloaded
+                .active()
+                .expect("active profile must exist")
+                .mic
+                .enabled,
+            "reloaded config must show mic.enabled = true"
+        );
+
+        // Mic source was spawned
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.ends_with("arctis_clean_mic.conf"))
+                .unwrap_or(false)),
+            "mic source must be spawned when enabling"
+        );
+        // One child tracked
+        assert_eq!(engine.children.len(), 1, "one mic child must be tracked");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 5b-2: mic_set_enabled(false) from master-on takes the remove path.
+    #[test]
+    fn mic_set_enabled_false_removes_source() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_false");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled(); // mic.enabled = true
+
+        // mic_set_enabled(false) → remove():
+        //   source_exists() (1 ls, absent, so no destroy needed)
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine
+            .mic_set_enabled(false)
+            .expect("mic_set_enabled(false) should succeed");
+
+        // Config persisted with mic.enabled = false
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+
+        // No spawn (remove path, source already absent)
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "no spawn on disable when source already absent"
+        );
+        assert_eq!(engine.children.len(), 0, "no child tracked on disable");
+
+        // Reload and confirm
+        let reloaded = arctis_config::store::load().expect("reload must succeed");
+        assert!(
+            !reloaded
+                .active()
+                .expect("active profile must exist")
+                .mic
+                .enabled,
+            "reloaded config must show mic.enabled = false"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Fix 2+3 test A: mic_set_stage_enabled while master is OFF → config persisted, no spawn,
+    /// children unchanged, event emitted.
+    #[test]
+    fn mic_set_stage_enabled_when_master_off_persists_only_no_spawn() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("stage_master_off");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Master switch is OFF; gain stage starts OFF.
+        let cfg = make_config_mic_disabled();
+
+        // No runner outputs needed — master off path skips all graph I/O.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine =
+            Engine::with_probe(MockRunner::new(), cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_stage_enabled(StageKind::Gain, true)
+            .expect("mic_set_stage_enabled should succeed when master is off");
+
+        // Config persisted with gain.enabled = true
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("enabled = true"),
+            "persisted config must show gain enabled"
+        );
+
+        // No spawn: master off → no recreate
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "no spawn when master is off"
+        );
+        // No graph I/O calls (no pw-cli destroy / no create ls)
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no pw-cli calls when master is off"
+        );
+        // No child tokens tracked
+        assert_eq!(engine.children.len(), 0, "no children when master is off");
+
+        // Event must still be emitted
+        let event = rx.try_recv().expect("MicStageSet event must be emitted");
+        assert_eq!(
+            event,
+            crate::state::Event::MicStageSet {
+                stage: crate::state::StageName::Gain,
+                enabled: true,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Fix 2+3 test B: mic_set_param while master is OFF → config persisted, no pw-cli s Props call,
+    /// event emitted.
+    #[test]
+    fn mic_set_param_when_master_off_persists_only_no_props() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("param_master_off");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_mic_disabled(); // master off
+        cfg.profiles[0].mic.highpass.enabled = true;
+        cfg.profiles[0].mic.highpass.freq_hz = 80.0;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine =
+            Engine::with_probe(MockRunner::new(), cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_param(MicParam::HighpassFreq, 120.0)
+            .expect("mic_set_param should succeed when master is off");
+
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config.toml must be written");
+
+        // No pw-cli s ... Props call
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no pw-cli calls (no apply_control) when master is off"
+        );
+
+        // Event must still be emitted
+        let event = rx.try_recv().expect("MicParamSet event must be emitted");
+        assert_eq!(
+            event,
+            crate::state::Event::MicParamSet {
+                param: MicParam::HighpassFreq,
+                value: 120.0,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Test 5b-3: mic_set_enabled emits Event::MicEnabledSet.
+    #[test]
+    fn mic_set_enabled_emits_event() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_set_enabled_event");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_disabled();
+
+        let ls_absent = ls_without_mic();
+        let runner = MockRunner::new().with_output(0, &ls_absent, "");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.set_event_sink(tx);
+
+        engine
+            .mic_set_enabled(true)
+            .expect("mic_set_enabled should succeed");
+
+        let event = rx.try_recv().expect("MicEnabledSet event must be sent");
+        assert_eq!(
+            event,
+            crate::state::Event::MicEnabledSet { enabled: true },
+            "event must be MicEnabledSet {{ enabled: true }}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
