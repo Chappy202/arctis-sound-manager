@@ -71,9 +71,10 @@ pub fn db_to_linear(db: f32) -> f32 {
 
 /// Build the `ChainSpec` for the Clean Mic virtual source.
 ///
-/// node_name = `arctis_clean_mic`, capture target = `cfg.hw_mic`, mono,
-/// both media classes = `Audio/Source` (capture side binds the hw mic, playback
-/// side exposes the virtual source).
+/// node_name = `arctis_clean_mic`, capture target = `cfg.hw_mic`, mono.
+/// capture.props gets `node.passive = true` + `target.object` (when pinned) and
+/// no `media.class`; playback.props gets `media.class = Audio/Source` to expose
+/// the virtual source to applications.
 pub fn mic_chain_spec(cfg: &MicChainConfig) -> ChainSpec {
     ChainSpec {
         node_name: "arctis_clean_mic".to_string(),

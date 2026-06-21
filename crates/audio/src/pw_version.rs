@@ -24,7 +24,11 @@ use crate::runner::CommandRunner;
 pub fn parse_pw_version(output: &str) -> Option<(u32, u32, u32)> {
     for line in output.lines() {
         // Find "libpipewire" on the line, then grab the next whitespace-separated token.
-        let idx = line.find("libpipewire")?;
+        // Use `continue` (not `?`) so lines that lack the token are skipped rather than
+        // causing the whole function to return None immediately.
+        let Some(idx) = line.find("libpipewire") else {
+            continue;
+        };
         let after = line[idx + "libpipewire".len()..].trim_start();
         // The version string is the first space-delimited token (stops at space or end).
         let version_str = after.split_whitespace().next()?;
@@ -107,6 +111,21 @@ mod tests {
     #[test]
     fn parse_version_empty_returns_none() {
         assert_eq!(parse_pw_version(""), None);
+    }
+
+    #[test]
+    fn parse_version_leading_header_line_still_parses() {
+        // Real `pipewire --version` output often has a leading non-matching header line.
+        // The parser must skip it and still find the libpipewire line.
+        let out = "pipewire\nCompiled with libpipewire 1.4.11\n";
+        assert_eq!(parse_pw_version(out), Some((1, 4, 11)));
+    }
+
+    #[test]
+    fn parse_version_random_header_then_using_line() {
+        // Alternate format: "Using libpipewire X.Y.Z (or newer)" with an unrelated first line.
+        let out = "random header\nUsing libpipewire 1.6.7 (or newer)\n";
+        assert_eq!(parse_pw_version(out), Some((1, 6, 7)));
     }
 
     // ── supports_builtin_noisegate ─────────────────────────────────────────────
