@@ -375,7 +375,7 @@ id 40, type PipeWire:Interface:Node/3
         }]
     }
 
-    fn full_nodes_with_rnnoise() -> Vec<FilterNode> {
+    fn full_nodes_with_suppression() -> Vec<FilterNode> {
         vec![
             FilterNode {
                 name: "mic_gain".into(),
@@ -441,7 +441,7 @@ id 40, type PipeWire:Interface:Node/3
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_MIC, "");
         let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
         let mut be = MicBackend::new(runner, probe, mic_spec());
-        let handle = be.create(&full_nodes_with_rnnoise()).unwrap();
+        let handle = be.create(&full_nodes_with_suppression()).unwrap();
 
         let spawned = &be.runner().spawned;
         assert_eq!(spawned.len(), 1);

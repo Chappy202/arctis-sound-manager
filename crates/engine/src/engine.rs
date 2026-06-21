@@ -2570,6 +2570,8 @@ mod tests {
         // Queue for mic-enabled absent reconcile (deepfilter probe is none → dropped from chain)
         let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
         let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         // Spawn still fires (chain has passthrough fallback)
@@ -2754,6 +2756,8 @@ mod tests {
         // Queue for reconcile with mic enabled, deepfilter probe absent → suppression dropped
         let runner = queue_reconcile_with_mic_enabled_absent(MockRunner::new());
         let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        // Pre-seed pw_version so ensure_pw_version() is a no-op (no extra runner call).
+        engine.seed_pw_version((1, 6, 0));
         engine.reconcile().expect("reconcile should succeed");
 
         let state = engine.state();
