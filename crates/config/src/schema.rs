@@ -249,6 +249,46 @@ pub struct RouteConfig {
     pub target_sink: String,
 }
 
+// ── Surround / HRIR config ────────────────────────────────────────────────────
+
+fn default_surround_channels() -> Vec<String> {
+    vec!["game".into(), "media".into()]
+}
+
+/// Per-profile virtual-surround (HRIR) configuration.
+/// Default = **disabled** — no surround processing, passthrough to hardware sink.
+/// Old configs lacking a `[surround]` block deserialize cleanly to the default
+/// via `#[serde(default)]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurroundConfig {
+    /// Master switch. false => no surround sink is spawned. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// HRIR profile stem (bare filename without `.wav`), e.g. `"00-default-asm"`.
+    /// None = first available profile lexicographically. Engine resolves to abs path.
+    #[serde(default)]
+    pub hrir: Option<String>,
+    /// Channel ids whose output is routed through the surround sink.
+    /// Defaults to `["game", "media"]`. Chat bypasses surround by default.
+    #[serde(default = "default_surround_channels")]
+    pub channels: Vec<String>,
+    /// Pinned hardware sink node.name for the surround output tail.
+    /// None = follow the Arctis hardware sink discovered at runtime.
+    #[serde(default)]
+    pub hw_sink: Option<String>,
+}
+
+impl Default for SurroundConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hrir: None,
+            channels: default_surround_channels(),
+            hw_sink: None,
+        }
+    }
+}
+
 /// Named collection of channel configs and routing rules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
@@ -260,6 +300,10 @@ pub struct Profile {
     /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
     #[serde(default)]
     pub mic: MicChainConfig,
+    /// Virtual-surround (HRIR) config. Defaults to disabled.
+    /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub surround: SurroundConfig,
 }
 
 /// Root configuration object. Versioned for forward-compatibility checking.
@@ -306,6 +350,7 @@ impl Config {
                 channels,
                 routes: Vec::new(),
                 mic: MicChainConfig::default(),
+                surround: SurroundConfig::default(),
             }],
         }
     }
@@ -503,6 +548,23 @@ impl Config {
                             band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, profile.name
                         )));
                     }
+                }
+            }
+
+            // Surround validation: pure, no I/O. File existence is the engine's job (F1.3).
+            // hrir must be a bare stem — no path separators, no empty string.
+            if let Some(stem) = &profile.surround.hrir {
+                if stem.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "surround.hrir must not be empty in profile '{}'; use None to select the first available",
+                        profile.name
+                    )));
+                }
+                if stem.contains('/') || stem.contains('\\') {
+                    return Err(ConfigError::Invalid(format!(
+                        "surround.hrir '{}' must be a bare stem (no path separators) in profile '{}'",
+                        stem, profile.name
+                    )));
                 }
             }
         }
@@ -985,6 +1047,143 @@ description = "Chat"
             cfg.validate().is_ok(),
             "attenuation_limit_db=100.0 (max) should be accepted"
         );
+    }
+
+    // ── Task F1.1: SurroundConfig tests ──────────────────────────────────────
+
+    /// 1. `SurroundConfig::default()` matches the documented defaults.
+    #[test]
+    fn surround_default_values() {
+        let s = SurroundConfig::default();
+        assert!(!s.enabled, "surround must default to disabled");
+        assert_eq!(s.hrir, None, "hrir must default to None");
+        assert_eq!(
+            s.channels,
+            vec!["game".to_string(), "media".to_string()],
+            "channels must default to [game, media]"
+        );
+        assert_eq!(s.hw_sink, None, "hw_sink must default to None");
+    }
+
+    /// 2. A profile TOML without any surround block deserializes to default (back-compat).
+    #[test]
+    fn old_config_without_surround_block_deserializes_to_default() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("should deserialize old config");
+        let profile = cfg.active().expect("active profile");
+        assert_eq!(
+            profile.surround,
+            SurroundConfig::default(),
+            "old config without surround block must deserialize to default"
+        );
+    }
+
+    /// 3. A fully-populated surround config round-trips via TOML.
+    #[test]
+    fn surround_toml_round_trips() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround = SurroundConfig {
+            enabled: true,
+            hrir: Some("00-default-asm".to_string()),
+            channels: vec!["game".to_string(), "chat".to_string(), "media".to_string()],
+            hw_sink: Some("alsa_output.usb_headset".to_string()),
+        };
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            cfg, deserialized,
+            "surround TOML round-trip must preserve config"
+        );
+    }
+
+    /// 4. Validation rejects hrir with a forward slash (path separator).
+    #[test]
+    fn validate_rejects_surround_hrir_with_forward_slash() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("foo/bar".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("hrir with '/' should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 5. Validation rejects hrir with a backslash (path separator).
+    #[test]
+    fn validate_rejects_surround_hrir_with_backslash() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("foo\\bar".to_string());
+        let err = cfg
+            .validate()
+            .expect_err("hrir with '\\' should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 6. Validation rejects an empty hrir string.
+    #[test]
+    fn validate_rejects_surround_hrir_empty() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some(String::new());
+        let err = cfg.validate().expect_err("empty hrir should be rejected");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    /// 7. Validation accepts a valid bare-stem hrir.
+    #[test]
+    fn validate_accepts_surround_hrir_valid_stem() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = Some("00-default-asm".to_string());
+        assert!(
+            cfg.validate().is_ok(),
+            "valid bare stem '00-default-asm' should be accepted"
+        );
+    }
+
+    /// 8. Validation accepts hrir = None.
+    #[test]
+    fn validate_accepts_surround_hrir_none() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].surround.hrir = None;
+        assert!(cfg.validate().is_ok(), "hrir=None should be accepted");
+    }
+
+    /// 9. default_config() surround field is the default (disabled).
+    #[test]
+    fn default_config_includes_surround_disabled() {
+        let cfg = Config::default_config();
+        assert!(cfg.validate().is_ok(), "default_config must be valid");
+        for profile in &cfg.profiles {
+            assert_eq!(
+                profile.surround,
+                SurroundConfig::default(),
+                "profile '{}' surround should be default (disabled)",
+                profile.name
+            );
+        }
     }
 
     /// Old config with `rnnoise` key deserializes via alias into `suppression`.

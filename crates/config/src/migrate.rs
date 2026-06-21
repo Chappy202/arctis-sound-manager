@@ -2,7 +2,10 @@ use serde::Deserialize;
 
 use crate::{
     error::ConfigError,
-    schema::{ChannelConfig, Config, MicChainConfig, Profile, RouteConfig, CURRENT_VERSION},
+    schema::{
+        ChannelConfig, Config, MicChainConfig, Profile, RouteConfig, SurroundConfig,
+        CURRENT_VERSION,
+    },
 };
 
 // ── v0 schema helpers (private) ───────────────────────────────────────────────
@@ -63,6 +66,7 @@ fn migrate_v0(raw: &str) -> Result<Config, ConfigError> {
         channels: doc.channels,
         routes: Vec::new(),
         mic: MicChainConfig::default(),
+        surround: SurroundConfig::default(),
     };
 
     Ok(Config {

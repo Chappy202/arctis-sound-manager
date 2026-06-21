@@ -387,12 +387,14 @@ mod tests {
                     channels: channels.clone(),
                     routes: vec![],
                     mic: MicChainConfig::default(),
+                    surround: arctis_config::SurroundConfig::default(),
                 },
                 Profile {
                     name: "gaming".into(),
                     channels,
                     routes: vec![],
                     mic: MicChainConfig::default(),
+                    surround: arctis_config::SurroundConfig::default(),
                 },
             ],
         }

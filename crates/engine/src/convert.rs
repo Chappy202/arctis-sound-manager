@@ -369,7 +369,9 @@ pub fn mic_eq_band_node_name(index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, Profile, RouteConfig};
+    use arctis_config::{
+        ChannelConfig, EqBandConfig, MicChainConfig, Profile, RouteConfig, SurroundConfig,
+    };
 
     fn profile_default() -> Profile {
         Profile {
@@ -392,6 +394,7 @@ mod tests {
             ],
             routes: vec![],
             mic: MicChainConfig::default(),
+            surround: SurroundConfig::default(),
         }
     }
 

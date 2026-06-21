@@ -1140,6 +1140,7 @@ mod tests {
                 ],
                 routes: vec![],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
         }
     }
@@ -1179,6 +1180,7 @@ mod tests {
                     target_sink: "Arctis_Media".into(),
                 }],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
         }
     }
@@ -1576,6 +1578,7 @@ mod tests {
                     target_sink: "Arctis_Media".into(),
                 }],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
         };
         let mut engine = Engine::new(runner, simple_cfg);
@@ -1849,6 +1852,7 @@ mod tests {
             ],
             routes: vec![],
             mic: MicChainConfig::default(),
+            surround: arctis_config::SurroundConfig::default(),
         });
 
         // Use a temp ASM_CONFIG_HOME so we don't touch real config.
@@ -2032,6 +2036,7 @@ mod tests {
                 ],
                 routes: vec![],
                 mic: MicChainConfig::default(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
         }
     }
@@ -2467,6 +2472,7 @@ mod tests {
                 ],
                 routes: vec![],
                 mic: mic_enabled_passthrough(),
+                surround: arctis_config::SurroundConfig::default(),
             }],
         }
     }
@@ -2817,6 +2823,7 @@ mod tests {
                     hw_mic: Some("alsa_input.hw_mic".to_string()),
                     ..Default::default()
                 },
+                surround: arctis_config::SurroundConfig::default(),
             }],
         }
     }
