@@ -386,6 +386,7 @@ impl<R: CommandRunner> Engine<R> {
                 eq_bands,
                 suppression_backend,
                 available_suppression_backends,
+                hw_mic: mc.hw_mic.clone(),
             }
         } else {
             MicSnapshot::default()
@@ -396,7 +397,9 @@ impl<R: CommandRunner> Engine<R> {
             crate::state::SurroundSnapshot {
                 enabled: sc.enabled,
                 hrir: sc.hrir.clone(),
-                available_hrirs: convert::available_hrirs(),
+                available_hrirs: convert::hrir_base_dir()
+                    .map(|base| convert::available_hrirs(&base))
+                    .unwrap_or_default(),
                 channels: sc.channels.clone(),
                 hw_sink: sc.hw_sink.clone(),
             }
@@ -540,6 +543,39 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(Event::RouteSet {
             app_binary: app_binary.to_string(),
             target_sink: target_sink.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Remove the routing rule for `app_binary`.
+    ///
+    /// Drops the rule from in-memory config + persists, removes the WirePlumber
+    /// fragment entry, and attempts a best-effort live clear (moves the stream back
+    /// to the default sink by deleting its `target.object` metadata key).
+    pub fn clear_route(&mut self, app_binary: &str) -> Result<(), EngineError> {
+        // Update in-memory config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            profile.routes.retain(|r| r.app_binary != app_binary);
+        }
+        // Persist unified config
+        self.save_config()?;
+        // Update Router (remove from persistent fragment)
+        {
+            let mut router = Router::new(&mut self.runner);
+            router.remove_rule(app_binary);
+            router.save_persistent()?;
+            // Best-effort live clear (ignore error if app not running)
+            let _ = router.clear_live(&AppMatch::Binary(app_binary.to_string()));
+        }
+        // Emit event
+        self.emit(Event::RouteCleared {
+            app_binary: app_binary.to_string(),
         });
         Ok(())
     }
@@ -1593,7 +1629,9 @@ impl<R: CommandRunner> Engine<R> {
         }
 
         // Enabled path: resolve HRIR first.
-        let hrir_path = match convert::resolve_hrir_path(sc) {
+        let hrir_path = match convert::hrir_base_dir()
+            .and_then(|base| convert::resolve_hrir_path(sc, &base))
+        {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("warning: apply_surround HRIR resolve failed (skipping surround): {e}");
@@ -1695,7 +1733,8 @@ impl<R: CommandRunner> Engine<R> {
         // When enabling, validate HRIR exists first (before mutating config).
         if on {
             let profile = self.config.active()?.clone();
-            convert::resolve_hrir_path(&profile.surround)?;
+            let base = convert::hrir_base_dir()?;
+            convert::resolve_hrir_path(&profile.surround, &base)?;
         }
         // Mutate config
         {
@@ -1732,7 +1771,8 @@ impl<R: CommandRunner> Engine<R> {
             let old = profile.surround.hrir.clone();
             profile.surround.hrir = Some(stem.clone());
             // Validate the resolved path exists.
-            if let Err(e) = convert::resolve_hrir_path(&profile.surround) {
+            let base = convert::hrir_base_dir()?;
+            if let Err(e) = convert::resolve_hrir_path(&profile.surround, &base) {
                 // Roll back mutation.
                 profile.surround.hrir = old;
                 return Err(e);
@@ -4476,128 +4516,118 @@ mod tests {
 
     use crate::convert;
 
+    // These tests inject the base dir directly — NO env mutation, NO ENV_MUTEX needed.
+    // This is the canonical pattern: resolve_hrir_path / available_hrirs take base_dir
+    // as a parameter so tests never race on process-global HOME.
+
     #[test]
     fn resolve_hrir_path_with_named_stem_returns_abs_path() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("hrir_named");
-        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
         let wav = profiles_dir.join("00-default.wav");
         std::fs::write(&wav, b"").unwrap();
-        std::env::set_var("HOME", &tmp);
 
         let cfg = arctis_config::SurroundConfig {
             hrir: Some("00-default".into()),
             ..Default::default()
         };
-        let path = convert::resolve_hrir_path(&cfg).expect("should resolve named stem");
+        let path = convert::resolve_hrir_path(&cfg, &base).expect("should resolve named stem");
         assert_eq!(path, wav);
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn resolve_hrir_path_named_stem_missing_returns_err() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("hrir_missing");
-        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
-        std::env::set_var("HOME", &tmp);
 
         let cfg = arctis_config::SurroundConfig {
             hrir: Some("nonexistent".into()),
             ..Default::default()
         };
-        let result = convert::resolve_hrir_path(&cfg);
+        let result = convert::resolve_hrir_path(&cfg, &base);
         assert!(matches!(result, Err(EngineError::BadRequest(_))));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn resolve_hrir_path_no_stem_picks_first_lexicographic() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("hrir_lex");
-        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
         std::fs::write(profiles_dir.join("beta.wav"), b"").unwrap();
         std::fs::write(profiles_dir.join("alpha.wav"), b"").unwrap();
-        std::env::set_var("HOME", &tmp);
 
         let cfg = arctis_config::SurroundConfig::default(); // hrir = None
-        let path = convert::resolve_hrir_path(&cfg).expect("should pick first lexicographic");
+        let path =
+            convert::resolve_hrir_path(&cfg, &base).expect("should pick first lexicographic");
         assert!(
             path.ends_with("alpha.wav"),
             "expected alpha.wav, got {:?}",
             path
         );
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn resolve_hrir_path_no_stem_no_profiles_fallback_to_hrir_wav() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("hrir_fallback");
-        let base = tmp.join(".local/share/pipewire/hrir_hesuvi");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("hrir.wav"), b"").unwrap();
-        std::env::set_var("HOME", &tmp);
 
         let cfg = arctis_config::SurroundConfig::default();
-        let path = convert::resolve_hrir_path(&cfg).expect("should fall back to hrir.wav");
+        let path = convert::resolve_hrir_path(&cfg, &base).expect("should fall back to hrir.wav");
         assert!(
             path.ends_with("hrir.wav"),
             "expected hrir.wav, got {:?}",
             path
         );
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn resolve_hrir_path_no_hrir_at_all_returns_err() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("hrir_none");
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("HOME", &tmp);
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        std::fs::create_dir_all(&base).unwrap();
 
         let cfg = arctis_config::SurroundConfig::default();
-        let result = convert::resolve_hrir_path(&cfg);
+        let result = convert::resolve_hrir_path(&cfg, &base);
         assert!(matches!(result, Err(EngineError::BadRequest(_))));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn available_hrirs_returns_sorted_stems() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("avail_hrirs");
-        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
         std::fs::create_dir_all(&profiles_dir).unwrap();
         std::fs::write(profiles_dir.join("zz-last.wav"), b"").unwrap();
         std::fs::write(profiles_dir.join("aa-first.wav"), b"").unwrap();
         std::fs::write(profiles_dir.join("mm-middle.wav"), b"").unwrap();
-        std::env::set_var("HOME", &tmp);
 
-        let hrirs = convert::available_hrirs();
+        let hrirs = convert::available_hrirs(&base);
         assert_eq!(hrirs, vec!["aa-first", "mm-middle", "zz-last"]);
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn available_hrirs_empty_when_dir_missing() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("avail_hrirs_empty");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
         // Intentionally don't create the profiles dir.
         std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("HOME", &tmp);
 
-        let hrirs = convert::available_hrirs();
+        let hrirs = convert::available_hrirs(&base);
         assert!(hrirs.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("HOME");
     }
 
     // ─────────────────────────────────────────────

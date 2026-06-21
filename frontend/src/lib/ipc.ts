@@ -48,6 +48,8 @@ export interface MicSnapshot {
   suppression_backend: string;
   /** Backends whose plugin is present on this machine */
   available_suppression_backends: string[];
+  /** Pinned hardware mic capture source; null = auto / not pinned. */
+  hw_mic?: string | null;
 }
 
 export interface SurroundSnapshot {
@@ -231,6 +233,10 @@ export const setEqBand = (
 /** Route an app binary to a target sink; returns updated EngineState. */
 export const setRoute = (app_binary: string, target_sink: string): Promise<EngineState> =>
   invoke<EngineState>("set_route", buildSetRouteArgs(app_binary, target_sink));
+
+/** Remove the routing rule for an app binary; returns updated EngineState. */
+export const clearRoute = (app_binary: string): Promise<EngineState> =>
+  invoke<EngineState>("clear_route", { appBinary: app_binary });
 
 /**
  * Set a single device hardware control by name.

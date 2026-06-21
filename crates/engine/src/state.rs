@@ -111,6 +111,10 @@ pub struct MicSnapshot {
     /// Backends whose LADSPA .so was found by the last probe.
     #[serde(default)]
     pub available_suppression_backends: Vec<SuppressionBackend>,
+    /// The pinned hardware mic capture source (if any).  `None` means auto / not pinned.
+    /// Populated from `profile.mic.hw_mic`; `None` is serde-default for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hw_mic: Option<String>,
 }
 
 /// Full surround snapshot returned in `EngineState`.
@@ -219,6 +223,9 @@ pub enum Event {
     RouteSet {
         app_binary: String,
         target_sink: String,
+    },
+    RouteCleared {
+        app_binary: String,
     },
     DeviceState {
         fields: std::collections::BTreeMap<String, String>,

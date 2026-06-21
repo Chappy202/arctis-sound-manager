@@ -100,6 +100,14 @@ pub async fn set_route(
 }
 
 #[tauri::command]
+pub async fn clear_route(
+    app_binary: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::RouteClear { app_binary }).await
+}
+
+#[tauri::command]
 pub async fn set_channel_output(
     channel: String,
     device: Option<String>,

@@ -15,6 +15,7 @@ pub fn run() {
             commands::switch_profile,
             commands::set_eq_band,
             commands::set_route,
+            commands::clear_route,
             commands::set_channel_output,
             commands::profile_new,
             commands::device_set,

@@ -172,6 +172,16 @@ enum RouteAction {
         #[arg(long)]
         by_name: bool,
     },
+    /// Remove the routing rule for an app and move its stream back to the default sink.
+    Clear {
+        /// Application binary name whose rule should be removed.
+        app: String,
+    },
+    /// Remove is an alias for clear.
+    Remove {
+        /// Application binary name whose rule should be removed.
+        app: String,
+    },
     /// Print all persistent routing rules from routes.json.
     List,
 }
@@ -535,6 +545,10 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
                         for (k, v) in &stage.params {
                             println!("    {k}: {v}");
                         }
+                    }
+                    match &mic.hw_mic {
+                        Some(hw) => println!("  hw_mic: {hw}"),
+                        None => println!("  hw_mic: (auto / not pinned)"),
                     }
                     if !mic.eq_bands.is_empty() {
                         println!("  eq bands:");
@@ -1028,6 +1042,28 @@ fn main() -> ExitCode {
                     }
                     Err(e) => {
                         eprintln!("error saving persistent rule: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            RouteAction::Clear { app } | RouteAction::Remove { app } => {
+                let mut router = Router::new(RealRunner);
+                if let Err(e) = router.load_persistent() {
+                    eprintln!("warning: could not load existing routes: {e}");
+                }
+                router.remove_rule(&app);
+                // Best-effort live clear (stream back to default).
+                match router.clear_live(&AppMatch::Binary(app.clone())) {
+                    Ok(()) => println!("live: cleared stream target for {app}"),
+                    Err(e) => eprintln!("warning: live clear failed (is the app playing?): {e}"),
+                }
+                match router.save_persistent() {
+                    Ok(()) => {
+                        println!("persistent: rule removed for {app}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("error saving routes after remove: {e}");
                         ExitCode::FAILURE
                     }
                 }

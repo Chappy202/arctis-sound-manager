@@ -326,6 +326,26 @@ impl<R: CommandRunner> Router<R> {
         }
     }
 
+    /// Remove the persistent rule for `app_binary`. No-op if not found.
+    /// Does NOT persist — caller must call `save_persistent` after.
+    pub fn remove_rule(&mut self, app_binary: &str) {
+        self.rules.retain(|r| r.app_binary != app_binary);
+    }
+
+    /// Best-effort live clear: move the stream for `app` back to the default sink
+    /// by deleting its `target.object` metadata key.  Errors are silently ignored
+    /// at the call site (same pattern as `apply_live` for route-set).
+    pub fn clear_live(&mut self, app: &AppMatch) -> Result<(), AudioError> {
+        let dump = self.runner.run("pw-dump", &[])?;
+        let dump = Self::check(dump, "pw-dump")?;
+        let id = parse_stream_id(&dump.stdout, app)?;
+        let argv = clear_stream_target_argv(&id)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-metadata", &args)?;
+        Self::check(out, "pw-metadata")?;
+        Ok(())
+    }
+
     /// Load persistent routes from `routes.json`. Absent file → empty rules (no error).
     /// Parse failure → typed AudioError.
     pub fn load_persistent(&mut self) -> Result<(), AudioError> {

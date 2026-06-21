@@ -372,22 +372,34 @@ use arctis_audio::SurroundSpec;
 use arctis_config::SurroundConfig;
 use std::path::PathBuf;
 
-const HRIR_BASE_SUBPATH: &str = ".local/share/pipewire/hrir_hesuvi";
+pub const HRIR_BASE_SUBPATH: &str = ".local/share/pipewire/hrir_hesuvi";
 
-/// Expand HOME env var and return the base HRIR directory.
-fn hrir_base_dir() -> Result<PathBuf, crate::error::EngineError> {
+/// Return the HRIR base directory derived from the `HOME` environment variable.
+///
+/// Call sites (engine::state, engine methods) call this ONCE and pass the
+/// resulting `PathBuf` down into `resolve_hrir_path` / `available_hrirs`, which
+/// are fully injected (no env reads inside).  Tests bypass this function entirely
+/// and pass a temp dir directly — eliminating the `$HOME` read from
+/// parallel-raced test paths.
+pub fn hrir_base_dir() -> Result<PathBuf, crate::error::EngineError> {
     let home = std::env::var("HOME")
         .map_err(|_| crate::error::EngineError::BadRequest("HOME env var not set".into()))?;
     Ok(PathBuf::from(home).join(HRIR_BASE_SUBPATH))
 }
 
 /// Resolve the absolute HRIR .wav path from surround config.
-/// - If cfg.hrir == Some(stem) → <base>/profiles/<stem>.wav  (error if missing)
-/// - If cfg.hrir == None → first *.wav in <base>/profiles/ sorted lexicographically
-///   (fallback: <base>/hrir.wav if it exists; else BadRequest error)
-pub fn resolve_hrir_path(cfg: &SurroundConfig) -> Result<PathBuf, crate::error::EngineError> {
-    let base = hrir_base_dir()?;
-    let profiles_dir = base.join("profiles");
+///
+/// `base_dir` is the HRIR base directory (e.g. `~/.local/share/pipewire/hrir_hesuvi`).
+/// Callers supply it via `hrir_base_dir()` in production; tests pass a temp path.
+///
+/// - If cfg.hrir == Some(stem) → <base_dir>/profiles/<stem>.wav  (error if missing)
+/// - If cfg.hrir == None → first *.wav in <base_dir>/profiles/ sorted lexicographically
+///   (fallback: <base_dir>/hrir.wav if it exists; else BadRequest error)
+pub fn resolve_hrir_path(
+    cfg: &SurroundConfig,
+    base_dir: &std::path::Path,
+) -> Result<PathBuf, crate::error::EngineError> {
+    let profiles_dir = base_dir.join("profiles");
 
     match &cfg.hrir {
         Some(stem) => {
@@ -419,8 +431,8 @@ pub fn resolve_hrir_path(cfg: &SurroundConfig) -> Result<PathBuf, crate::error::
                     return Ok(first);
                 }
             }
-            // Fallback: <base>/hrir.wav
-            let fallback = base.join("hrir.wav");
+            // Fallback: <base_dir>/hrir.wav
+            let fallback = base_dir.join("hrir.wav");
             if fallback.exists() {
                 return Ok(fallback);
             }
@@ -432,11 +444,11 @@ pub fn resolve_hrir_path(cfg: &SurroundConfig) -> Result<PathBuf, crate::error::
 }
 
 /// Return sorted HRIR stems (no .wav) from the profiles directory. Empty if dir missing.
-pub fn available_hrirs() -> Vec<String> {
-    let Ok(base) = hrir_base_dir() else {
-        return Vec::new();
-    };
-    let profiles_dir = base.join("profiles");
+///
+/// `base_dir` is the HRIR base directory. Callers supply it via `hrir_base_dir()` in
+/// production; tests pass a temp path directly to avoid env reads.
+pub fn available_hrirs(base_dir: &std::path::Path) -> Vec<String> {
+    let profiles_dir = base_dir.join("profiles");
     if !profiles_dir.is_dir() {
         return Vec::new();
     }

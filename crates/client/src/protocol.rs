@@ -135,6 +135,12 @@ pub enum Request {
     EqPresetDelete {
         name: String,
     },
+    /// Remove a routing rule for an app by binary name.
+    /// Drops the rule from persistent config + best-effort live clear (moves the
+    /// stream back to the default sink if it is currently running).
+    RouteClear {
+        app_binary: String,
+    },
     /// Add a new channel to the active profile by id.
     /// The engine derives node_name and description from the id.
     ChannelAdd {
@@ -1059,6 +1065,34 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         // `state` should not appear (skip_serializing_if = None)
         assert!(!json.contains("\"state\""), "state must be absent: {json}");
+    }
+
+    // ── F5a: RouteClear wire-tag + round-trip tests ──────────────────────────
+
+    #[test]
+    fn parse_route_clear_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"route-clear","app_binary":"firefox"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::RouteClear {
+                app_binary: "firefox".into()
+            }
+        );
+    }
+
+    #[test]
+    fn request_route_clear_round_trips() {
+        let req = Request::RouteClear {
+            app_binary: "firefox".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("route-clear"),
+            "cmd tag must be route-clear, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
     }
 
     // ── F4: ChannelAdd / ChannelRemove wire-tag parse tests ──────────────────

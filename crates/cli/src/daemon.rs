@@ -88,6 +88,10 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::RouteClear { app_binary } => match engine.clear_route(&app_binary) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::SetChannelOutput { channel, device } => {
             match engine.set_channel_output(&channel, device) {
                 Ok(()) => Response::ok_with_state(engine.state()),
@@ -1053,6 +1057,14 @@ mod tests {
 
     #[test]
     fn handle_surround_enable_false_returns_ok() {
+        // surround_set_enabled(false) calls save_config() which reads ASM_CONFIG_HOME.
+        // Without ENV_MUTEX + a valid temp dir, a parallel test could have set
+        // ASM_CONFIG_HOME to a now-deleted temp dir, causing save_config to fail and
+        // resp.ok to be false (flake).  Hold the lock and give config a valid home.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_surr_en_false_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
         let cfg = two_profile_config();
         let mut engine = Engine::new(MockRunner::new(), cfg);
         // disable (already disabled by default) — must return ok
@@ -1064,6 +1076,9 @@ mod tests {
         );
         let state = resp.state.expect("state must be present");
         assert!(!state.surround.enabled);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]
@@ -1159,6 +1174,90 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ── F5a: RouteClear dispatch test ────────────────────────────────────────
+
+    #[test]
+    fn handle_route_clear_removes_rule_and_returns_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_rc_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Seed config with a route for "firefox".
+        let mut cfg = two_profile_config();
+        cfg.profiles[0].routes.push(arctis_config::RouteConfig {
+            app_binary: "firefox".into(),
+            target_sink: "Arctis_Media".into(),
+        });
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Verify route exists in state before clear.
+        let state_before = engine.state();
+        assert!(
+            state_before.routes.iter().any(|(app, _)| app == "firefox"),
+            "firefox route must exist before clear"
+        );
+
+        let resp = handle_request(
+            &mut engine,
+            Request::RouteClear {
+                app_binary: "firefox".into(),
+            },
+        );
+        assert!(
+            resp.ok,
+            "RouteClear must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.routes.iter().any(|(app, _)| app == "firefox"),
+            "firefox route must be absent after clear: {:?}",
+            state.routes
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ── F5a: MicSnapshot.hw_mic surfaced in state ────────────────────────────
+
+    #[test]
+    fn mic_status_includes_hw_mic_when_pinned() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_hwmic_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = two_profile_config();
+        cfg.profiles[0].mic.hw_mic = Some("alsa_input.usb-SteelSeries".into());
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::MicStatus);
+        assert!(resp.ok, "MicStatus must return ok:true");
+        let state = resp.state.expect("state must be present");
+        assert_eq!(
+            state.mic.hw_mic.as_deref(),
+            Some("alsa_input.usb-SteelSeries"),
+            "hw_mic must be surfaced in MicSnapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn mic_status_hw_mic_none_when_not_pinned() {
+        let cfg = two_profile_config(); // hw_mic defaults to None
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::MicStatus);
+        assert!(resp.ok);
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.mic.hw_mic.is_none(),
+            "hw_mic must be None when not configured"
+        );
     }
 
     #[test]
