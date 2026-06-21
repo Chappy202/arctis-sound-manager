@@ -29,7 +29,8 @@ export interface ChannelSnapshot {
 }
 
 export interface MicStageSnapshot {
-  kind: string; // serde snake_case StageName: "gain"|"highpass"|"rnnoise"|"compressor"|"gate"|"mic_eq"
+  /** serde snake_case StageName: "gain"|"highpass"|"suppression"|"compressor"|"gate"|"mic_eq" */
+  kind: string;
   enabled: boolean;
   available: boolean;
   params: Record<string, number>; // BTreeMap<String,f32>; keys per engine state() builder
@@ -39,6 +40,10 @@ export interface MicSnapshot {
   enabled: boolean;
   stages: MicStageSnapshot[];
   eq_bands: EqBandSnapshot[]; // reuse existing EqBandSnapshot
+  /** Active suppression backend: "deep_filter" | "rnnoise" */
+  suppression_backend: string;
+  /** Backends whose plugin is present on this machine */
+  available_suppression_backends: string[];
 }
 
 export interface EngineState {
@@ -176,6 +181,10 @@ export const micEqBand = (
 /** Set (or clear) the hardware mic capture source. */
 export const micHwMic = (device: string | null): Promise<EngineState> =>
   invoke<EngineState>("mic_hw_mic", { device });
+
+/** Switch the noise-suppression backend ("deep_filter" | "rnnoise"). */
+export const micSuppressionBackend = (backend: string): Promise<EngineState> =>
+  invoke<EngineState>("mic_suppression_backend", { backend });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

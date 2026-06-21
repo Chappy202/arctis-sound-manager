@@ -16,6 +16,7 @@
     micStage,
     micSet,
     micEqBand,
+    micSuppressionBackend,
     type MicStageSnapshot,
   } from "../ipc.js";
   import {
@@ -23,6 +24,9 @@
     isStageDisabled,
     stageUnavailableTooltip,
     micBandToArgs,
+    backendLabel,
+    backendAvailable,
+    backendTooltip,
   } from "../mic.js";
   import EqCanvas from "./EqCanvas.svelte";
   import BandList from "./BandList.svelte";
@@ -38,15 +42,19 @@
     return mic?.stages.find((s) => s.kind === kind);
   }
 
-  const gainStage      = $derived(findStage("gain"));
-  const highpassStage  = $derived(findStage("highpass"));
-  const rnnoiseStage   = $derived(findStage("rnnoise"));
-  const compStage      = $derived(findStage("compressor"));
-  const gateStage      = $derived(findStage("gate"));
-  const micEqStage     = $derived(findStage("mic_eq"));
+  const gainStage         = $derived(findStage("gain"));
+  const highpassStage     = $derived(findStage("highpass"));
+  const suppressionStage  = $derived(findStage("suppression"));
+  const compStage         = $derived(findStage("compressor"));
+  const gateStage         = $derived(findStage("gate"));
+  const micEqStage        = $derived(findStage("mic_eq"));
 
   // Master enabled gates all stage cards
   const masterEnabled  = $derived(mic?.enabled ?? false);
+
+  // Suppression backend state from the snapshot
+  const suppressionBackend    = $derived(mic?.suppression_backend ?? "deep_filter");
+  const availableBackends     = $derived(mic?.available_suppression_backends ?? []);
 
   // ---------------------------------------------------------------------------
   // Mic EQ bands (mirroring EqPage pattern)
@@ -99,6 +107,13 @@
     if (isNaN(value)) return;
     micSet(param, value).then(applyState).catch((err) => {
       console.warn(`[MicPage] micSet(${param}) failed:`, err);
+    });
+  }
+
+  function onBackendChange(e: Event) {
+    const backend = (e.target as HTMLSelectElement).value;
+    micSuppressionBackend(backend).then(applyState).catch((err) => {
+      console.warn(`[MicPage] micSuppressionBackend(${backend}) failed:`, err);
     });
   }
 
@@ -214,7 +229,7 @@
                   type="range"
                   class="ss-slider"
                   min="-20"
-                  max="20"
+                  max="30"
                   step="0.5"
                   value={paramVal(gainStage, "gain_db")}
                   disabled={!gainStage.enabled || isStageDisabled(gainStage) || !masterEnabled}
@@ -261,7 +276,7 @@
                   type="range"
                   class="ss-slider"
                   min="20"
-                  max="400"
+                  max="300"
                   step="5"
                   value={paramVal(highpassStage, "freq_hz")}
                   disabled={!highpassStage.enabled || isStageDisabled(highpassStage) || !masterEnabled}
@@ -275,23 +290,23 @@
         </div>
       {/if}
 
-      <!-- ─── RNNOISE card ───────────────────────────────────────────────── -->
-      {#if rnnoiseStage}
+      <!-- ─── NOISE SUPPRESSION card ───────────────────────────────────── -->
+      {#if suppressionStage}
         <div
           class="device-card device-card--live"
-          class:device-card--disabled={isStageDisabled(rnnoiseStage)}
-          title={stageUnavailableTooltip(rnnoiseStage)}
+          class:device-card--disabled={isStageDisabled(suppressionStage)}
+          title={stageUnavailableTooltip(suppressionStage)}
         >
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">◉</span>
             <h2 class="card-title">NOISE SUPPRESSION</h2>
-            <label class="toggle toggle--sm" title={stageUnavailableTooltip(rnnoiseStage)}>
+            <label class="toggle toggle--sm" title={stageUnavailableTooltip(suppressionStage)}>
               <input
                 type="checkbox"
                 class="toggle-input"
-                checked={rnnoiseStage.enabled}
-                disabled={isStageDisabled(rnnoiseStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("rnnoise", e)}
+                checked={suppressionStage.enabled}
+                disabled={isStageDisabled(suppressionStage) || !masterEnabled}
+                onchange={(e) => onStageToggle("suppression", e)}
                 aria-label="Enable noise suppression"
               />
               <span class="toggle-track"><span class="toggle-thumb"></span></span>
@@ -299,47 +314,101 @@
           </div>
           <div
             class="card-body"
-            class:controls-layout--dimmed={isStageDisabled(rnnoiseStage)}
+            class:controls-layout--dimmed={isStageDisabled(suppressionStage)}
           >
+            <!-- Backend selector -->
             <div class="control-row">
-              <span class="field-label">VAD THRESHOLD (%)</span>
-              <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="0"
-                  max="100"
-                  step="1"
-                  value={paramVal(rnnoiseStage, "vad_threshold")}
-                  disabled={!rnnoiseStage.enabled || isStageDisabled(rnnoiseStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("vad_threshold", e)}
-                  aria-label="VAD threshold percent"
-                />
-                <span class="slider-readout">{Math.round(paramVal(rnnoiseStage, "vad_threshold"))}%</span>
+              <span class="field-label">BACKEND</span>
+              <div class="select-group">
+                <select
+                  class="ss-select"
+                  value={suppressionBackend}
+                  disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                  onchange={onBackendChange}
+                  aria-label="Noise suppression backend"
+                >
+                  {#each ["deep_filter", "rnnoise"] as b (b)}
+                    <option
+                      value={b}
+                      disabled={!backendAvailable(b, availableBackends)}
+                      title={backendTooltip(b, availableBackends)}
+                    >
+                      {backendLabel(b)}{!backendAvailable(b, availableBackends) ? " (not installed)" : ""}
+                    </option>
+                  {/each}
+                </select>
               </div>
             </div>
-            <div class="control-row">
-              <span class="field-label">VAD GRACE (ms)</span>
-              <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="0"
-                  max="2000"
-                  step="50"
-                  value={paramVal(rnnoiseStage, "vad_grace_ms")}
-                  disabled={!rnnoiseStage.enabled || isStageDisabled(rnnoiseStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("vad_grace_ms", e)}
-                  aria-label="VAD grace period ms"
-                />
-                <span class="slider-readout">{Math.round(paramVal(rnnoiseStage, "vad_grace_ms"))} ms</span>
+
+            <!-- DeepFilterNet controls -->
+            {#if suppressionBackend === "deep_filter"}
+              <div class="control-row">
+                <span class="field-label">ATTENUATION LIMIT (dB)</span>
+                <div class="slider-group">
+                  <input
+                    type="range"
+                    class="ss-slider"
+                    min="0"
+                    max="100"
+                    step="1"
+                    value={paramVal(suppressionStage, "attenuation_limit_db")}
+                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                    onchange={(e) => onParamChange("attenuation_limit_db", e)}
+                    aria-label="DeepFilterNet attenuation limit dB"
+                  />
+                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "attenuation_limit_db"))} dB</span>
+                </div>
               </div>
-            </div>
-            <div class="field-row">
-              <span class="field-label--hint">
-                Lower threshold = less suppression, less tinny
-              </span>
-            </div>
+              <div class="field-row">
+                <span class="field-label--hint">
+                  Lower = less suppression / fewer artifacts (the anti-tinny control). Default 100 = maximum suppression.
+                </span>
+              </div>
+            {/if}
+
+            <!-- RNNoise controls -->
+            {#if suppressionBackend === "rnnoise"}
+              <div class="control-row">
+                <span class="field-label">VAD THRESHOLD (%)</span>
+                <div class="slider-group">
+                  <input
+                    type="range"
+                    class="ss-slider"
+                    min="0"
+                    max="99"
+                    step="1"
+                    value={paramVal(suppressionStage, "vad_threshold")}
+                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                    onchange={(e) => onParamChange("vad_threshold", e)}
+                    aria-label="VAD threshold percent"
+                  />
+                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_threshold"))}%</span>
+                </div>
+              </div>
+              <div class="control-row">
+                <span class="field-label">VAD GRACE (ms)</span>
+                <div class="slider-group">
+                  <input
+                    type="range"
+                    class="ss-slider"
+                    min="0"
+                    max="1000"
+                    step="50"
+                    value={paramVal(suppressionStage, "vad_grace_ms")}
+                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                    onchange={(e) => onParamChange("vad_grace_ms", e)}
+                    aria-label="VAD grace period ms"
+                  />
+                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_grace_ms"))} ms</span>
+                </div>
+              </div>
+              <div class="field-row">
+                <span class="field-label--hint">
+                  RNNoise can sound tinnier (no attenuation cap). Prefer DeepFilterNet for clean voice.
+                  VAD affects word-clipping, not timbral tinniness.
+                </span>
+              </div>
+            {/if}
           </div>
         </div>
       {/if}
@@ -376,7 +445,7 @@
                 <input
                   type="range"
                   class="ss-slider"
-                  min="-60"
+                  min="-30"
                   max="0"
                   step="1"
                   value={paramVal(compStage, "threshold_db")}
@@ -458,7 +527,7 @@
                   type="range"
                   class="ss-slider"
                   min="0"
-                  max="1"
+                  max="0.5"
                   step="0.01"
                   value={paramVal(gateStage, "threshold")}
                   disabled={!gateStage.enabled || isStageDisabled(gateStage) || !masterEnabled}
@@ -898,6 +967,38 @@
     color: var(--ss-text-primary);
     min-width: 52px;
     text-align: right;
+  }
+
+  /* ===== Select (backend picker) ===== */
+  .select-group {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-2);
+    flex: 1;
+    justify-content: flex-end;
+  }
+
+  .ss-select {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-body-size);
+    color: var(--ss-text-primary);
+    background: var(--ss-surface-input);
+    border: 1px solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    padding: var(--ss-space-1) var(--ss-space-2);
+    cursor: pointer;
+    outline: none;
+    min-width: 140px;
+  }
+
+  .ss-select:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .ss-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   /* ===== Input meter placeholder (E8) ===== */

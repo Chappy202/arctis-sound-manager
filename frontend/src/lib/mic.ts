@@ -17,7 +17,7 @@ import type { Band } from "./eq.js";
  * `Request::MicStage { stage, enabled }`.
  *
  * The only mismatch: snapshot kind "mic_eq" → wire string "eq".
- * All other kinds map identity.
+ * All other kinds (including "suppression") map identity.
  */
 export function stageWireName(kind: string): string {
   if (kind === "mic_eq") return "eq";
@@ -33,15 +33,62 @@ export function stageWireName(kind: string): string {
  * builtin stages that need no external plugin.
  *
  * Used for the "Plugin not installed: <path>" unavailability tooltip.
+ * Note: for "suppression", plugin availability is backend-specific — use
+ * backendAvailable/backendTooltip helpers instead; this returns null.
  */
 export function stagePluginPath(kind: string): string | null {
   switch (kind) {
-    case "rnnoise":
-      return "/usr/lib64/ladspa/librnnoise_ladspa.so";
     case "compressor":
       return "/usr/lib64/ladspa/sc4m_1916.so";
     default:
-      return null; // builtins: gain, highpass, gate, mic_eq
+      return null; // builtins: gain, highpass, gate, mic_eq; suppression uses backendTooltip
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Suppression backend helpers (E4/§8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns a human-readable label for a suppression backend id.
+ *   "deep_filter" → "DeepFilterNet"
+ *   "rnnoise"     → "RNNoise"
+ *   other         → the raw id (forward-compat)
+ */
+export function backendLabel(backend: string): string {
+  switch (backend) {
+    case "deep_filter":
+      return "DeepFilterNet";
+    case "rnnoise":
+      return "RNNoise";
+    default:
+      return backend;
+  }
+}
+
+/**
+ * Returns true when the given backend id is present in the available list
+ * (i.e., its plugin has been detected on this machine).
+ */
+export function backendAvailable(backend: string, available: string[]): boolean {
+  return available.includes(backend);
+}
+
+/**
+ * Returns an informational tooltip for a backend that is NOT available, or
+ * undefined when the backend IS available (no tooltip needed).
+ *
+ * Only covers the known backends; unknown ids get a generic message.
+ */
+export function backendTooltip(backend: string, available: string[]): string | undefined {
+  if (backendAvailable(backend, available)) return undefined;
+  switch (backend) {
+    case "deep_filter":
+      return "DeepFilterNet plugin not installed — see README";
+    case "rnnoise":
+      return "RNNoise plugin not installed — see README";
+    default:
+      return `${backend} plugin not installed`;
   }
 }
 
@@ -62,10 +109,15 @@ export function isStageDisabled(stage: MicStageSnapshot): boolean {
  * `undefined` when the stage is available (no tooltip needed).
  *
  * For stages with a known plugin path: "Plugin not installed: <path>".
- * For builtin stages that are still somehow unavailable: "Stage not available".
+ * For the suppression stage: handled separately via backendTooltip.
+ * For builtin stages that are still somehow unavailable: generic message.
+ * For the gate stage: version/plugin message.
  */
 export function stageUnavailableTooltip(stage: MicStageSnapshot): string | undefined {
   if (stage.available) return undefined;
+  if (stage.kind === "gate") {
+    return "Requires PipeWire ≥1.6 (builtin gate) or the swh gate_1410 LADSPA plugin";
+  }
   const path = stagePluginPath(stage.kind);
   if (path) {
     return `Plugin not installed: ${path}`;
