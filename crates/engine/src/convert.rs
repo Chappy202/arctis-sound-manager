@@ -1,8 +1,9 @@
 use crate::error::EngineError;
 use crate::state::StageAvailability;
 use arctis_audio::{
-    BandKind, ChainChannels, ChainSpec, ChannelDef, ChannelSetConfig, EqBand, EqModel, FilterNode,
-    NodeType, PluginProbe, RouteRule, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN, SC4M_LABEL, SC4M_PLUGIN,
+    BandKind, ChainChannels, ChainKind, ChainSpec, ChannelDef, ChannelSetConfig, EqBand, EqModel,
+    FilterNode, NodeType, PluginProbe, RouteRule, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME,
+    SC4M_LABEL, SC4M_PLUGIN_BASENAME,
 };
 use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, RouteConfig};
 
@@ -78,14 +79,11 @@ pub fn mic_chain_spec(cfg: &MicChainConfig) -> ChainSpec {
         node_name: "arctis_clean_mic".to_string(),
         description: "Clean Mic".to_string(),
         channels: ChainChannels::Mono,
-        capture_media_class: "Audio/Source".to_string(),
+        kind: ChainKind::Source,
         capture_node_name: "arctis_clean_mic.capture".to_string(),
         capture_target: cfg.hw_mic.clone(),
-        playback_media_class: Some("Audio/Source".to_string()),
-        playback_passive: false,
         playback_target: None,
         playback_node_name: "arctis_clean_mic".to_string(),
-        capture_is_source_stream: true,
     }
 }
 
@@ -147,12 +145,12 @@ pub fn mic_chain_nodes(
 
     // ── RNNoise stage (LADSPA noise_suppressor_mono) ─────────────────────────
     if cfg.rnnoise.enabled {
-        if probe.ladspa_exists(RNNOISE_PLUGIN) {
+        if probe.ladspa_available(RNNOISE_PLUGIN_BASENAME) {
             nodes.push(FilterNode {
                 name: "mic_rnnoise".to_string(),
                 node_type: NodeType::Ladspa,
                 label: RNNOISE_LABEL_MONO.to_string(),
-                plugin: Some(RNNOISE_PLUGIN.to_string()),
+                plugin: Some(RNNOISE_PLUGIN_BASENAME.to_string()),
                 port_in: "Input".to_string(),
                 port_out: "Output".to_string(),
                 controls: vec![
@@ -183,12 +181,12 @@ pub fn mic_chain_nodes(
 
     // ── Compressor stage (LADSPA sc4m) ───────────────────────────────────────
     if cfg.compressor.enabled {
-        if probe.ladspa_exists(SC4M_PLUGIN) {
+        if probe.ladspa_available(SC4M_PLUGIN_BASENAME) {
             nodes.push(FilterNode {
                 name: "mic_compressor".to_string(),
                 node_type: NodeType::Ladspa,
                 label: SC4M_LABEL.to_string(),
-                plugin: Some(SC4M_PLUGIN.to_string()),
+                plugin: Some(SC4M_PLUGIN_BASENAME.to_string()),
                 port_in: "Input".to_string(),
                 port_out: "Output".to_string(),
                 controls: vec![
@@ -532,15 +530,17 @@ mod tests {
 
     #[test]
     fn mic_chain_nodes_rnnoise_present_plugin_included() {
-        use arctis_audio::RNNOISE_PLUGIN;
+        use arctis_audio::RNNOISE_PLUGIN_BASENAME;
         let mut cfg = MicChainConfig::passthrough();
         cfg.rnnoise.enabled = true;
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN]);
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
         let (nodes, _) = mic_chain_nodes(&cfg, &probe);
         // Only rnnoise (no gain/highpass/gate/eq enabled) — rnnoise IS present
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].name, "mic_rnnoise");
         assert_eq!(nodes[0].label, "noise_suppressor_mono");
+        // plugin field must be the basename
+        assert_eq!(nodes[0].plugin.as_deref(), Some(RNNOISE_PLUGIN_BASENAME));
     }
 
     #[test]
@@ -551,11 +551,9 @@ mod tests {
         assert_eq!(spec.node_name, "arctis_clean_mic");
         assert_eq!(spec.description, "Clean Mic");
         assert!(matches!(spec.channels, ChainChannels::Mono));
-        assert_eq!(spec.capture_media_class, "Audio/Source");
+        assert!(matches!(spec.kind, ChainKind::Source));
         assert_eq!(spec.capture_node_name, "arctis_clean_mic.capture");
         assert_eq!(spec.capture_target, Some("alsa_input.hw_mic".to_string()));
-        assert_eq!(spec.playback_media_class, Some("Audio/Source".to_string()));
-        assert!(!spec.playback_passive);
         assert_eq!(spec.playback_node_name, "arctis_clean_mic");
     }
 }

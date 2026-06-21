@@ -4,40 +4,89 @@ use crate::error::AudioError;
 use crate::props::set_control_props_argv;
 use crate::runner::CommandRunner;
 
-// ─── Plugin path constants ────────────────────────────────────────────────────
+// ─── Plugin basename constants ────────────────────────────────────────────────
 
-/// RNNoise LADSPA plugin path on this system.
-pub const RNNOISE_PLUGIN: &str = "/usr/lib64/ladspa/librnnoise_ladspa.so";
+/// RNNoise LADSPA plugin basename (PipeWire resolves via $LADSPA_PATH).
+pub const RNNOISE_PLUGIN_BASENAME: &str = "librnnoise_ladspa";
 /// RNNoise mono label.
 pub const RNNOISE_LABEL_MONO: &str = "noise_suppressor_mono";
-/// swh sc4m compressor path.
-pub const SC4M_PLUGIN: &str = "/usr/lib64/ladspa/sc4m_1916.so";
+
+/// DeepFilterNet LADSPA plugin basename.
+pub const DEEPFILTER_PLUGIN_BASENAME: &str = "libdeep_filter_ladspa";
+/// DeepFilterNet mono label.
+pub const DEEPFILTER_LABEL_MONO: &str = "deep_filter_mono";
+
+/// swh sc4m compressor basename.
+pub const SC4M_PLUGIN_BASENAME: &str = "sc4m_1916";
 /// swh sc4m label.
 pub const SC4M_LABEL: &str = "sc4m";
 
+/// swh gate basename.
+pub const GATE_PLUGIN_BASENAME: &str = "gate_1410";
+/// swh gate label.
+pub const GATE_LABEL: &str = "gate";
+
+// ─── LADSPA multi-distro resolver ────────────────────────────────────────────
+
+/// Search the standard LADSPA plugin directories for `<basename>.so` and return
+/// the first existing absolute path.
+///
+/// Search order:
+/// 1. Each colon-separated directory in `$LADSPA_PATH` (env var).
+/// 2. `/usr/lib64/ladspa` (Fedora/Nobara/RHEL).
+/// 3. `/usr/lib/ladspa` (Debian/Ubuntu/Arch).
+/// 4. `/usr/lib/x86_64-linux-gnu/ladspa` (Debian multiarch).
+///
+/// Returns `None` if no match is found or on any I/O error.
+pub fn resolve_ladspa(basename: &str) -> Option<std::path::PathBuf> {
+    let filename = format!("{basename}.so");
+
+    // Collect search dirs: $LADSPA_PATH first, then system defaults.
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(ladspa_path) = std::env::var("LADSPA_PATH") {
+        for dir in ladspa_path.split(':') {
+            if !dir.is_empty() {
+                dirs.push(std::path::PathBuf::from(dir));
+            }
+        }
+    }
+    dirs.push(std::path::PathBuf::from("/usr/lib64/ladspa"));
+    dirs.push(std::path::PathBuf::from("/usr/lib/ladspa"));
+    dirs.push(std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu/ladspa"));
+
+    for dir in dirs {
+        let candidate = dir.join(&filename);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 // ─── PluginProbe seam ─────────────────────────────────────────────────────────
 
-/// Returns true if a LADSPA plugin .so exists and is (likely) usable.
-/// Builtin nodes are always available and never need a probe check.
+/// Returns true if a LADSPA plugin basename is available (the .so can be found
+/// by the resolver). Builtin nodes are always available and never need a probe check.
 ///
 /// `Send` bound required so that `Box<dyn PluginProbe>` can be held in `Engine<R>`
 /// which the daemon spawns on a thread.
 pub trait PluginProbe: Send {
-    fn ladspa_exists(&self, plugin_path: &str) -> bool;
+    /// Return true if `<basename>.so` is present and (likely) loadable.
+    fn ladspa_available(&self, basename: &str) -> bool;
 }
 
-/// Production probe: `std::path::Path::exists`.
+/// Production probe: uses `resolve_ladspa` to locate the .so.
 pub struct FsPluginProbe;
 
 impl PluginProbe for FsPluginProbe {
-    fn ladspa_exists(&self, plugin_path: &str) -> bool {
-        std::path::Path::new(plugin_path).exists()
+    fn ladspa_available(&self, basename: &str) -> bool {
+        resolve_ladspa(basename).is_some()
     }
 }
 
-/// Test probe: only reports plugins in its allow-set as present.
-/// Counts every `ladspa_exists` call so tests can assert the probe was (or was
-/// not) consulted.
+/// Test probe: only reports basenames in its allow-set as present.
+/// Counts every `ladspa_available` call so tests can assert the probe was (or
+/// was not) consulted.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct MockPluginProbe {
     pub present: std::collections::HashSet<String>,
@@ -53,25 +102,25 @@ impl MockPluginProbe {
         }
     }
 
-    /// Report the given paths as present.
-    pub fn with<I: IntoIterator<Item = S>, S: Into<String>>(paths: I) -> Self {
+    /// Report the given basenames as present.
+    pub fn with<I: IntoIterator<Item = S>, S: Into<String>>(basenames: I) -> Self {
         Self {
-            present: paths.into_iter().map(|s| s.into()).collect(),
+            present: basenames.into_iter().map(|s| s.into()).collect(),
             call_count: Default::default(),
         }
     }
 
-    /// Total number of times `ladspa_exists` has been called on this probe.
+    /// Total number of times `ladspa_available` has been called on this probe.
     pub fn calls(&self) -> usize {
         self.call_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 impl PluginProbe for MockPluginProbe {
-    fn ladspa_exists(&self, plugin_path: &str) -> bool {
+    fn ladspa_available(&self, basename: &str) -> bool {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.present.contains(plugin_path)
+        self.present.contains(basename)
     }
 }
 
@@ -103,11 +152,11 @@ impl StageKind {
         )
     }
 
-    /// Return the LADSPA plugin path for LADSPA stages; None for builtins.
-    pub fn plugin_path(self) -> Option<&'static str> {
+    /// Return the LADSPA plugin basename for LADSPA stages; None for builtins.
+    pub fn plugin_basename(self) -> Option<&'static str> {
         match self {
-            StageKind::Rnnoise => Some(RNNOISE_PLUGIN),
-            StageKind::Compressor => Some(SC4M_PLUGIN),
+            StageKind::Rnnoise => Some(RNNOISE_PLUGIN_BASENAME),
+            StageKind::Compressor => Some(SC4M_PLUGIN_BASENAME),
             _ => None,
         }
     }
@@ -259,8 +308,8 @@ impl<R: CommandRunner, P: PluginProbe> MicBackend<R, P> {
                     true
                 } else {
                     stage
-                        .plugin_path()
-                        .map(|p| self.probe.ladspa_exists(p))
+                        .plugin_basename()
+                        .map(|b| self.probe.ladspa_available(b))
                         .unwrap_or(false)
                 };
                 (stage, available)
@@ -303,14 +352,11 @@ id 40, type PipeWire:Interface:Node/3
             node_name: "arctis_clean_mic".into(),
             description: "Clean Mic".into(),
             channels: ChainChannels::Mono,
-            capture_media_class: "Audio/Source".into(),
+            kind: crate::config::ChainKind::Source,
             capture_node_name: "arctis_clean_mic.capture".into(),
             capture_target: Some("alsa_input.hw_mic".into()),
-            playback_media_class: Some("Audio/Source".into()),
-            playback_passive: false,
             playback_target: None,
             playback_node_name: "arctis_clean_mic".into(),
-            capture_is_source_stream: true,
         }
     }
 
@@ -341,7 +387,7 @@ id 40, type PipeWire:Interface:Node/3
                 name: "mic_rnnoise".into(),
                 node_type: NodeType::Ladspa,
                 label: RNNOISE_LABEL_MONO.into(),
-                plugin: Some(RNNOISE_PLUGIN.into()),
+                plugin: Some(RNNOISE_PLUGIN_BASENAME.into()),
                 port_in: "Input".into(),
                 port_out: "Output".into(),
                 controls: vec![
@@ -390,7 +436,7 @@ id 40, type PipeWire:Interface:Node/3
     #[test]
     fn create_full_chain_spawns_when_rnnoise_present() {
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_MIC, "");
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN]);
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
         let mut be = MicBackend::new(runner, probe, mic_spec());
         let handle = be.create(&full_nodes_with_rnnoise()).unwrap();
 
@@ -427,7 +473,7 @@ id 40, type PipeWire:Interface:Node/3
         let runner = MockRunner::new()
             .with_output(0, LS_WITH_MIC, "") // find_node_id
             .with_output(0, "", ""); // the set
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN]);
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME]);
         let mut be = MicBackend::new(runner, probe, mic_spec());
         be.apply_control("mic_rnnoise", "VAD Threshold (%)", 40.0)
             .unwrap();
@@ -495,7 +541,7 @@ id 40, type PipeWire:Interface:Node/3
 
     #[test]
     fn availability_ladspa_true_when_probe_reports_present() {
-        let probe = MockPluginProbe::with([RNNOISE_PLUGIN, SC4M_PLUGIN]);
+        let probe = MockPluginProbe::with([RNNOISE_PLUGIN_BASENAME, SC4M_PLUGIN_BASENAME]);
         let be = MicBackend::new(MockRunner::new(), probe, mic_spec());
 
         let avail = be.availability(&[StageKind::Rnnoise, StageKind::Compressor]);
