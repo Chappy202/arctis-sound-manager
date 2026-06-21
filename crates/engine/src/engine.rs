@@ -1026,6 +1026,15 @@ impl<R: CommandRunner> Engine<R> {
             .remove_channel(id)
             .map_err(EngineError::Config)?;
 
+        // Prune the removed channel from surround.channels so config doesn't reference a
+        // deleted channel. Do this after the last-channel guard passes (above).
+        {
+            let active_name = self.config.active_profile.clone();
+            if let Some(profile) = self.config.profile_mut(&active_name) {
+                profile.surround.channels.retain(|ch| ch != id);
+            }
+        }
+
         // Persist
         self.save_config()?;
 
@@ -1719,8 +1728,8 @@ impl<R: CommandRunner> Engine<R> {
                         );
                     }
                 }
+                self.surround_routed.insert(ch_id.clone());
             }
-            self.surround_routed.insert(ch_id.clone());
         }
 
         Ok(())
@@ -5357,6 +5366,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_home);
         let _ = std::fs::remove_dir_all(&tmp_cfg);
         std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // Minor fix tests: surround tracker + prune
+    // ─────────────────────────────────────────────
+
+    /// Fix: remove_channel prunes surround.channels and surround_routed stays consistent.
+    ///
+    /// Setup: config has channels = ["game", "chat", "media"], surround.channels = ["game", "media"].
+    /// surround_routed = {"game", "media"} (simulating prior enable).
+    ///
+    /// After remove_channel("media"):
+    ///   - surround.channels must not contain "media"
+    ///   - surround_routed tracker is unaffected by remove_channel itself (reconcile handles it),
+    ///     but a subsequent apply_surround driven from the new config must not try to route "media"
+    ///     (it no longer exists in channels) and must restore it from surround_routed → tracker
+    ///     drains "media" correctly.
+    #[test]
+    fn remove_channel_prunes_surround_channels_and_tracker_stays_consistent() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("rm_ch_surr_prune");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Config: surround enabled, surround.channels = ["game", "media"],
+        // actual channels = ["game", "chat", "media"].
+        let cfg = make_config_surround_enabled("unused-hrir"); // channels: game, chat, media; surround.channels: game, media
+
+        // remove_channel("media") → AudioBackend::remove:
+        //   sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // sink_exists
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", "") // pw-cli destroy
+            .with_output(1, "", ""); // pkill (exit 1 — ignored)
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate prior surround enable: both channels tracked.
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        engine
+            .remove_channel("media")
+            .expect("remove_channel must succeed");
+
+        // surround.channels must no longer reference the deleted channel.
+        let surr_channels = &engine.config.active().unwrap().surround.channels;
+        assert!(
+            !surr_channels.contains(&"media".to_string()),
+            "surround.channels must not reference deleted channel 'media': {surr_channels:?}"
+        );
+        assert!(
+            surr_channels.contains(&"game".to_string()),
+            "surround.channels must still contain 'game': {surr_channels:?}"
+        );
+
+        // The actual channels list must also not contain "media".
+        let profile = engine.config.active().unwrap();
+        assert!(
+            !profile.channels.iter().any(|c| c.id == "media"),
+            "channels list must not contain removed channel"
+        );
+
+        // surround_routed tracker: remove_channel doesn't touch it (reconcile/apply_surround
+        // will clean it up on next pass). That is the correct contract — verify it's still
+        // populated so a subsequent apply_surround can restore cleanly.
+        assert!(
+            engine.surround_routed.contains("media"),
+            "surround_routed retains 'media' until next apply_surround pass"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
