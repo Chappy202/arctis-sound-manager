@@ -23,6 +23,7 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.11.1"
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-updater": "^2.10.1"
   }
 }

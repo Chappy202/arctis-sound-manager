@@ -5,3 +5,9 @@
 # Harness scratch / worktree storage
 .claude/
 .superpowers/
+
+# Tauri updater signing private key — NEVER commit; store in CI secret TAURI_SIGNING_PRIVATE_KEY
+*.key
+# But allow the public key to be committed if placed in the repo
+!*.key.pub
+.signing/

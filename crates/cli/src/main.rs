@@ -1,6 +1,7 @@
 mod coexist;
 mod daemon;
 mod dial;
+mod setup_udev;
 
 use arctis_audio::{
     AppMatch, AudioBackend, BandKind, ChannelManager, ChannelSetConfig, EqBand, EqModel,
@@ -82,6 +83,12 @@ enum Command {
     Coexist {
         #[command(subcommand)]
         action: CoexistAction,
+    },
+    /// Install the udev rule for hidraw access (requires pkexec / root).
+    SetupUdev {
+        /// Preview the pkexec command without executing it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1190,6 +1197,7 @@ fn main() -> ExitCode {
         Command::Profile { action } => dispatch_profile(action),
         Command::Coexist { action } => dispatch_coexist(action),
         Command::Apply => dispatch_apply(),
+        Command::SetupUdev { dry_run } => setup_udev::dispatch_setup_udev(&mut RealRunner, dry_run),
         Command::Daemon { foreground: _ } => {
             // Coexist check: scan for legacy nodes using pw-cli ls Node output.
             let node_stdout = std::process::Command::new("pw-cli")
