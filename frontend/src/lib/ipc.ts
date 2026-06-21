@@ -26,6 +26,10 @@ export interface ChannelSnapshot {
   output_device: string | null;
   /** Full per-band EQ state; empty = flat / no overrides. */
   eq_bands: EqBandSnapshot[];
+  /** Software volume in dB. Range: -60..=+6. 0 dB = unity gain. */
+  volume_db: number;
+  /** Whether the channel is muted. */
+  muted: boolean;
 }
 
 export interface MicStageSnapshot {
@@ -106,6 +110,23 @@ export function buildDeviceSetArgs(
   return { control, value };
 }
 
+/** Builds the arg object for set_channel_volume.
+ * volume_db has no rename — Tauri v2 snake_case param names pass through as-is. */
+export function buildSetChannelVolumeArgs(
+  channel: string,
+  volume_db: number,
+): { channel: string; volume_db: number } {
+  return { channel, volume_db };
+}
+
+/** Builds the arg object for set_channel_mute. */
+export function buildSetChannelMuteArgs(
+  channel: string,
+  muted: boolean,
+): { channel: string; muted: boolean } {
+  return { channel, muted };
+}
+
 /** Builds the camelCase arg object for the mic_eq_band command.
  * Tauri v2 converts these camelCase keys back to the Rust command's snake_case params
  * at the invoke boundary — the same round-trip as buildSetEqBandArgs; this is intentional. */
@@ -141,6 +162,20 @@ export const profileNew = (name: string): Promise<EngineState> =>
  */
 export const setChannelOutput = (channel: string, device: string | null): Promise<EngineState> =>
   invoke<EngineState>("set_channel_output", buildSetChannelOutputArgs(channel, device));
+
+/**
+ * Set the software volume (dB) for a channel. Range: -60..=+6. 0 dB = unity gain.
+ * Returns the updated EngineState for immediate store application.
+ */
+export const setChannelVolume = (channel: string, volumeDb: number): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_volume", buildSetChannelVolumeArgs(channel, volumeDb));
+
+/**
+ * Set the mute state for a channel.
+ * Returns the updated EngineState for immediate store application.
+ */
+export const setChannelMute = (channel: string, muted: boolean): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_mute", buildSetChannelMuteArgs(channel, muted));
 
 /** Update a parametric EQ band; returns updated EngineState. */
 export const setEqBand = (

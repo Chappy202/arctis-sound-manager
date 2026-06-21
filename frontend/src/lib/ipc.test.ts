@@ -12,6 +12,8 @@ import {
   buildSetRouteArgs,
   buildSetChannelOutputArgs,
   buildDeviceSetArgs,
+  buildSetChannelVolumeArgs,
+  buildSetChannelMuteArgs,
 } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -137,6 +139,62 @@ describe("buildDeviceSetArgs", () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildSetChannelVolumeArgs
+// ---------------------------------------------------------------------------
+describe("buildSetChannelVolumeArgs", () => {
+  it("passes channel and volume_db through with snake_case key", () => {
+    const args = buildSetChannelVolumeArgs("game", -6.0);
+    expect(args).toEqual({ channel: "game", volume_db: -6.0 });
+  });
+
+  it("uses snake_case volume_db key (not camelCase)", () => {
+    const args = buildSetChannelVolumeArgs("chat", 0.0);
+    expect(Object.keys(args)).toContain("volume_db");
+    expect(Object.keys(args)).not.toContain("volumeDb");
+  });
+
+  it("produces exactly two keys: channel and volume_db", () => {
+    const args = buildSetChannelVolumeArgs("media", 6.0);
+    expect(Object.keys(args).sort()).toEqual(["channel", "volume_db"]);
+  });
+
+  it("accepts min boundary -60 dB", () => {
+    const args = buildSetChannelVolumeArgs("game", -60.0);
+    expect(args.volume_db).toBe(-60.0);
+  });
+
+  it("accepts max boundary +6 dB", () => {
+    const args = buildSetChannelVolumeArgs("game", 6.0);
+    expect(args.volume_db).toBe(6.0);
+  });
+
+  it("accepts fractional dB values", () => {
+    const args = buildSetChannelVolumeArgs("chat", -3.5);
+    expect(args.volume_db).toBeCloseTo(-3.5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSetChannelMuteArgs
+// ---------------------------------------------------------------------------
+describe("buildSetChannelMuteArgs", () => {
+  it("passes channel and muted=true", () => {
+    const args = buildSetChannelMuteArgs("game", true);
+    expect(args).toEqual({ channel: "game", muted: true });
+  });
+
+  it("passes channel and muted=false", () => {
+    const args = buildSetChannelMuteArgs("chat", false);
+    expect(args).toEqual({ channel: "chat", muted: false });
+  });
+
+  it("produces exactly two keys: channel and muted", () => {
+    const args = buildSetChannelMuteArgs("media", true);
+    expect(Object.keys(args).sort()).toEqual(["channel", "muted"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // EngineState shape validation (type-level: exercised by TS compilation,
 // here we also do runtime shape checks against a mock snapshot)
 // ---------------------------------------------------------------------------
@@ -159,7 +217,7 @@ describe("EngineState shape (runtime guard)", () => {
     expect(typeof snapshot.device_fields).toBe("object");
   });
 
-  it("accepts a snapshot with populated channels including eq_bands", () => {
+  it("accepts a snapshot with populated channels including eq_bands, volume_db, muted", () => {
     const snapshot = {
       active_profile: "Gaming",
       profiles: ["Default", "Gaming"],
@@ -171,6 +229,8 @@ describe("EngineState shape (runtime guard)", () => {
           eq_bands: [
             { kind: "peaking", freq_hz: 1000, q: 1.4, gain_db: 3.0 },
           ],
+          volume_db: -6.0,
+          muted: false,
         },
       ],
       routes: [["discord", "chat"]] as [string, string][],
@@ -184,6 +244,8 @@ describe("EngineState shape (runtime guard)", () => {
     expect(ch.eq_bands).toHaveLength(1);
     expect(ch.eq_bands[0].freq_hz).toBe(1000);
     expect(ch.eq_bands[0].gain_db).toBe(3.0);
+    expect(ch.volume_db).toBe(-6.0);
+    expect(ch.muted).toBe(false);
 
     expect(snapshot.routes[0]).toEqual(["discord", "chat"]);
     expect(snapshot.device_fields.battery).toBe("85");

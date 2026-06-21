@@ -1,8 +1,12 @@
 <script lang="ts">
   import type { ChannelSnapshot } from "../ipc.js";
-  import { setChannelOutput } from "../ipc.js";
+  import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
+
+  // Domain bounds — mirror crates/domain/src/eq_bounds.rs CHANNEL_VOLUME_MIN/MAX_DB
+  const VOLUME_MIN_DB = -60;
+  const VOLUME_MAX_DB = 6;
 
   interface Props {
     channel: ChannelSnapshot;
@@ -73,6 +77,58 @@
     }
   }
 
+  // -----------------------------------------------------------------------
+  // Volume / mute handlers
+  // -----------------------------------------------------------------------
+  let volumeBusy = $state(false);
+  let muteBusy = $state(false);
+
+  /** Format a dB value for the readout: "0.0 dB", "-60 dB", "+6.0 dB". */
+  function formatDb(db: number): string {
+    const fixed = db.toFixed(1);
+    return db > 0 ? `+${fixed} dB` : `${fixed} dB`;
+  }
+
+  /** Translate slider value (number) → slider position % for the fader fill. */
+  function sliderPercent(db: number): number {
+    const pct = ((db - VOLUME_MIN_DB) / (VOLUME_MAX_DB - VOLUME_MIN_DB)) * 100;
+    return Math.max(0, Math.min(100, pct));
+  }
+
+  async function handleVolumeChange(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const db = parseFloat(input.value);
+    if (volumeBusy || isNaN(db)) return;
+    volumeBusy = true;
+    try {
+      const newState = await setChannelVolume(channel.id, db);
+      if (newState) {
+        engineState.set(newState);
+      }
+    } catch (err) {
+      console.error("[ChannelStrip] setChannelVolume failed:", err);
+      // Revert input to reflect actual state
+      input.value = String(channel.volume_db);
+    } finally {
+      volumeBusy = false;
+    }
+  }
+
+  async function handleMuteToggle() {
+    if (muteBusy) return;
+    muteBusy = true;
+    try {
+      const newState = await setChannelMute(channel.id, !channel.muted);
+      if (newState) {
+        engineState.set(newState);
+      }
+    } catch (err) {
+      console.error("[ChannelStrip] setChannelMute failed:", err);
+    } finally {
+      muteBusy = false;
+    }
+  }
+
   function openEq() {
     // Store the target channel id in sessionStorage so the EQ page can read it.
     sessionStorage.setItem("eq:channel", channel.id);
@@ -98,27 +154,43 @@
 
   <p class="channel-node-name" title={displayName}>{displayName}</p>
 
-  <!-- ===== Vertical placeholder for volume slot (disabled) ===== -->
-  <div
-    class="volume-slot"
-    title="Volume and mute are not yet supported by the engine"
-    aria-label="Volume control — not supported"
-  >
+  <!-- ===== Volume slot ===== -->
+  <div class="volume-slot" class:volume-busy={volumeBusy}>
+    <!-- Custom fader visual (decorative — mirrors the range input value) -->
     <div class="fader-track" aria-hidden="true">
-      <div class="fader-fill" style="height: 70%"></div>
-      <div class="fader-thumb" style="bottom: calc(70% - 8px)"></div>
+      <div class="fader-fill" style="height: {sliderPercent(channel.volume_db)}%"></div>
+      <div class="fader-thumb" style="bottom: calc({sliderPercent(channel.volume_db)}% - 8px)"></div>
     </div>
-    <div class="fader-readout" aria-hidden="true">— dB</div>
+
+    <!-- Accessible range input (the real interactive element) -->
+    <input
+      class="fader-input"
+      type="range"
+      min={VOLUME_MIN_DB}
+      max={VOLUME_MAX_DB}
+      step="0.5"
+      value={channel.volume_db}
+      disabled={volumeBusy}
+      aria-label="Volume for {channel.id.toUpperCase()} ({formatDb(channel.volume_db)})"
+      aria-valuemin={VOLUME_MIN_DB}
+      aria-valuemax={VOLUME_MAX_DB}
+      aria-valuenow={channel.volume_db}
+      onchange={handleVolumeChange}
+    />
+
+    <div class="fader-readout">{formatDb(channel.volume_db)}</div>
 
     <button
       class="mute-btn"
-      disabled
-      title="Mute not supported by the engine"
-      aria-label="Mute ({channel.id.toUpperCase()}) — not supported"
+      class:muted={channel.muted}
+      disabled={muteBusy}
+      title={channel.muted ? "Unmute" : "Mute"}
+      aria-label="{channel.muted ? 'Unmute' : 'Mute'} {channel.id.toUpperCase()}"
+      aria-pressed={channel.muted}
+      onclick={handleMuteToggle}
     >
-      <span aria-hidden="true">🔇</span>
+      <span aria-hidden="true">{channel.muted ? "🔇" : "🔊"}</span>
     </button>
-    <span class="disabled-hint">Volume/mute not yet supported by the engine</span>
   </div>
 
   <!-- ===== Output device selector ===== -->
@@ -207,7 +279,7 @@
     text-overflow: ellipsis;
   }
 
-  /* ===== Volume slot (disabled / placeholder) ===== */
+  /* ===== Volume slot ===== */
   .volume-slot {
     display: flex;
     flex-direction: column;
@@ -216,8 +288,15 @@
     flex: 1;
     min-height: 100px;
     position: relative;
+    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
+  .volume-slot.volume-busy {
+    opacity: 0.6;
+    pointer-events: none;
+  }
+
+  /* Decorative vertical track — overlaid behind the invisible range input */
   .fader-track {
     position: relative;
     width: 4px;
@@ -225,7 +304,7 @@
     background: var(--ss-surface-input);
     border-radius: var(--ss-radius-pill);
     flex-shrink: 0;
-    opacity: 0.35;
+    pointer-events: none;
   }
 
   .fader-fill {
@@ -233,8 +312,9 @@
     bottom: 0;
     left: 0;
     width: 100%;
-    background: var(--ss-text-disabled);
+    background: var(--ss-accent);
     border-radius: var(--ss-radius-pill);
+    transition: height var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
   .fader-thumb {
@@ -243,17 +323,36 @@
     transform: translateX(-50%);
     width: 16px;
     height: 16px;
-    background: var(--ss-text-disabled);
+    background: var(--ss-accent);
     border-radius: var(--ss-radius-pill);
     box-shadow: var(--ss-e1);
+    transition: bottom var(--ss-dur-fast) var(--ss-ease-standard);
+    pointer-events: none;
+  }
+
+  /* Transparent range input positioned over the decorative track */
+  .fader-input {
+    position: absolute;
+    /* Rotate so the range runs bottom-to-top along the fader track. */
+    writing-mode: vertical-lr;
+    direction: rtl;
+    width: 80px;
+    height: 24px;
+    opacity: 0;
+    cursor: pointer;
+    margin-top: 0;
+    z-index: 1;
+  }
+
+  .fader-input:disabled {
+    cursor: not-allowed;
   }
 
   .fader-readout {
     font-family: var(--ss-font-mono);
     font-size: var(--ss-type-readout-size);
     font-variant-numeric: tabular-nums;
-    color: var(--ss-text-disabled);
-    opacity: 0.5;
+    color: var(--ss-text-secondary);
   }
 
   .mute-btn {
@@ -265,24 +364,31 @@
     border-radius: var(--ss-radius-xs);
     background: var(--ss-surface-input);
     border: var(--ss-border-width) solid var(--ss-border);
-    cursor: not-allowed;
-    opacity: 0.35;
+    cursor: pointer;
     font-size: 13px;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  .disabled-hint {
-    font-family: var(--ss-font-ui);
-    font-size: 9px;
-    font-weight: 400;
-    line-height: 1.3;
-    color: var(--ss-text-disabled);
-    text-align: center;
-    letter-spacing: 0.01em;
-    display: none; /* shown on :hover of the slot */
+  .mute-btn:hover {
+    border-color: var(--ss-border-strong);
+    background: var(--ss-surface-2);
   }
 
-  .volume-slot:hover .disabled-hint {
-    display: block;
+  .mute-btn.muted {
+    background: var(--ss-accent);
+    border-color: var(--ss-accent-border);
+  }
+
+  .mute-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .mute-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
   }
 
   /* ===== Output device selector ===== */

@@ -169,6 +169,26 @@ pub async fn mic_suppression_backend(
     call(&state, Request::MicSuppressionBackend { backend }).await
 }
 
+// ── F2.2: Per-channel volume / mute commands ─────────────────────────────────
+
+#[tauri::command]
+pub async fn set_channel_volume(
+    channel: String,
+    volume_db: f32,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetChannelVolume { channel, volume_db }).await
+}
+
+#[tauri::command]
+pub async fn set_channel_mute(
+    channel: String,
+    muted: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetChannelMute { channel, muted }).await
+}
+
 // ── F1.5: Surround / HRIR commands ──────────────────────────────────────────
 
 #[tauri::command]
