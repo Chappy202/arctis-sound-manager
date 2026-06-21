@@ -29,7 +29,10 @@ pub use mic::{
     DEEPFILTER_LABEL_MONO, DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME,
     RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME, SC4M_LABEL, SC4M_PLUGIN_BASENAME,
 };
-pub use props::{band_props_json, control_props_json, set_band_props_argv, set_control_props_argv};
+pub use props::{
+    band_props_json, control_props_json, node_volume_props_json, set_band_props_argv,
+    set_control_props_argv, set_node_volume_props_argv,
+};
 pub use pw_version::{parse_pw_version, query_pw_version, supports_builtin_noisegate};
 pub use routing::{
     clear_stream_target_argv, move_stream_argv, node_rules_fragment, parse_stream_id,

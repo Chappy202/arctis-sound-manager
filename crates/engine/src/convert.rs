@@ -483,6 +483,8 @@ mod tests {
                     description: "Game".to_string(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "chat".to_string(),
@@ -490,6 +492,8 @@ mod tests {
                     description: "Chat".to_string(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
             ],
             routes: vec![],
@@ -545,6 +549,8 @@ mod tests {
             description: "Game".into(),
             output_device: None,
             eq: vec![],
+            volume_db: 0.0,
+            muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
         assert_eq!(model, EqModel::default_10band());
@@ -563,6 +569,8 @@ mod tests {
                 q: 1.0,
                 gain_db: 2.0,
             }],
+            volume_db: 0.0,
+            muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
         assert_eq!(model.bands.len(), 1);
@@ -578,6 +586,8 @@ mod tests {
             description: "Media".into(),
             output_device: Some("speakers".into()),
             eq: vec![],
+            volume_db: 0.0,
+            muted: false,
         };
         let def = channel_def_from_cfg(&ch);
         assert_eq!(def.id, "media");

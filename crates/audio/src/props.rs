@@ -78,6 +78,32 @@ pub fn set_control_props_argv(
     ])
 }
 
+/// The `<param-json>` for `pw-cli s <id> Props <json>` that sets a node's
+/// volume (channelVolumes array) and mute (bool) via SPA Props.
+pub fn node_volume_props_json(channel_volumes: &[f32], mute: bool) -> String {
+    let vols: Vec<String> = channel_volumes.iter().map(|v| fmt_f(*v)).collect();
+    let vols_str = vols.join(" ");
+    let mute_str = if mute { "true" } else { "false" };
+    format!("{{ channelVolumes = [ {vols_str} ] mute = {mute_str} }}")
+}
+
+/// Full argv (after the `pw-cli` program) to set a node's volume+mute live.
+pub fn set_node_volume_props_argv(
+    node_id: &str,
+    channel_volumes: &[f32],
+    mute: bool,
+) -> Result<Vec<String>, AudioError> {
+    if node_id.trim().is_empty() {
+        return Err(AudioError::Invalid("empty node id".into()));
+    }
+    Ok(vec![
+        "s".to_string(),
+        node_id.to_string(),
+        "Props".to_string(),
+        node_volume_props_json(channel_volumes, mute),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +170,36 @@ mod tests {
     #[test]
     fn set_control_props_argv_rejects_empty_node_id() {
         assert!(set_control_props_argv("  ", "mic_gain", "Mult", 1.0).is_err());
+    }
+
+    #[test]
+    fn node_volume_props_json_stereo_unmuted() {
+        let json = node_volume_props_json(&[1.0, 1.0], false);
+        assert_eq!(json, "{ channelVolumes = [ 1.0 1.0 ] mute = false }");
+    }
+
+    #[test]
+    fn node_volume_props_json_stereo_muted() {
+        let json = node_volume_props_json(&[0.5, 0.5], true);
+        assert_eq!(json, "{ channelVolumes = [ 0.5 0.5 ] mute = true }");
+    }
+
+    #[test]
+    fn set_node_volume_props_argv_is_s_id_props_json() {
+        let argv = set_node_volume_props_argv("42", &[1.0, 1.0], false).unwrap();
+        assert_eq!(
+            argv,
+            vec![
+                "s".to_string(),
+                "42".to_string(),
+                "Props".to_string(),
+                "{ channelVolumes = [ 1.0 1.0 ] mute = false }".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_node_volume_props_argv_rejects_empty_node_id() {
+        assert!(set_node_volume_props_argv("  ", &[1.0, 1.0], false).is_err());
     }
 }

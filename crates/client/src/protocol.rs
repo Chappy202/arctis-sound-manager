@@ -94,6 +94,16 @@ pub enum Request {
     },
     /// Return the current surround snapshot (EngineState.surround).
     SurroundStatus,
+    /// Set the software volume (dB) for a single channel. Range: -60..=+6.
+    SetChannelVolume {
+        channel: String,
+        volume_db: f32,
+    },
+    /// Set the mute state for a single channel.
+    SetChannelMute {
+        channel: String,
+        muted: bool,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -776,6 +786,67 @@ mod tests {
         let req = Request::MicEnable { enabled: false };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──
+
+    #[test]
+    fn parse_set_channel_volume_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"set-channel-volume","channel":"game","volume_db":-6.0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: -6.0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_set_channel_mute_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"set-channel-mute","channel":"chat","muted":true}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::SetChannelMute {
+                channel: "chat".into(),
+                muted: true,
+            }
+        );
+    }
+
+    #[test]
+    fn request_set_channel_volume_round_trips() {
+        let req = Request::SetChannelVolume {
+            channel: "game".into(),
+            volume_db: -6.0,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("set-channel-volume"),
+            "cmd tag must be set-channel-volume, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_set_channel_mute_round_trips() {
+        let req = Request::SetChannelMute {
+            channel: "chat".into(),
+            muted: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("set-channel-mute"),
+            "cmd tag must be set-channel-mute, got: {json}"
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

@@ -1,11 +1,11 @@
 use arctis_domain::eq_bounds::{
-    EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
-    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
-    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
-    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
-    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
-    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
-    MIC_VAD_THRESHOLD_MIN,
+    CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, EQ_FREQ_MAX_HZ, EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB,
+    EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use serde::{Deserialize, Serialize};
 
@@ -240,6 +240,12 @@ pub struct ChannelConfig {
     pub output_device: Option<String>, // hardware sink node.name, or None = default
     #[serde(default)]
     pub eq: Vec<EqBandConfig>, // empty => flat 10-band default at apply time
+    /// Software volume in dB. 0.0 = unity gain. Range: -60..=+6.
+    #[serde(default)]
+    pub volume_db: f32,
+    /// Whether the channel is muted.
+    #[serde(default)]
+    pub muted: bool,
 }
 
 /// Application-level routing rule.
@@ -325,6 +331,8 @@ impl Config {
                 description: "Game audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "chat".to_string(),
@@ -332,6 +340,8 @@ impl Config {
                 description: "Chat audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "media".to_string(),
@@ -339,6 +349,8 @@ impl Config {
                 description: "Media audio channel".to_string(),
                 output_device: None,
                 eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
             },
         ];
 
@@ -420,6 +432,12 @@ impl Config {
                             band.gain_db, EQ_GAIN_MIN_DB, EQ_GAIN_MAX_DB, channel.id
                         )));
                     }
+                }
+                if !(CHANNEL_VOLUME_MIN_DB..=CHANNEL_VOLUME_MAX_DB).contains(&channel.volume_db) {
+                    return Err(ConfigError::Invalid(format!(
+                        "volume_db {} dB out of range {}..={} in channel '{}'",
+                        channel.volume_db, CHANNEL_VOLUME_MIN_DB, CHANNEL_VOLUME_MAX_DB, channel.id
+                    )));
                 }
             }
 
@@ -1184,6 +1202,71 @@ description = "Chat"
                 profile.name
             );
         }
+    }
+
+    // ── F2.1: per-channel volume/mute config tests ────────────────────────────
+
+    /// volume_db=0.0 (default) passes validation.
+    #[test]
+    fn default_channel_volume_is_valid() {
+        let cfg = Config::default_config();
+        assert!(cfg.validate().is_ok(), "default config must be valid");
+        let profile = cfg.active().unwrap();
+        for ch in &profile.channels {
+            assert!(
+                (ch.volume_db - 0.0).abs() < f32::EPSILON,
+                "default volume_db must be 0.0"
+            );
+            assert!(!ch.muted, "default muted must be false");
+        }
+    }
+
+    /// volume_db at max boundary (+6.0) passes.
+    #[test]
+    fn validate_accepts_channel_volume_at_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = 6.0;
+        assert!(cfg.validate().is_ok(), "+6.0 dB must be accepted");
+    }
+
+    /// volume_db at min boundary (-60.0) passes.
+    #[test]
+    fn validate_accepts_channel_volume_at_min() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -60.0;
+        assert!(cfg.validate().is_ok(), "-60.0 dB must be accepted");
+    }
+
+    /// volume_db just above max (+6.01) is rejected.
+    #[test]
+    fn validate_rejects_channel_volume_above_max() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = 6.01;
+        let err = cfg.validate().expect_err("+6.01 dB should be rejected");
+        assert!(matches!(err, ConfigError::Invalid(_)), "expected Invalid");
+    }
+
+    /// volume_db just below min (-60.01) is rejected.
+    #[test]
+    fn validate_rejects_channel_volume_below_min() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -60.01;
+        let err = cfg.validate().expect_err("-60.01 dB should be rejected");
+        assert!(matches!(err, ConfigError::Invalid(_)), "expected Invalid");
+    }
+
+    /// Config without volume_db/muted in TOML round-trips correctly (backward compat).
+    #[test]
+    fn channel_config_toml_round_trips_with_volume_fields() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_db = -3.5;
+        cfg.profiles[0].channels[0].muted = true;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(
+            cfg, deserialized,
+            "TOML round-trip must preserve volume fields"
+        );
     }
 
     /// Old config with `rnnoise` key deserializes via alias into `suppression`.

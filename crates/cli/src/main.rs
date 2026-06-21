@@ -145,6 +145,21 @@ enum ChannelCmd {
         #[command(subcommand)]
         action: ChannelOutputAction,
     },
+    /// Set the software volume for a channel in dB (-60..+6). 0 = unity.
+    Volume {
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// Volume in dB, e.g. -6.0 for -6 dB.
+        #[arg(allow_negative_numbers = true)]
+        db: f32,
+    },
+    /// Mute or unmute a channel.
+    Mute {
+        /// Channel id: game | chat | media.
+        channel: String,
+        /// `on` to mute, `off` to unmute.
+        state: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -954,6 +969,61 @@ fn main() -> ExitCode {
                     }
                 }
             },
+            ChannelCmd::Volume { channel, db } => {
+                let req = daemon::Request::SetChannelVolume {
+                    channel: channel.clone(),
+                    volume_db: db,
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{channel}' volume set to {db} dB");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ChannelCmd::Mute { channel, state } => {
+                let muted = match state.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        eprintln!("mute state must be 'on' or 'off', got: {other}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let req = daemon::Request::SetChannelMute {
+                    channel: channel.clone(),
+                    muted,
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        let mute_str = if muted { "muted" } else { "unmuted" };
+                        println!("channel '{channel}' {mute_str}");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Command::Device { action } => dispatch_device(action),
         Command::Mic { action } => dispatch_mic(action),
@@ -1383,6 +1453,52 @@ mod tests {
             } => {
                 assert_eq!(channel, "media");
                 assert_eq!(device, "alsa_output.speakers");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── F2.1: channel volume/mute subcommand parsing tests ───────────────────
+
+    #[test]
+    fn channel_volume_set() {
+        let cmd =
+            parse(&["channel", "volume", "game", "-6.0"]).expect("channel volume should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Volume { channel, db },
+            } => {
+                assert_eq!(channel, "game");
+                assert!((db - (-6.0_f32)).abs() < 0.001, "db must be -6.0, got {db}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_mute_set() {
+        let cmd = parse(&["channel", "mute", "chat", "on"]).expect("channel mute on should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Mute { channel, state },
+            } => {
+                assert_eq!(channel, "chat");
+                assert_eq!(state, "on");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_unmute_set() {
+        let cmd =
+            parse(&["channel", "mute", "media", "off"]).expect("channel mute off should parse");
+        match cmd {
+            super::Command::Channel {
+                action: super::ChannelCmd::Mute { channel, state },
+            } => {
+                assert_eq!(channel, "media");
+                assert_eq!(state, "off");
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -172,6 +172,18 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SetChannelVolume { channel, volume_db } => {
+            match engine.set_channel_volume(&channel, volume_db) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::SetChannelMute { channel, muted } => {
+            match engine.set_channel_mute(&channel, muted) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
     }
 }
 
@@ -379,6 +391,8 @@ mod tests {
                 description: "Game".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "chat".into(),
@@ -386,6 +400,8 @@ mod tests {
                 description: "Chat".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
             ChannelConfig {
                 id: "media".into(),
@@ -393,6 +409,8 @@ mod tests {
                 description: "Media".into(),
                 output_device: None,
                 eq: vec![],
+                volume_db: 0.0,
+                muted: false,
             },
         ];
         Config {
@@ -439,6 +457,11 @@ mod tests {
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+        }
+        // Phase 2b: 3 channels × (1 ls + 1 Props set for volume/mute)
+        for _ in 0..3 {
+            r = r.with_output(0, &ls, "");
+            r = r.with_output(0, "", "");
         }
         r
     }
@@ -1140,6 +1163,92 @@ mod tests {
 
         drop(engine);
         worker.join().expect("fake worker must not panic");
+    }
+
+    // ── F2.1: SetChannelVolume / SetChannelMute dispatch tests ───────────────
+
+    #[test]
+    fn handle_set_channel_volume_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_vol_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // set_channel_volume calls apply_volume_mute: 1 ls (find_node_id) + 1 Props set
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // pw-cli s ... Props ...
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: -6.0,
+            },
+        );
+        assert!(
+            resp.ok,
+            "set_channel_volume must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.unwrap();
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game.volume_db, -6.0, "volume_db must be updated in state");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_mute_ok() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_mute_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // set_channel_mute calls apply_volume_mute: 1 ls + 1 Props set
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelMute {
+                channel: "chat".into(),
+                muted: true,
+            },
+        );
+        assert!(
+            resp.ok,
+            "set_channel_mute must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.unwrap();
+        let chat = state.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert!(chat.muted, "muted must be true in state");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_set_channel_volume_out_of_range_errors() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SetChannelVolume {
+                channel: "game".into(),
+                volume_db: 99.0, // out of range
+            },
+        );
+        assert!(!resp.ok, "out-of-range volume must return ok:false");
+        assert!(resp.error.is_some());
     }
 
     // ── Integration test: shutdown breaks accept loop ─────────────────────────

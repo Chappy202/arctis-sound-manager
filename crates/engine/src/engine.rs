@@ -6,12 +6,12 @@ use arctis_audio::{
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
-    MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB,
-    MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN, MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB,
-    MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB, MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN,
-    MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ, MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS,
-    MIC_VAD_RETRO_GRACE_MAX_MS, MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX,
-    MIC_VAD_THRESHOLD_MIN,
+    CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
+    MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
+    MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
+    MIC_VAD_GRACE_MAX_MS, MIC_VAD_GRACE_MIN_MS, MIC_VAD_RETRO_GRACE_MAX_MS,
+    MIC_VAD_RETRO_GRACE_MIN_MS, MIC_VAD_THRESHOLD_MAX, MIC_VAD_THRESHOLD_MIN,
 };
 use std::sync::Arc;
 
@@ -229,6 +229,8 @@ impl<R: CommandRunner> Engine<R> {
                                 gain_db: b.gain_db,
                             })
                             .collect(),
+                        volume_db: ch.volume_db,
+                        muted: ch.muted,
                     })
                     .collect()
             })
@@ -586,6 +588,99 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Set the software volume for a single channel. Validates range, persists, applies live, emits.
+    pub fn set_channel_volume(
+        &mut self,
+        channel_id: &str,
+        volume_db: f32,
+    ) -> Result<(), EngineError> {
+        if !(CHANNEL_VOLUME_MIN_DB..=CHANNEL_VOLUME_MAX_DB).contains(&volume_db) {
+            return Err(EngineError::BadRequest(format!(
+                "volume_db {volume_db} out of range {CHANNEL_VOLUME_MIN_DB}..={CHANNEL_VOLUME_MAX_DB}"
+            )));
+        }
+        // Mutate config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.volume_db = volume_db;
+        }
+        self.save_config()?;
+        // Apply live
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_volume_mute(volume_db, channel.muted)?;
+        }
+        self.emit(Event::ChannelVolumeSet {
+            channel_id: channel_id.to_string(),
+            volume_db,
+        });
+        Ok(())
+    }
+
+    /// Set the mute state for a single channel. Persists, applies live, emits.
+    pub fn set_channel_mute(&mut self, channel_id: &str, muted: bool) -> Result<(), EngineError> {
+        // Mutate config
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.muted = muted;
+        }
+        self.save_config()?;
+        // Apply live
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_volume_mute(channel.volume_db, muted)?;
+        }
+        self.emit(Event::ChannelMuteSet {
+            channel_id: channel_id.to_string(),
+            muted,
+        });
+        Ok(())
+    }
+
     /// Create a new profile by cloning the currently active one under `name`,
     /// make it active, persist the config, reconcile the graph to it, and emit
     /// a `ProfileCreated` event.
@@ -654,18 +749,30 @@ impl<R: CommandRunner> Engine<R> {
             let eq_model = convert::eq_model_for(ch)?;
             let def = convert::channel_def_from_cfg(ch);
             let spec = def.sink_spec();
-            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
-            if let Err(e) = be.apply_all(&eq_model) {
-                let freshness = if freshly_spawned.contains(&ch.id) {
-                    "freshly-spawned"
-                } else {
-                    "already-present"
-                };
-                eprintln!(
-                    "warning: reconcile apply_all for channel '{}' ({freshness}) failed \
-                     (EQ is conf-baked; ignoring): {e}",
-                    ch.id
-                );
+            {
+                let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec.clone());
+                if let Err(e) = be.apply_all(&eq_model) {
+                    let freshness = if freshly_spawned.contains(&ch.id) {
+                        "freshly-spawned"
+                    } else {
+                        "already-present"
+                    };
+                    eprintln!(
+                        "warning: reconcile apply_all for channel '{}' ({freshness}) failed \
+                         (EQ is conf-baked; ignoring): {e}",
+                        ch.id
+                    );
+                }
+            }
+            // Volume/mute apply
+            {
+                let mut be2 = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+                if let Err(e) = be2.apply_volume_mute(ch.volume_db, ch.muted) {
+                    eprintln!(
+                        "warning: reconcile apply_volume_mute for channel '{}' failed (ignoring): {e}",
+                        ch.id
+                    );
+                }
             }
         }
 
@@ -1429,6 +1536,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1436,6 +1545,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1443,6 +1554,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -1466,6 +1579,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1473,6 +1588,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1480,6 +1597,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: Some("alsa_output.speakers".into()),
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![RouteConfig {
@@ -1580,59 +1699,66 @@ mod tests {
     #[test]
     fn reconcile_emits_expected_argv_sinks_already_present() {
         // Channels already present → no spawns for sink creation.
-        // Each channel: 1 ls for create (present, skip), then apply_all: 1 ls (find_node_id) + 10 set-band calls.
+        // Per channel: Phase 2 (1 ls + 10 bands) then Phase 2b (1 ls + 1 Props), interleaved.
+        // Reconcile processes each channel fully before moving to the next.
         let ls = ls_all_present();
 
-        // Queue outputs:
-        // Phase 1 (channels up): 3 channels × 1 ls-Node (sinks present, no spawn)
-        // Phase 2 (apply_all per channel): 3 channels × (1 ls-Node + 10 pw-cli s <id> Props)
-        // Phase 3 (no output devices)
-        // Phase 4 (no routes)
+        // Queue outputs (interleaved per channel):
+        // Phase 1 (channels up): 3 × 1 ls-Node
+        // Per channel: (1 ls + 10 bands) + (1 ls + 1 Props)
+        // Phase 5: 1 ls (mic disabled)
+        // Phase 6: 1 ls (surround disabled)
         let runner = MockRunner::new()
             // Phase 1: channel up — game (present), chat (present), media (present)
-            .with_output(0, &ls, "")
-            .with_output(0, &ls, "")
-            .with_output(0, &ls, "")
-            // Phase 2: apply_all game — find_node_id + 10 bands
-            .with_output(0, &ls, "") // game ls Node
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // 10 band sets
-            // Phase 2: apply_all chat — find_node_id + 10 bands
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            // Phase 2: apply_all media — find_node_id + 10 bands
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
+            .with_output(0, &ls, "") // [0]
+            .with_output(0, &ls, "") // [1]
+            .with_output(0, &ls, "") // [2]
+            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [3] game EQ ls
+            .with_output(0, "", "") // [4]
+            .with_output(0, "", "") // [5]
+            .with_output(0, "", "") // [6]
+            .with_output(0, "", "") // [7]
+            .with_output(0, "", "") // [8]
+            .with_output(0, "", "") // [9]
+            .with_output(0, "", "") // [10]
+            .with_output(0, "", "") // [11]
+            .with_output(0, "", "") // [12]
+            .with_output(0, "", "") // [13] game 10 band sets
+            .with_output(0, &ls, "") // [14] game vol find_node_id
+            .with_output(0, "", "") // [15] game vol Props set
+            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [16] chat EQ ls
+            .with_output(0, "", "") // [17]
+            .with_output(0, "", "") // [18]
+            .with_output(0, "", "") // [19]
+            .with_output(0, "", "") // [20]
+            .with_output(0, "", "") // [21]
+            .with_output(0, "", "") // [22]
+            .with_output(0, "", "") // [23]
+            .with_output(0, "", "") // [24]
+            .with_output(0, "", "") // [25]
+            .with_output(0, "", "") // [26] chat 10 band sets
+            .with_output(0, &ls, "") // [27] chat vol find_node_id
+            .with_output(0, "", "") // [28] chat vol Props set
+            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [29] media EQ ls
+            .with_output(0, "", "") // [30]
+            .with_output(0, "", "") // [31]
+            .with_output(0, "", "") // [32]
+            .with_output(0, "", "") // [33]
+            .with_output(0, "", "") // [34]
+            .with_output(0, "", "") // [35]
+            .with_output(0, "", "") // [36]
+            .with_output(0, "", "") // [37]
+            .with_output(0, "", "") // [38]
+            .with_output(0, "", "") // [39] media 10 band sets
+            .with_output(0, &ls, "") // [40] media vol find_node_id
+            .with_output(0, "", "") // [41] media vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "")
+            .with_output(0, &ls, "") // [42]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls, "");
+            .with_output(0, &ls, ""); // [43]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1647,7 +1773,7 @@ mod tests {
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
 
-        // Phase 2: apply_all game — ls Node then 10 pw-cli s 10 Props calls
+        // Phase 2: apply_all game — ls Node then 10 pw-cli s Props calls
         assert_eq!(
             calls[3],
             vec!["pw-cli", "ls", "Node"],
@@ -1657,22 +1783,43 @@ mod tests {
         assert_eq!(calls[4][1], "s");
         assert_eq!(calls[4][3], "Props");
 
-        // apply_all chat starts after 3 (up) + 1 + 10 (game) = 14
+        // Phase 2b: apply_volume_mute game — index 14
         assert_eq!(
             calls[14],
+            vec!["pw-cli", "ls", "Node"],
+            "game vol find_node_id"
+        );
+
+        // Phase 2 chat: EQ starts at index 16
+        assert_eq!(
+            calls[16],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // apply_all media starts after 14 + 1 + 10 = 25
+        // Phase 2b chat: volume starts at index 27
         assert_eq!(
-            calls[25],
+            calls[27],
+            vec!["pw-cli", "ls", "Node"],
+            "chat vol find_node_id"
+        );
+
+        // Phase 2 media: EQ starts at index 29
+        assert_eq!(
+            calls[29],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Total: 3 (up) + 3*(1+10) (apply) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists) = 38
-        assert_eq!(calls.len(), 38, "expected 38 total pw-cli calls");
+        // Phase 2b media: volume starts at index 40
+        assert_eq!(
+            calls[40],
+            vec!["pw-cli", "ls", "Node"],
+            "media vol find_node_id"
+        );
+
+        // Total: 3 (up) + 3*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 44
+        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
 
         // No spawned processes (sinks already present)
         assert!(
@@ -1686,53 +1833,61 @@ mod tests {
         // Channels absent → spawn_owned fires for each sink creation.
         // spawn_owned goes into `spawned` (NOT `calls`) and does NOT consume queued outputs.
         // Phase 1 only consumes 3 queued outputs (one ls-Node per channel).
-        // Phase 2: each channel: apply_all: ls (find_node_id) + 10 band sets = 11 each.
+        // Per channel: Phase 2 (ls + 10 bands) then Phase 2b (ls + 1 Props), interleaved.
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
             // Phase 1: 3 ls calls only (spawn_owned does not consume queued outputs)
-            .with_output(0, &ls_absent, "") // game ls (absent)
-            .with_output(0, &ls_absent, "") // chat ls (absent)
-            .with_output(0, &ls_absent, "") // media ls (absent)
-            // Phase 2: apply_all per channel (sinks now "present" for id lookup)
-            .with_output(0, &ls_present, "") // game ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // game 10 band sets
-            .with_output(0, &ls_present, "") // chat ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // chat 10 band sets
-            .with_output(0, &ls_present, "") // media ls Node (find_node_id)
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "") // media 10 band sets
+            .with_output(0, &ls_absent, "") // [0] game ls (absent)
+            .with_output(0, &ls_absent, "") // [1] chat ls (absent)
+            .with_output(0, &ls_absent, "") // [2] media ls (absent)
+            // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [3] game EQ find_node_id
+            .with_output(0, "", "") // [4]
+            .with_output(0, "", "") // [5]
+            .with_output(0, "", "") // [6]
+            .with_output(0, "", "") // [7]
+            .with_output(0, "", "") // [8]
+            .with_output(0, "", "") // [9]
+            .with_output(0, "", "") // [10]
+            .with_output(0, "", "") // [11]
+            .with_output(0, "", "") // [12]
+            .with_output(0, "", "") // [13] game 10 band sets
+            .with_output(0, &ls_present, "") // [14] game vol find_node_id
+            .with_output(0, "", "") // [15] game vol Props set
+            // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [16] chat EQ find_node_id
+            .with_output(0, "", "") // [17]
+            .with_output(0, "", "") // [18]
+            .with_output(0, "", "") // [19]
+            .with_output(0, "", "") // [20]
+            .with_output(0, "", "") // [21]
+            .with_output(0, "", "") // [22]
+            .with_output(0, "", "") // [23]
+            .with_output(0, "", "") // [24]
+            .with_output(0, "", "") // [25]
+            .with_output(0, "", "") // [26] chat 10 band sets
+            .with_output(0, &ls_present, "") // [27] chat vol find_node_id
+            .with_output(0, "", "") // [28] chat vol Props set
+            // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [29] media EQ find_node_id
+            .with_output(0, "", "") // [30]
+            .with_output(0, "", "") // [31]
+            .with_output(0, "", "") // [32]
+            .with_output(0, "", "") // [33]
+            .with_output(0, "", "") // [34]
+            .with_output(0, "", "") // [35]
+            .with_output(0, "", "") // [36]
+            .with_output(0, "", "") // [37]
+            .with_output(0, "", "") // [38]
+            .with_output(0, "", "") // [39] media 10 band sets
+            .with_output(0, &ls_present, "") // [40] media vol find_node_id
+            .with_output(0, "", "") // [41] media vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "") // [42]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls_absent, "");
+            .with_output(0, &ls_absent, ""); // [43]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -1747,7 +1902,7 @@ mod tests {
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
 
-        // Phase 2: apply game starts at index 3 (right after phase1 ls calls)
+        // Phase 2: apply game EQ starts at index 3 (right after phase1 ls calls)
         assert_eq!(
             calls[3],
             vec!["pw-cli", "ls", "Node"],
@@ -1757,25 +1912,46 @@ mod tests {
         assert_eq!(calls[4][1], "s", "game band 0 sub-cmd");
         assert_eq!(calls[4][3], "Props", "game band 0 Props");
 
-        // apply_all chat: 3 (phase1 ls) + 1+10 (game apply) = 14
+        // Phase 2b: apply game vol at index 14
         assert_eq!(
             calls[14],
+            vec!["pw-cli", "ls", "Node"],
+            "game vol find_node_id"
+        );
+
+        // Phase 2 chat EQ: index 16
+        assert_eq!(
+            calls[16],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // apply_all media: 14 + 1+10 = 25
+        // Phase 2b chat vol: index 27
         assert_eq!(
-            calls[25],
+            calls[27],
+            vec!["pw-cli", "ls", "Node"],
+            "chat vol find_node_id"
+        );
+
+        // Phase 2 media EQ: index 29
+        assert_eq!(
+            calls[29],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Total: 3 (phase1 ls) + 3*11 (apply) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists) = 38
+        // Phase 2b media vol: index 40
+        assert_eq!(
+            calls[40],
+            vec!["pw-cli", "ls", "Node"],
+            "media vol find_node_id"
+        );
+
+        // Total: 3 (phase1 ls) + 3*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 44
         assert_eq!(
             calls.len(),
-            38,
-            "expected 38 total run calls (no spawns in calls)"
+            44,
+            "expected 44 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 3 pipewire -c invocations (channels only)
@@ -1809,8 +1985,8 @@ mod tests {
             .with_output(0, &ls, "")
             .with_output(0, &ls, "")
             .with_output(0, &ls, "")
-            // Phase 2: apply_all 3 channels
-            .with_output(0, &ls, "")
+            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // game EQ ls
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
@@ -1820,19 +1996,11 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, &ls, "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, "", "")
-            .with_output(0, &ls, "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // game vol ls
+            .with_output(0, "", "") // game vol Props
+            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // chat EQ ls
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
@@ -1842,7 +2010,23 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // chat vol ls
+            .with_output(0, "", "") // chat vol Props
+            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // media EQ ls
             .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "") // 10 band sets
+            .with_output(0, &ls, "") // media vol ls
+            .with_output(0, "", "") // media vol Props
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
             .with_output(0, &ls, "")
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
@@ -1870,6 +2054,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -1877,6 +2063,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -1884,6 +2072,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![RouteConfig {
@@ -2011,7 +2201,11 @@ mod tests {
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
-            // Phase 2: find_node_id for each channel — node absent → Parse error
+            // Phase 2: find_node_id for each channel — node absent → Parse error (warn+continue)
+            .with_output(0, &ls_absent, "") // game
+            .with_output(0, &ls_absent, "") // chat
+            .with_output(0, &ls_absent, "") // media
+            // Phase 2b: apply_volume_mute find_node_id for each channel — also absent (warn+continue)
             .with_output(0, &ls_absent, "") // game
             .with_output(0, &ls_absent, "") // chat
             .with_output(0, &ls_absent, "") // media
@@ -2041,11 +2235,11 @@ mod tests {
         // 3 tracked tokens
         assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
 
-        // 8 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 1 (mic step5 source_exists) + 1 (surround step6 source_exists)
+        // 11 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 3 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
         assert_eq!(
             engine.runner.calls.len(),
-            8,
-            "expected 8 run calls: 3 ls-up + 3 ls-find-node + 1 mic source_exists + 1 surround source_exists"
+            11,
+            "expected 11 run calls: 3 ls-up + 3 ls-find-node + 3 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
         );
     }
 
@@ -2062,12 +2256,16 @@ mod tests {
             for _ in 0..3 {
                 runner = runner.with_output(0, &ls, "");
             }
-            // Phase 2: 3 channels × (1 ls + 10 band sets)
+            // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
             for _ in 0..3 {
+                // Phase 2: EQ apply (1 ls + 10 band sets)
                 runner = runner.with_output(0, &ls, "");
                 for _ in 0..10 {
                     runner = runner.with_output(0, "", "");
                 }
+                // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+                runner = runner.with_output(0, &ls, ""); // find_node_id
+                runner = runner.with_output(0, "", ""); // Props set
             }
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls
             runner = runner.with_output(0, &ls, "");
@@ -2118,12 +2316,16 @@ mod tests {
         for _ in 0..3 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
         for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
         }
         // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node found)
         r = r.with_output(0, &ls_no_mic, "");
@@ -2155,6 +2357,8 @@ mod tests {
                     description: "Game".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "chat".into(),
@@ -2162,6 +2366,8 @@ mod tests {
                     description: "Chat".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
                 ChannelConfig {
                     id: "media".into(),
@@ -2169,6 +2375,8 @@ mod tests {
                     description: "Media".into(),
                     output_device: None,
                     eq: vec![],
+                    volume_db: 0.0,
+                    muted: false,
                 },
             ],
             routes: vec![],
@@ -2339,6 +2547,8 @@ mod tests {
                                 gain_db: -2.0,
                             },
                         ],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -2346,6 +2556,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: Some("alsa_output.headphones".into()),
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -2353,6 +2565,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -2517,6 +2731,149 @@ mod tests {
         let mut engine = Engine::new(MockRunner::new(), cfg);
         let result = engine.set_channel_output("nonexistent", Some("some_device".into()));
         assert!(result.is_err(), "unknown channel_id must return an error");
+    }
+
+    // ─────────────────────────────────────────────
+    // F2.1: set_channel_volume / set_channel_mute tests
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn set_channel_volume_persists_and_applies_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_vol");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        // set_channel_volume: find_node_id (ls) + apply_volume_mute (Props set)
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // Props set
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_volume("game", -6.0)
+            .expect("set_channel_volume should succeed");
+
+        // Persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config must be persisted");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("volume_db = -6"),
+            "config.toml must contain volume_db = -6, got: {saved_str}"
+        );
+
+        // In-memory state updated
+        let state = engine.state();
+        let ch = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert!(
+            (ch.volume_db - (-6.0)).abs() < f32::EPSILON,
+            "volume_db must be -6.0"
+        );
+
+        // Event emitted
+        let event = rx
+            .try_recv()
+            .expect("ChannelVolumeSet event must be emitted");
+        assert!(
+            matches!(
+                event,
+                crate::state::Event::ChannelVolumeSet {
+                    ref channel_id,
+                    volume_db,
+                } if channel_id == "game" && (volume_db - (-6.0)).abs() < f32::EPSILON
+            ),
+            "event must be ChannelVolumeSet{{channel_id: game, volume_db: -6.0}}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_volume_rejects_out_of_range() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_volume("game", 100.0)
+            .expect_err("100 dB should be rejected");
+        assert!(
+            matches!(err, EngineError::BadRequest(_)),
+            "expected BadRequest"
+        );
+    }
+
+    #[test]
+    fn set_channel_mute_persists_and_applies_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_mute");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // Props set
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_event_sink(tx);
+
+        engine
+            .set_channel_mute("chat", true)
+            .expect("set_channel_mute should succeed");
+
+        // Persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config must be persisted");
+        let saved_str = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved_str.contains("muted = true"),
+            "config.toml must contain muted = true, got: {saved_str}"
+        );
+
+        // In-memory state updated
+        let state = engine.state();
+        let ch = state.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert!(ch.muted, "muted must be true");
+
+        // Event emitted
+        let event = rx.try_recv().expect("ChannelMuteSet event must be emitted");
+        assert!(
+            matches!(
+                event,
+                crate::state::Event::ChannelMuteSet {
+                    ref channel_id,
+                    muted,
+                } if channel_id == "chat" && muted
+            ),
+            "event must be ChannelMuteSet{{channel_id: chat, muted: true}}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_volume_rejects_unknown_channel() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_volume("nonexistent", 0.0)
+            .expect_err("unknown channel should fail");
+        assert!(matches!(err, EngineError::BadRequest(_)));
+    }
+
+    #[test]
+    fn set_channel_mute_rejects_unknown_channel() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_channel_mute("nonexistent", true)
+            .expect_err("unknown channel should fail");
+        assert!(matches!(err, EngineError::BadRequest(_)));
     }
 
     #[test]
@@ -2775,6 +3132,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -2782,6 +3141,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -2789,6 +3150,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -2813,12 +3176,16 @@ mod tests {
         for _ in 0..3 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
         for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
         }
         // Phase 5: mic enabled → create() → source_exists() (absent) → spawn
         r = r.with_output(0, &ls_mic_absent, "");
@@ -3124,6 +3491,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -3131,6 +3500,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -3138,6 +3509,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -3711,6 +4084,8 @@ mod tests {
                         description: "Game".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "chat".into(),
@@ -3718,6 +4093,8 @@ mod tests {
                         description: "Chat".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                     ChannelConfig {
                         id: "media".into(),
@@ -3725,6 +4102,8 @@ mod tests {
                         description: "Media".into(),
                         output_device: None,
                         eq: vec![],
+                        volume_db: 0.0,
+                        muted: false,
                     },
                 ],
                 routes: vec![],
@@ -3765,8 +4144,8 @@ mod tests {
                 .unwrap_or(false)),
             "no surround spawn when disabled"
         );
-        // Total 38 calls
-        assert_eq!(calls.len(), 38, "expected 38 total pw-cli calls");
+        // Total 44 calls: 38 baseline + 6 from apply_volume_mute (3 channels × 2 calls)
+        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
     }
 
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
@@ -3784,12 +4163,16 @@ mod tests {
         for _ in 0..3 {
             r = r.with_output(0, &ls_channels, "");
         }
-        // Phase 2: 3 channels × (1 ls + 10 band sets)
+        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
         for _ in 0..3 {
+            // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls_channels, "");
             for _ in 0..10 {
                 r = r.with_output(0, "", "");
             }
+            // Phase 2b: volume/mute apply (1 ls + 1 Props set)
+            r = r.with_output(0, &ls_channels, ""); // find_node_id
+            r = r.with_output(0, "", ""); // Props set
         }
         // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
         r = r.with_output(0, &ls_surround_absent, "");

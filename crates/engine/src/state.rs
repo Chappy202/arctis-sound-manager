@@ -154,6 +154,10 @@ pub struct ChannelSnapshot {
     pub output_device: Option<String>,
     /// Full per-band EQ state. Empty means flat / no overrides configured.
     pub eq_bands: Vec<EqBandSnapshot>,
+    /// Software volume in dB. 0.0 = unity gain.
+    pub volume_db: f32,
+    /// Whether the channel is muted.
+    pub muted: bool,
 }
 
 /// Events emitted on the engine's outbound stream (mpsc::Receiver<Event> for the daemon/UI).
@@ -174,6 +178,14 @@ pub enum Event {
     ChannelOutputSet {
         channel_id: String,
         device: Option<String>,
+    },
+    ChannelVolumeSet {
+        channel_id: String,
+        volume_db: f32,
+    },
+    ChannelMuteSet {
+        channel_id: String,
+        muted: bool,
     },
     RouteSet {
         app_binary: String,
