@@ -211,7 +211,7 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 
 /** Pin (or clear) the surround output to a specific hardware sink. */
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
-  invoke<EngineState>("surround_set_hw_sink", { hwSink });
+  invoke<EngineState>("surround_set_hw_sink", { hw_sink: hwSink });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

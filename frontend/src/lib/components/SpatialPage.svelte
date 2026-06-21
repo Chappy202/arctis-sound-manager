@@ -33,8 +33,6 @@
   const currentHrir       = $derived(surround?.hrir ?? null);
   const availableHrirs    = $derived(surround?.available_hrirs ?? []);
   const activeChannels    = $derived(surround?.channels ?? []);
-  const hwSink            = $derived(surround?.hw_sink ?? "");
-
   // All channel ids known to the engine (from the channels list)
   const allChannelIds = $derived(($engineState?.channels ?? []).map((c) => c.id));
 

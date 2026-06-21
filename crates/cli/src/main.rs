@@ -602,12 +602,12 @@ fn dispatch_surround(action: SurroundAction) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let is_status = matches!(
+    let is_status = matches!(action, SurroundAction::Status);
+    let is_hrir_list = matches!(
         action,
-        SurroundAction::Status
-            | SurroundAction::Hrir {
-                action: HrirAction::List
-            }
+        SurroundAction::Hrir {
+            action: HrirAction::List
+        }
     );
     let req = match action {
         SurroundAction::Status => daemon::Request::SurroundStatus,
@@ -650,6 +650,17 @@ fn dispatch_surround(action: SurroundAction) -> ExitCode {
                     match &s.hw_sink {
                         Some(sink) => println!("  hw_sink: {sink}"),
                         None => println!("  hw_sink: (auto-detected)"),
+                    }
+                }
+            } else if is_hrir_list {
+                if let Some(state) = resp.state {
+                    let s = &state.surround;
+                    if s.available_hrirs.is_empty() {
+                        println!("none found in ~/.local/share/pipewire/hrir_hesuvi/profiles/");
+                    } else {
+                        for h in &s.available_hrirs {
+                            println!("{h}");
+                        }
                     }
                 }
             } else {
