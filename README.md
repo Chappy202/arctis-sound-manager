@@ -200,17 +200,27 @@ journalctl --user -u arctis-sound-manager.service -f
 
 ### 9. Run the GUI
 
-```sh
-cd frontend && pnpm install && pnpm tauri dev
-```
-
-The daemon must be running first. On NVIDIA with a blank window:
+Run the Tauri CLI from the **repo root** (not `frontend/`): `tauri.conf.json` lives in
+`src-tauri/`, so the CLI must be invoked where `src-tauri/` is a subfolder. One-time install
+of the two dependency sets:
 
 ```sh
-WEBKIT_DISABLE_DMABUF_RENDERER=1 pnpm tauri dev
+pnpm install                 # repo root — installs the Tauri CLI (for `pnpm tauri`)
+pnpm --dir frontend install  # the Svelte frontend's deps (vite, svelte, ...)
 ```
 
-(The `.desktop` file applies this flag automatically if installed via
+Then launch from the repo root (the daemon from step 8 must be running):
+
+```sh
+pnpm gui     # = WEBKIT_DISABLE_DMABUF_RENDERER=1 tauri dev
+```
+
+`pnpm gui` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`, which avoids a `Failed to create GBM
+buffer` / blank-window failure on NVIDIA GPUs (harmless elsewhere). The plain form is
+`pnpm tauri dev` (add the env var yourself on NVIDIA). Do **not** `cd frontend` first —
+the CLI won't find the project there.
+
+(The `.desktop` file applies the same flag automatically once installed via
 `cp packaging/arctis-sound-manager.desktop ~/.local/share/applications/`.)
 
 ### 10. First use
@@ -470,8 +480,13 @@ Install the udev rule (`asm-cli setup-udev` or manual copy), then replug the hea
 Install the required LADSPA plugin (see section 4 above). The app degrades gracefully —
 other stages still function.
 
-**NVIDIA blank window in the GUI**
-Set `WEBKIT_DISABLE_DMABUF_RENDERER=1` before launching: `WEBKIT_DISABLE_DMABUF_RENDERER=1 pnpm tauri dev`.
+**GUI: "Couldn't recognize the current folder as a Tauri project"**
+You ran the Tauri CLI from `frontend/`. Run it from the **repo root** instead (where `src-tauri/`
+is a subfolder): `pnpm gui` (or `pnpm tauri dev`) from the repo root. See section 9.
+
+**NVIDIA blank window / "Failed to create GBM buffer ... Invalid argument"**
+WebKitGTK's DMABUF renderer fails on some NVIDIA setups. Launch with the env var:
+`WEBKIT_DISABLE_DMABUF_RENDERER=1 pnpm tauri dev` — `pnpm gui` already sets it.
 
 **Gate refused on a device write**
 The control has not been validated on hardware yet. Read `asm-cli device status` to confirm

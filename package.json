@@ -1,0 +1,14 @@
+{
+  "name": "arctis-sound-manager",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tauri CLI entrypoint for the GUI. Run `pnpm tauri dev` / `pnpm tauri build` from the REPO ROOT — tauri.conf.json lives in src-tauri/, so the CLI must run where src-tauri/ is a subfolder. The Svelte frontend is a separate package in frontend/ (install its deps with `cd frontend && pnpm install`).",
+  "scripts": {
+    "tauri": "tauri",
+    "gui": "WEBKIT_DISABLE_DMABUF_RENDERER=1 tauri dev",
+    "gui:build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
