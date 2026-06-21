@@ -5,6 +5,9 @@ use arctis_engine::EngineState;
 use tauri::State;
 use tokio::sync::Mutex;
 
+// Re-export for serde derives (CoexistReport + CoexistDisableResult must be serializable via Tauri).
+// They are defined in arctis_client::protocol and already derive Serialize+Deserialize.
+
 /// Internal helper: lock state to get socket path, run the blocking send on a
 /// threadpool thread (so we never block the async executor), then interpret the
 /// daemon's `Response`.
@@ -285,6 +288,49 @@ pub async fn profile_import(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::ProfileImport { toml }).await
+}
+
+// ── R2: Coexistence teardown commands ────────────────────────────────────────
+
+#[tauri::command]
+pub async fn coexist_status(
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<arctis_client::CoexistReport, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        send_request_to(&socket, &Request::CoexistStatus)
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        resp.coexist_report
+            .ok_or_else(|| CommandError::Daemon("ok response missing coexist_report".into()))
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
+}
+
+#[tauri::command]
+pub async fn coexist_disable(
+    dry_run: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<arctis_client::CoexistDisableResult, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || {
+        send_request_to(&socket, &Request::CoexistDisable { dry_run })
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        resp.coexist_result
+            .ok_or_else(|| CommandError::Daemon("ok response missing coexist_result".into()))
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
 }
 
 // ── F4: Channel add / remove commands ────────────────────────────────────────

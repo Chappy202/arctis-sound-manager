@@ -322,6 +322,10 @@ pub struct EqPreset {
     pub bands: Vec<EqBandConfig>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Root configuration object. Versioned for forward-compatibility checking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -332,6 +336,13 @@ pub struct Config {
     /// Defaults to empty (back-compat: old configs without this field load correctly).
     #[serde(default)]
     pub eq_presets: Vec<EqPreset>,
+    /// Global flag: when true (the default), the physical Game↔Chat dial on the headset
+    /// adjusts the software volume of the "game" and "chat" channels live.
+    /// Set to false to disable automatic dial→volume mapping (e.g. if you prefer to control
+    /// game/chat balance manually via the CLI or UI).
+    /// Old configs without this field default to true (back-compat).
+    #[serde(default = "default_true")]
+    pub dial_controls_balance: bool,
 }
 
 impl Config {
@@ -379,6 +390,7 @@ impl Config {
                 surround: SurroundConfig::default(),
             }],
             eq_presets: Vec::new(),
+            dial_controls_balance: true,
         }
     }
 
@@ -1320,6 +1332,58 @@ vad_threshold = 55.0
         assert!(
             (profile.mic.suppression.vad_threshold - 55.0).abs() < f32::EPSILON,
             "rnnoise.vad_threshold must map to suppression.vad_threshold"
+        );
+    }
+
+    // ── R1: dial_controls_balance config flag ─────────────────────────────────
+
+    /// default_config() has dial_controls_balance = true.
+    #[test]
+    fn dial_controls_balance_defaults_to_true_in_default_config() {
+        let cfg = Config::default_config();
+        assert!(
+            cfg.dial_controls_balance,
+            "dial_controls_balance must default to true in default_config()"
+        );
+    }
+
+    /// Old TOML without dial_controls_balance deserializes to true (back-compat).
+    #[test]
+    fn old_config_without_dial_controls_balance_deserializes_to_true() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("old config must deserialize");
+        assert!(
+            cfg.dial_controls_balance,
+            "old config without dial_controls_balance must default to true"
+        );
+    }
+
+    /// Explicit dial_controls_balance = false round-trips via TOML.
+    #[test]
+    fn dial_controls_balance_false_round_trips() {
+        let mut cfg = Config::default_config();
+        cfg.dial_controls_balance = false;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert!(
+            !deserialized.dial_controls_balance,
+            "dial_controls_balance=false must survive TOML round-trip"
         );
     }
 }

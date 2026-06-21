@@ -4,4 +4,6 @@ pub mod client;
 pub mod protocol;
 
 pub use client::{send_request, send_request_to, ClientError};
-pub use protocol::{socket_path, Request, Response};
+pub use protocol::{
+    socket_path, CoexistActionResult, CoexistDisableResult, CoexistReport, Request, Response,
+};

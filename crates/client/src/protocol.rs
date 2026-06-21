@@ -1,5 +1,36 @@
 use arctis_engine::EngineState;
 
+/// Serialisable legacy-stack detection report (mirrors `coexist::LegacyReport`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CoexistReport {
+    pub legacy_loopbacks: Vec<String>,
+    pub hrir_switch_present: bool,
+    pub rpm_daemon_running: bool,
+    /// True when any legacy component was detected.
+    pub any_detected: bool,
+}
+
+/// One action result from a teardown run.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoexistActionResult {
+    pub description: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Result of a `CoexistDisable` call.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CoexistDisableResult {
+    pub dry_run: bool,
+    pub actions_attempted: usize,
+    pub successes: usize,
+    pub failures: Vec<CoexistActionResult>,
+    /// True when all actions succeeded (or it was a dry-run).
+    pub all_ok: bool,
+    /// Human note about the RPM package (owner must `sudo dnf remove` manually).
+    pub owner_note: String,
+}
+
 /// Path to the Unix domain socket used for IPC.
 pub fn socket_path() -> std::path::PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
@@ -151,6 +182,14 @@ pub enum Request {
     ChannelRemove {
         id: String,
     },
+    /// Detect the legacy arctis-sound-manager RPM stack (loopback nodes + services).
+    /// Returns a CoexistReport serialised in `Response.coexist`.
+    CoexistStatus,
+    /// Disable the legacy arctis-sound-manager RPM stack: stop+disable user services
+    /// and destroy live loopback nodes. Optionally dry-run (preview only).
+    CoexistDisable {
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -163,6 +202,12 @@ pub struct Response {
     /// Export payload (profile TOML string). Populated only for ProfileExport responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Coexistence status report. Populated only for CoexistStatus responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coexist_report: Option<CoexistReport>,
+    /// Coexistence disable result. Populated only for CoexistDisable responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coexist_result: Option<CoexistDisableResult>,
 }
 
 impl Response {
@@ -172,6 +217,8 @@ impl Response {
             state: Some(state),
             error: None,
             text: None,
+            coexist_report: None,
+            coexist_result: None,
         }
     }
 
@@ -181,6 +228,8 @@ impl Response {
             state: None,
             error: None,
             text: Some(text),
+            coexist_report: None,
+            coexist_result: None,
         }
     }
 
@@ -190,6 +239,30 @@ impl Response {
             state: None,
             error: Some(msg),
             text: None,
+            coexist_report: None,
+            coexist_result: None,
+        }
+    }
+
+    pub fn ok_with_coexist_report(report: CoexistReport) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: None,
+            coexist_report: Some(report),
+            coexist_result: None,
+        }
+    }
+
+    pub fn ok_with_coexist_result(result: CoexistDisableResult) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: None,
+            coexist_report: None,
+            coexist_result: Some(result),
         }
     }
 }
@@ -264,6 +337,8 @@ mod tests {
             state: None,
             error: None,
             text: None,
+            coexist_report: None,
+            coexist_result: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -1107,6 +1182,53 @@ mod tests {
     fn parse_channel_remove_wire_tag() {
         let req: Request = serde_json::from_str(r#"{"cmd":"channel-remove","id":"aux"}"#).unwrap();
         assert_eq!(req, Request::ChannelRemove { id: "aux".into() });
+    }
+
+    // ── R2: CoexistStatus + CoexistDisable wire-tag + round-trip tests ──────────
+
+    #[test]
+    fn parse_coexist_status_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"coexist-status"}"#).unwrap();
+        assert_eq!(req, Request::CoexistStatus);
+    }
+
+    #[test]
+    fn parse_coexist_disable_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"coexist-disable","dry_run":true}"#).unwrap();
+        assert_eq!(req, Request::CoexistDisable { dry_run: true });
+    }
+
+    #[test]
+    fn request_coexist_status_round_trips() {
+        let req = Request::CoexistStatus;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("coexist-status"),
+            "cmd tag must be coexist-status, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_coexist_disable_round_trips() {
+        let req = Request::CoexistDisable { dry_run: false };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("coexist-disable"),
+            "cmd tag must be coexist-disable, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_coexist_disable_dry_run_true_round_trips() {
+        let req = Request::CoexistDisable { dry_run: true };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+[Desktop Entry]
+Version=1.1
+Type=Application
+Name=Arctis Sound Manager
+GenericName=Headset Audio Manager
+Comment=Per-app audio routing and EQ for SteelSeries Arctis headsets
+# WEBKIT_DISABLE_DMABUF_RENDERER=1 required on NVIDIA (WebKitGTK DMA-buf
+# compositor bug causes a blank window with proprietary NVIDIA drivers).
+Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 arctis-sound-manager %U
+Icon=arctis-sound-manager
+Terminal=false
+StartupNotify=true
+StartupWMClass=arctis-sound-manager
+Categories=Audio;AudioVideo;
+Keywords=SteelSeries;Arctis;headset;EQ;equalizer;audio;sound;
+MimeType=

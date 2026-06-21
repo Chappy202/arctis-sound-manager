@@ -1920,6 +1920,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 
@@ -1967,6 +1968,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 
@@ -2443,6 +2445,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         };
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
@@ -2934,6 +2937,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 
@@ -3740,6 +3744,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 
@@ -4104,6 +4109,7 @@ mod tests {
                 surround: arctis_config::SurroundConfig::default(),
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 
@@ -4689,6 +4695,7 @@ mod tests {
                 },
             }],
             eq_presets: vec![],
+            dial_controls_balance: true,
         }
     }
 

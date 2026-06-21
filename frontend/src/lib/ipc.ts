@@ -339,6 +339,47 @@ export const channelAdd = (id: string): Promise<EngineState> =>
 export const channelRemove = (id: string): Promise<EngineState> =>
   invoke<EngineState>("channel_remove", buildChannelRemoveArgs(id));
 
+// ── R2: Coexistence teardown types + commands ────────────────────────────────
+
+export interface CoexistReport {
+  legacy_loopbacks: string[];
+  hrir_switch_present: boolean;
+  rpm_daemon_running: boolean;
+  /** True when any legacy component was detected. */
+  any_detected: boolean;
+}
+
+export interface CoexistActionResult {
+  description: string;
+  ok: boolean;
+  error: string | null;
+}
+
+export interface CoexistDisableResult {
+  dry_run: boolean;
+  actions_attempted: number;
+  successes: number;
+  failures: CoexistActionResult[];
+  all_ok: boolean;
+  /** Human note: owner must `sudo dnf remove arctis-sound-manager` manually. */
+  owner_note: string;
+}
+
+/**
+ * Detect the legacy arctis-sound-manager RPM stack.
+ * Returns a report indicating what legacy components are present.
+ */
+export const coexistStatus = (): Promise<CoexistReport> =>
+  invoke<CoexistReport>("coexist_status");
+
+/**
+ * Disable the legacy arctis-sound-manager RPM stack.
+ * Stops and disables user services; destroys live loopback nodes.
+ * Pass dry_run=true to preview without making changes.
+ */
+export const coexistDisable = (dryRun: boolean = false): Promise<CoexistDisableResult> =>
+  invoke<CoexistDisableResult>("coexist_disable", { dry_run: dryRun });
+
 // ---------------------------------------------------------------------------
 // Event subscriptions
 // ---------------------------------------------------------------------------
@@ -349,3 +390,28 @@ export const channelRemove = (id: string): Promise<EngineState> =>
  */
 export const onStateChanged = (cb: (s: EngineState) => void): Promise<UnlistenFn> =>
   listen<EngineState>("state-changed", (e) => cb(e.payload));
+
+// ---------------------------------------------------------------------------
+// R3: Level-meter event (levels)
+// ---------------------------------------------------------------------------
+
+/**
+ * Payload of the `levels` Tauri event emitted by the src-tauri metering task.
+ *
+ * Keys are PipeWire `node.name` strings for the Arctis virtual sinks and the
+ * clean-mic source (e.g. "Arctis_Game", "Arctis_Chat", "Arctis_Media",
+ * "arctis_clean_mic").  Values are real-time PCM signal peaks in [0.0, 1.0].
+ *
+ * These are true signal peaks captured via a short pw-record capture stream
+ * per node, sampled at ~25 Hz.  They reflect actual audio activity, not the
+ * configured software volume.
+ */
+export type LevelsPayload = Record<string, number>;
+
+/**
+ * Subscribe to live level updates from the metering task.
+ * Emitted every ~2 s; the payload maps node_name → linear volume [0, 1].
+ * Returns an unlisten function to clean up the subscription.
+ */
+export const onLevels = (cb: (levels: LevelsPayload) => void): Promise<UnlistenFn> =>
+  listen<LevelsPayload>("levels", (e) => cb(e.payload));
