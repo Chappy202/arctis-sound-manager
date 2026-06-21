@@ -87,6 +87,10 @@ pub struct Engine<R: CommandRunner> {
     builtin_noisegate: bool,
     /// Cached PipeWire version (queried once, then cached).
     pw_version: Option<(u32, u32, u32)>,
+    /// Tracks which channel IDs are currently routed to the surround node.
+    /// Used by apply_surround to restore channels removed from the surround list (C1)
+    /// and channels whose output_device is None when surround is disabled (C2).
+    surround_routed: std::collections::HashSet<String>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -104,6 +108,7 @@ impl<R: CommandRunner> Engine<R> {
             mic_availability: Vec::new(),
             builtin_noisegate: false,
             pw_version: None,
+            surround_routed: std::collections::HashSet::new(),
         }
     }
 
@@ -124,6 +129,7 @@ impl<R: CommandRunner> Engine<R> {
             mic_availability: Vec::new(),
             builtin_noisegate: false,
             pw_version: None,
+            surround_routed: std::collections::HashSet::new(),
         }
     }
 
@@ -1107,12 +1113,25 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Apply the surround config to the live graph:
-    /// - If disabled: remove the surround sink (idempotent; reconcile step3 restores channel routing).
-    /// - If enabled: resolve HRIR (warn+skip on error), create surround sink (track child),
-    ///   then recreate each surround channel with output = effect_input.arctis_surround.
+    /// Apply the surround config to the live graph (self-correcting, non-thrashing).
     ///
-    /// Idempotent; warn-and-continue on transient errors (mirrors reconcile step pattern).
+    /// Tracks which channels are currently routed to the surround node via
+    /// `self.surround_routed`. On each call:
+    ///
+    /// **Disabled path**: removes the surround sink (idempotent), then restores ALL
+    ///   channels in `surround_routed` to their configured `output_device` (fixes C2:
+    ///   channels with `output_device=None` were left with a stale pointer to the
+    ///   destroyed node). Drains `surround_routed` on completion.
+    ///
+    /// **Enabled path**: recreates the surround sink (so HRIR/hw_sink changes take
+    ///   effect), then computes:
+    ///   - `to_restore`: channels previously routed to surround but no longer in the
+    ///     desired set → restore to their configured `output_device` (fixes C1).
+    ///   - `to_route`: channels in the desired set not yet tracked → route to surround.
+    ///
+    ///   Channels already in `surround_routed` ∩ `desired` are left untouched (no thrash).
+    ///
+    /// Warn-and-continue on transient errors (mirrors reconcile step pattern).
     fn apply_surround(
         &mut self,
         profile: &arctis_config::Profile,
@@ -1121,11 +1140,39 @@ impl<R: CommandRunner> Engine<R> {
         let spec = convert::surround_spec(sc);
 
         if !sc.enabled {
-            // Remove surround sink (idempotent). Reconcile step3 already restores channel
-            // output devices to their configured values, so no reroute-back is needed here.
+            // Remove surround sink (idempotent).
             let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
             if let Err(e) = surround_be.remove() {
                 eprintln!("warning: apply_surround remove failed (ignoring): {e}");
+            }
+            // Restore ALL channels that were surround-routed (fixes C2).
+            // Drain first so the set is empty regardless of errors below.
+            let previously_routed: Vec<String> = self.surround_routed.drain().collect();
+            if !previously_routed.is_empty() {
+                let channel_set = convert::channel_set_from_profile(profile);
+                for ch_id in &previously_routed {
+                    if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                        let eq_model = convert::eq_model_for(ch)?;
+                        // M1: create ChannelManager per iteration; drop before track to release borrow.
+                        let handle = {
+                            let mut mgr =
+                                ChannelManager::new(&mut self.runner, channel_set.clone());
+                            mgr.set_output(ch_id, ch.output_device.clone(), &eq_model)
+                        };
+                        match handle {
+                            Ok(h) => {
+                                if let Some(t) = h.child {
+                                    self.children.track(t);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: apply_surround restore channel '{ch_id}' failed (ignoring): {e}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -1139,29 +1186,77 @@ impl<R: CommandRunner> Engine<R> {
             }
         };
 
-        // Create surround sink (idempotent).
-        let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
-        match surround_be.create(&hrir_path) {
-            Ok(handle) => {
-                if let Some(t) = handle.child {
-                    self.children.track(t);
+        // Recreate surround sink (handles both first-time and HRIR/hw_sink change).
+        {
+            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
+            match surround_be.recreate(&hrir_path) {
+                Ok(handle) => {
+                    if let Some(t) = handle.child {
+                        self.children.track(t);
+                    }
                 }
-            }
-            Err(e) => {
-                eprintln!("warning: apply_surround create failed (ignoring): {e}");
+                Err(e) => {
+                    eprintln!("warning: apply_surround recreate failed (ignoring): {e}");
+                }
             }
         }
 
-        // Reroute the surround channels through the surround sink.
-        let surround_target = "effect_input.arctis_surround".to_string();
+        // Compute desired surround-channel set (from new config).
+        let desired: std::collections::HashSet<String> = sc.channels.iter().cloned().collect();
+
+        // Channels to restore: were surround-routed, no longer in desired set (fixes C1).
+        let to_restore: Vec<String> = self
+            .surround_routed
+            .iter()
+            .filter(|id| !desired.contains(*id))
+            .cloned()
+            .collect();
+
+        // Channels to route to surround: in desired set, not already tracked (avoid thrash).
+        let to_route: Vec<String> = desired
+            .iter()
+            .filter(|id| !self.surround_routed.contains(*id))
+            .cloned()
+            .collect();
+
         let channel_set = convert::channel_set_from_profile(profile);
-        for ch_id in &sc.channels {
+        let surround_target = "effect_input.arctis_surround".to_string();
+
+        // Restore removed channels to their configured output_device.
+        for ch_id in &to_restore {
             if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
                 let eq_model = convert::eq_model_for(ch)?;
-                let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
-                match mgr.set_output(ch_id, Some(surround_target.clone()), &eq_model) {
-                    Ok(handle) => {
-                        if let Some(t) = handle.child {
+                let handle = {
+                    let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                    mgr.set_output(ch_id, ch.output_device.clone(), &eq_model)
+                };
+                match handle {
+                    Ok(h) => {
+                        if let Some(t) = h.child {
+                            self.children.track(t);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: apply_surround restore channel '{ch_id}' failed (ignoring): {e}"
+                        );
+                    }
+                }
+            }
+            self.surround_routed.remove(ch_id);
+        }
+
+        // Route new channels to surround.
+        for ch_id in &to_route {
+            if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
+                let eq_model = convert::eq_model_for(ch)?;
+                let handle = {
+                    let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
+                    mgr.set_output(ch_id, Some(surround_target.clone()), &eq_model)
+                };
+                match handle {
+                    Ok(h) => {
+                        if let Some(t) = h.child {
                             self.children.track(t);
                         }
                     }
@@ -1172,7 +1267,9 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 }
             }
+            self.surround_routed.insert(ch_id.clone());
         }
+
         Ok(())
     }
 
@@ -1196,34 +1293,12 @@ impl<R: CommandRunner> Engine<R> {
             profile.surround.enabled = on;
         }
         self.save_config()?;
-        // Apply: mirror apply_surround (the same helper used by reconcile step6).
+        // Apply via the canonical path (handles sink create/remove AND channel routing).
+        // When enabling: apply_surround recreates sink + routes desired channels → surround_routed.
+        // When disabling: apply_surround removes sink + restores all surround_routed channels.
         {
             let profile = self.config.active()?.clone();
             self.apply_surround(&profile)?;
-            // When disabling, reroute surround channels back to their configured output device.
-            // (apply_surround only removes the sink; reconcile step3 handles config-driven routing,
-            //  but here we are outside reconcile so we must do it explicitly.)
-            if !on {
-                let channel_set = convert::channel_set_from_profile(&profile);
-                for ch_id in &profile.surround.channels {
-                    if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
-                        let eq_model = convert::eq_model_for(ch)?;
-                        let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
-                        match mgr.set_output(ch_id, ch.output_device.clone(), &eq_model) {
-                            Ok(handle) => {
-                                if let Some(t) = handle.child {
-                                    self.children.track(t);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "warning: surround_set_enabled reroute-back channel '{ch_id}' failed (ignoring): {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
         }
         self.emit(crate::state::Event::SurroundEnabledSet { enabled: on });
         Ok(())
@@ -1249,16 +1324,12 @@ impl<R: CommandRunner> Engine<R> {
             }
         }
         self.save_config()?;
-        // Recreate if enabled (HRIR change requires respawn).
-        if self.config.active()?.surround.enabled {
+        // Apply via the canonical path (recreates sink with new HRIR if enabled;
+        // no-op remove if disabled; channel routing is a no-op since channels are
+        // already tracked in surround_routed).
+        {
             let profile = self.config.active()?.clone();
-            let hrir_path = convert::resolve_hrir_path(&profile.surround)?;
-            let spec = convert::surround_spec(&profile.surround);
-            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
-            let handle = surround_be.recreate(&hrir_path)?;
-            if let Some(t) = handle.child {
-                self.children.track(t);
-            }
+            self.apply_surround(&profile)?;
         }
         let hrir_snapshot = self.config.active()?.surround.hrir.clone();
         self.emit(crate::state::Event::SurroundHrirSet {
@@ -1309,16 +1380,12 @@ impl<R: CommandRunner> Engine<R> {
             profile.surround.hw_sink = hw_sink;
         }
         self.save_config()?;
-        // Recreate the surround sink if enabled (hw_sink is baked into the conf at spawn time).
-        if self.config.active()?.surround.enabled {
+        // Apply via the canonical path (recreates sink with new hw_sink baked into conf if
+        // enabled; no-op remove if disabled; channel routing is a no-op since channels are
+        // already tracked in surround_routed).
+        {
             let profile = self.config.active()?.clone();
-            let hrir_path = convert::resolve_hrir_path(&profile.surround)?;
-            let spec = convert::surround_spec(&profile.surround);
-            let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
-            let handle = surround_be.recreate(&hrir_path)?;
-            if let Some(t) = handle.child {
-                self.children.track(t);
-            }
+            self.apply_surround(&profile)?;
         }
         let hw_sink_snapshot = self.config.active()?.surround.hw_sink.clone();
         self.emit(crate::state::Event::SurroundHwSinkSet {
@@ -3703,8 +3770,10 @@ mod tests {
     }
 
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
-    /// Step6 enabled:
-    ///   1. source_exists() → 1 ls (absent) → spawn (goes to spawned, not calls)
+    /// Step6 enabled (apply_surround uses recreate in enabled path):
+    ///   1. recreate() = remove() + create():
+    ///      remove: source_exists() → 1 ls (absent, no destroy)
+    ///      create: source_exists() → 1 ls absent → spawn (goes to spawned, not calls)
     ///   2. reroute "game": set_output → ls (source_exists: present) → find_node_id → destroy → pkill + ls (source absent → spawn)
     ///   3. reroute "media": same
     fn queue_reconcile_surround_enabled_absent(runner: MockRunner) -> MockRunner {
@@ -3724,8 +3793,10 @@ mod tests {
         }
         // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
         r = r.with_output(0, &ls_surround_absent, "");
-        // Phase 6 (surround enabled, absent):
-        //   source_exists() → 1 ls absent → spawn (in spawned, not calls)
+        // Phase 6 (surround enabled, absent) — recreate():
+        //   remove: source_exists() → 1 ls (absent, no destroy needed)
+        r = r.with_output(0, &ls_surround_absent, "");
+        //   create: source_exists() → 1 ls absent → spawn (in spawned, not calls)
         r = r.with_output(0, &ls_surround_absent, "");
         // reroute "game": set_output → ChannelManager::set_output →
         //   find existing present node: ls (source_exists present) + find_node_id ls + destroy + pkill
@@ -3951,5 +4022,393 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // F1.3 Bug Fix tests: C1, C2, I3
+    // ─────────────────────────────────────────────
+
+    /// C1 fix: apply_surround restores a channel removed from the surround list.
+    ///
+    /// Setup: `surround_routed = {"game", "media"}`, config has `channels = ["game"]`.
+    /// After apply_surround: media must be restored to its output_device; surround_routed = {"game"}.
+    #[test]
+    fn apply_surround_restores_removed_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("c1_restore_home");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+
+        // Config: surround enabled with only "game" in channels.
+        // "media" was previously routed to surround but is now removed.
+        let cfg = make_config_surround_enabled("test-hrir"); // channels = ["game", "media"]
+                                                             // We'll override channels to just ["game"] below.
+
+        // Runner calls for apply_surround with surround_routed = {"game", "media"},
+        // desired = {"game"}, to_restore = ["media"], to_route = [] (game already tracked):
+        //
+        // recreate surround (absent):
+        //   remove: source_exists → 1 ls (absent, no destroy)
+        //   create: source_exists → 1 ls (absent) → spawn
+        //
+        // restore media (Arctis_Media present → destroy + pkill, then create absent → spawn):
+        //   remove: sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        //   create: sink_exists → 1 ls (absent) → spawn
+        let ls_channels = ls_all_present();
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // restore media: remove sink_exists (present)
+            .with_output(0, &ls_channels, "")
+            // restore media: remove find_node_id
+            .with_output(0, &ls_channels, "")
+            // restore media: destroy
+            .with_output(0, "", "")
+            // restore media: pkill
+            .with_output(0, "", "")
+            // restore media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Pre-populate surround_routed to simulate prior state.
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        // Mutate config so surround only has "game".
+        {
+            let p = engine.config.profile_mut("default").unwrap();
+            p.surround.channels = vec!["game".into()];
+        }
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        // surround_routed must now only contain "game" (media was removed).
+        assert!(
+            engine.surround_routed.contains("game"),
+            "game must remain in surround_routed"
+        );
+        assert!(
+            !engine.surround_routed.contains("media"),
+            "media must be removed from surround_routed after restore"
+        );
+        assert_eq!(
+            engine.surround_routed.len(),
+            1,
+            "exactly 1 channel in surround_routed"
+        );
+
+        // media was respawned (set_output → recreate → create → spawn)
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "Arctis_Media must be respawned to restore from surround routing: {:?}",
+            engine.runner.spawned
+        );
+
+        // surround sink was recreated (spawned)
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be respawned: {:?}",
+            engine.runner.spawned
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("HOME");
+    }
+
+    /// C2 fix: apply_surround disabled path restores channels with output_device=None.
+    ///
+    /// Setup: `surround_routed = {"game"}` (simulating prior enable), config has
+    /// `surround.enabled = false`. After apply_surround: game must be restored
+    /// (even though output_device = None), surround_routed = {}.
+    #[test]
+    fn apply_surround_disabled_restores_stale_channel_with_no_output_device() {
+        // Config: surround disabled (default). Game channel has output_device = None.
+        let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
+
+        // Runner calls for apply_surround with surround_routed = {"game"},
+        // surround disabled:
+        //
+        // remove surround (absent → no destroy):
+        //   source_exists → 1 ls (absent)
+        //
+        // restore game (Arctis_Game present, then recreate):
+        //   remove: sink_exists → 1 ls (present), find_node_id → 1 ls, destroy, pkill
+        //   create: sink_exists → 1 ls (absent) → spawn
+        let ls_channels = ls_all_present();
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // remove surround: source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: remove sink_exists (present)
+            .with_output(0, &ls_channels, "")
+            // restore game: remove find_node_id
+            .with_output(0, &ls_channels, "")
+            // restore game: destroy
+            .with_output(0, "", "")
+            // restore game: pkill
+            .with_output(0, "", "")
+            // restore game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate prior enable: game was routed to surround.
+        engine.surround_routed.insert("game".into());
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        // surround_routed must be empty after disable.
+        assert!(
+            engine.surround_routed.is_empty(),
+            "surround_routed must be empty after disable: {:?}",
+            engine.surround_routed
+        );
+
+        // game channel was respawned (restored even with output_device = None).
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game"))
+                .unwrap_or(false)),
+            "Arctis_Game must be respawned after disable even with output_device=None: {:?}",
+            engine.runner.spawned
+        );
+
+        // Verify destroy was called (channel was present, then destroyed and recreated).
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 3 && c[1] == "destroy"),
+            "destroy must be called when restoring the channel"
+        );
+    }
+
+    /// Enable → disable flow: all listed channels are restored after disable.
+    ///
+    /// This tests the full round-trip:
+    /// 1. surround_set_enabled(true) → populates surround_routed
+    /// 2. surround_set_enabled(false) → drains surround_routed + restores channels
+    #[test]
+    fn surround_set_enabled_disable_restores_all_channels() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_roundtrip_home");
+        let tmp_cfg = unique_cfg_tmp("surr_roundtrip_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // Config: surround disabled, channels = ["game", "media"] (will be enabled).
+        // Start with surround disabled so surround_set_enabled(true) is meaningful.
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround = arctis_config::SurroundConfig {
+            enabled: false,
+            hrir: Some("test-hrir".into()),
+            channels: vec!["game".into(), "media".into()],
+            hw_sink: None,
+        };
+
+        // Phase 1: surround_set_enabled(true) → apply_surround(enabled):
+        //   recreate surround: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //   to_route = ["game", "media"] (both not yet tracked):
+        //     route game: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //     route media: remove (absent) + create (absent → spawn) = 2 ls + spawn
+        //
+        // Phase 2: surround_set_enabled(false) → apply_surround(disabled):
+        //   remove surround: source_exists (absent) = 1 ls
+        //   restore game (was present from spawn above — but MockRunner can't distinguish;
+        //     we'll report game as absent for simplicity → remove is no-op, create spawns)
+        //   restore media: same
+        //
+        // For simplicity, we report all channels/surround as absent throughout.
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // --- Phase 1: surround_set_enabled(true) ---
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // route game: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // route game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // route media: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // route media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // --- Phase 2: surround_set_enabled(false) ---
+            // remove surround: source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore game: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "")
+            // restore media: remove sink_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // restore media: create sink_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+
+        // Enable surround.
+        engine
+            .surround_set_enabled(true)
+            .expect("enable must succeed");
+
+        // After enable: surround_routed must contain both channels.
+        assert!(
+            engine.surround_routed.contains("game"),
+            "game must be in surround_routed after enable"
+        );
+        assert!(
+            engine.surround_routed.contains("media"),
+            "media must be in surround_routed after enable"
+        );
+
+        // Disable surround.
+        engine
+            .surround_set_enabled(false)
+            .expect("disable must succeed");
+
+        // After disable: surround_routed must be empty.
+        assert!(
+            engine.surround_routed.is_empty(),
+            "surround_routed must be empty after disable: {:?}",
+            engine.surround_routed
+        );
+
+        // game and media channels must have been respawned (restored).
+        let game_spawns = engine
+            .runner
+            .spawned
+            .iter()
+            .filter(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("Arctis_Game"))
+                    .unwrap_or(false)
+            })
+            .count();
+        let media_spawns = engine
+            .runner
+            .spawned
+            .iter()
+            .filter(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("Arctis_Media"))
+                    .unwrap_or(false)
+            })
+            .count();
+
+        // game: spawned on route (enable) + spawned on restore (disable) = 2
+        assert!(
+            game_spawns >= 2,
+            "game must be spawned at least twice (route + restore): {game_spawns}"
+        );
+        // media: same
+        assert!(
+            media_spawns >= 2,
+            "media must be spawned at least twice (route + restore): {media_spawns}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// I3 fix: surround_set_hrir routes through apply_surround (not inlined recreate).
+    ///
+    /// When surround is ENABLED and HRIR changes, apply_surround is called.
+    /// Since channels are already in surround_routed, to_route and to_restore are both empty
+    /// → only the sink is recreated (no channel thrash).
+    #[test]
+    fn surround_set_hrir_enabled_uses_apply_surround_no_channel_thrash() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp_home = unique_cfg_tmp("surr_hrir_i3_home");
+        let tmp_cfg = unique_cfg_tmp("surr_hrir_i3_cfg");
+        let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("old-hrir.wav"), b"").unwrap();
+        std::fs::write(profiles_dir.join("new-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp_home);
+        std::env::set_var("ASM_CONFIG_HOME", &tmp_cfg);
+
+        // Config: surround enabled, channels = ["game"].
+        let cfg = make_config_surround_enabled("old-hrir");
+
+        // Pre-populate surround_routed to simulate that "game" is already routed.
+        // apply_surround will find to_route = [], to_restore = [] → only sink recreated.
+        //
+        // recreate surround (absent):
+        //   remove: source_exists → 1 ls (absent)
+        //   create: source_exists → 1 ls (absent) → spawn
+        // No channel operations.
+        let ls_absent = ls_all_absent();
+
+        let runner = MockRunner::new()
+            // recreate surround: remove source_exists (absent)
+            .with_output(0, &ls_absent, "")
+            // recreate surround: create source_exists (absent → spawn)
+            .with_output(0, &ls_absent, "");
+
+        let mut engine = Engine::new(runner, cfg);
+        // Simulate that channels are already tracked (prior enable).
+        engine.surround_routed.insert("game".into());
+        engine.surround_routed.insert("media".into());
+
+        engine
+            .surround_set_hrir("new-hrir".into())
+            .expect("surround_set_hrir must succeed");
+
+        // Surround sink was respawned (HRIR change took effect).
+        assert!(
+            engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("arctis_surround"))
+                .unwrap_or(false)),
+            "surround sink must be respawned after HRIR change: {:?}",
+            engine.runner.spawned
+        );
+
+        // No channel thrash: game and media were NOT respawned (already tracked).
+        assert!(
+            !engine.runner.spawned.iter().any(|argv| argv
+                .get(2)
+                .map(|s| s.contains("Arctis_Game") || s.contains("Arctis_Media"))
+                .unwrap_or(false)),
+            "channels must NOT be thrashed when HRIR changes (already in surround_routed): {:?}",
+            engine.runner.spawned
+        );
+
+        // surround_routed unchanged.
+        assert!(engine.surround_routed.contains("game"));
+        assert!(engine.surround_routed.contains("media"));
+
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        let _ = std::fs::remove_dir_all(&tmp_cfg);
+        std::env::remove_var("HOME");
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
