@@ -42,6 +42,9 @@ use arctis_audio::CommandRunner;
 use arctis_engine::{Engine, EngineError};
 
 /// Maximum attenuation in dB applied at the fully-away-from-center dial position.
+/// -40 dB is the perceptual "effectively silent" threshold — enough headroom that
+/// the attenuated channel is inaudible in practice, while staying well above the
+/// engine's -60 dB `CHANNEL_VOLUME_MIN_DB` floor (avoiding unnecessary clipping math).
 const FULL_ATTENUATION_DB: f32 = -40.0;
 
 /// The center of the 0..=9 dial range (4.5 treats both 4 and 5 symmetrically).

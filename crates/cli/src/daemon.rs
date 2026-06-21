@@ -443,6 +443,11 @@ impl arctis_engine::DeviceOpener for HidOpener {
 /// read inside the signal handler — no races after install.
 ///
 /// This function must be called exactly once before `run_daemon_with_engine`.
+///
+/// # Warning — process-global side effect
+/// Installs **process-global** SIGTERM/SIGINT handlers via `sigaction`.
+/// **MUST NOT be called from tests.** Use `run_daemon_with_engine` in tests,
+/// which accepts a pre-built engine and does not install signal handlers.
 unsafe fn install_signal_pipe(write_fd: libc::c_int) {
     // Store the fd globally so the signal handler can access it.
     SIGNAL_PIPE_WFD.store(write_fd, std::sync::atomic::Ordering::Relaxed);
@@ -469,6 +474,14 @@ unsafe fn install_signal_pipe(write_fd: libc::c_int) {
 /// Global write-end fd for the signal self-pipe. -1 = not installed.
 static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Production daemon entry point: opens real PipeWire + HID, installs process-global
+/// SIGTERM/SIGINT handlers, then runs the accept loop.
+///
+/// # Warning — process-global signal handlers
+/// Calls [`install_signal_pipe`] which installs SIGTERM/SIGINT handlers that mutate
+/// the process-global `SIGNAL_PIPE_WFD` static. **MUST NOT be called from tests.**
+/// For tests, use [`run_daemon_with_engine`] which takes a pre-built engine and does
+/// not touch signal handlers.
 pub fn run_daemon() -> Result<(), EngineError> {
     let path = socket_path();
     if path.exists() {
@@ -564,16 +577,28 @@ pub fn run_daemon() -> Result<(), EngineError> {
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(250));
+                // Sleep ~250 ms in 50 ms increments so shutdown can exit within ≤50 ms.
+                for _ in 0..5 {
+                    if stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
         })
         .map_err(|e| EngineError::Ipc(format!("failed to spawn dial-balance thread: {e}")))?;
 
     // ── Signal watcher thread ───────────────────────────────────────────────
     // Waits for a byte on the read-end of the signal pipe, then sends a
-    // Shutdown request to our own socket so run_daemon_with_engine exits
-    // through the normal graceful path (engine.shutdown() + socket removal).
+    // Shutdown request to our own socket so the accept loop exits through the
+    // normal graceful path (engine.shutdown() + socket removal).
+    //
+    // Fallback (I1): if the socket connect fails (socket not yet bound, already
+    // gone, or accept loop hasn't started), the watcher directly acquires the
+    // engine lock, calls engine.shutdown() to reap all children, removes the
+    // socket file, and exits the process — so children are ALWAYS reaped.
     let socket_path_for_watcher = path.clone();
+    let engine_arc_for_watcher = std::sync::Arc::clone(&engine_arc);
     let signal_watcher = std::thread::Builder::new()
         .name("signal-watcher".into())
         .spawn(move || {
@@ -586,13 +611,29 @@ pub fn run_daemon() -> Result<(), EngineError> {
                 return;
             }
             unsafe { libc::close(pipe_read_fd) };
-            // Connect to our own socket and send Shutdown — this wakes up the accept loop.
+            // Primary path: connect to our own socket and send Shutdown —
+            // this wakes up the accept loop for a clean exit.
             eprintln!("daemon: signal received, initiating graceful shutdown");
-            if let Ok(mut stream) =
-                std::os::unix::net::UnixStream::connect(&socket_path_for_watcher)
-            {
-                use std::io::Write;
-                let _ = writeln!(stream, r#"{{"cmd":"shutdown"}}"#);
+            match std::os::unix::net::UnixStream::connect(&socket_path_for_watcher) {
+                Ok(mut stream) => {
+                    use std::io::Write;
+                    let _ = writeln!(stream, r#"{{"cmd":"shutdown"}}"#);
+                }
+                Err(e) => {
+                    // Fallback: socket unreachable — directly reap children so they
+                    // are never leaked regardless of accept-loop state.
+                    eprintln!(
+                        "daemon: signal watcher: socket connect failed ({e}), \
+                         performing direct engine shutdown"
+                    );
+                    if let Ok(mut eng) = engine_arc_for_watcher.lock() {
+                        if let Err(se) = eng.shutdown() {
+                            eprintln!("daemon: direct shutdown warning: {se}");
+                        }
+                    }
+                    let _ = std::fs::remove_file(&socket_path_for_watcher);
+                    std::process::exit(0);
+                }
             }
         })
         .map_err(|e| EngineError::Ipc(format!("failed to spawn signal watcher: {e}")))?;
