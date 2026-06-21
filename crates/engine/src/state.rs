@@ -123,6 +123,13 @@ pub struct SurroundSnapshot {
     pub hw_sink: Option<String>,
 }
 
+/// Lightweight summary of one EQ preset for the state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqPresetSnapshot {
+    pub name: String,
+    pub band_count: usize,
+}
+
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -135,6 +142,8 @@ pub struct EngineState {
     pub mic: MicSnapshot,
     #[serde(default)]
     pub surround: SurroundSnapshot,
+    #[serde(default)]
+    pub eq_presets: Vec<EqPresetSnapshot>,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI
@@ -168,6 +177,26 @@ pub enum Event {
         name: String,
     },
     ProfileCreated {
+        name: String,
+    },
+    ProfileRenamed {
+        old: String,
+        new: String,
+    },
+    ProfileDeleted {
+        name: String,
+    },
+    ProfileImported {
+        name: String,
+    },
+    EqPresetSaved {
+        name: String,
+    },
+    EqPresetApplied {
+        name: String,
+        channel_id: String,
+    },
+    EqPresetDeleted {
         name: String,
     },
     Reconciled,

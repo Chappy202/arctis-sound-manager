@@ -108,6 +108,31 @@ enum EqAction {
     },
     /// Show the resolved node id and confirm the sink is present.
     Show,
+    /// EQ preset management (save, apply, list, delete).
+    Preset {
+        #[command(subcommand)]
+        action: EqPresetAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EqPresetAction {
+    /// Save the current EQ bands of a channel as a named preset.
+    Save {
+        name: String,
+        #[arg(long)]
+        channel: String,
+    },
+    /// Apply a named preset to a channel's EQ.
+    Apply {
+        name: String,
+        #[arg(long)]
+        channel: String,
+    },
+    /// List all available EQ presets.
+    List,
+    /// Delete a named EQ preset.
+    Delete { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -185,6 +210,18 @@ enum ProfileAction {
     Save,
     /// Create a new profile as a copy of the active one.
     New { name: String },
+    /// Rename a profile.
+    Rename { old: String, new: String },
+    /// Delete a profile (cannot delete the active or last profile).
+    Delete { name: String },
+    /// Export a profile as standalone TOML (prints to stdout or --out file).
+    Export {
+        name: String,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Import a profile from a TOML file.
+    Import { file: std::path::PathBuf },
 }
 
 #[derive(Subcommand, Debug)]
@@ -849,6 +886,7 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 },
+                EqAction::Preset { action } => dispatch_eq_preset(action),
             }
         }
         Command::Channels { action } => {
@@ -1172,6 +1210,346 @@ fn dispatch_profile(action: ProfileAction) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Rename { old, new } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileRename {
+                    old: old.clone(),
+                    new: new.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("profile '{old}' renamed to '{new}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through to direct engine path
+                }
+            }
+            // Direct engine path
+            let mut cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = cfg.rename_profile(&old, &new) {
+                eprintln!("error renaming profile: {e}");
+                return ExitCode::FAILURE;
+            }
+            if cfg.active_profile == old {
+                cfg.active_profile = new.clone();
+            }
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("profile '{old}' renamed to '{new}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Delete { name } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileDelete { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("profile '{name}' deleted");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct engine path
+            let mut cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(e) = cfg.delete_profile(&name) {
+                eprintln!("error deleting profile: {e}");
+                return ExitCode::FAILURE;
+            }
+            match config_store::save(&cfg) {
+                Ok(()) => {
+                    println!("profile '{name}' deleted");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving config: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::Export { name, out } => {
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileExport { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        let text = resp.text.unwrap_or_default();
+                        if let Some(path) = out {
+                            if let Err(e) = std::fs::write(&path, &text) {
+                                eprintln!("error writing to {}: {e}", path.display());
+                                return ExitCode::FAILURE;
+                            }
+                            println!("profile '{name}' exported to {}", path.display());
+                        } else {
+                            print!("{text}");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct path
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let profile = match cfg.profile(&name) {
+                Some(p) => p,
+                None => {
+                    eprintln!("error: profile '{name}' not found");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let text = match toml::to_string(profile) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error serializing profile: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(path) = out {
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("error writing to {}: {e}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                println!("profile '{name}' exported to {}", path.display());
+            } else {
+                print!("{text}");
+            }
+            ExitCode::SUCCESS
+        }
+        ProfileAction::Import { file } => {
+            let toml_str = match std::fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error reading {}: {e}", file.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            // Try daemon first
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ProfileImport {
+                    toml: toml_str.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            // The imported name is the last profile added (by convention)
+                            let name = state.profiles.last().cloned().unwrap_or_default();
+                            println!("profile imported as '{name}'");
+                        } else {
+                            println!("profile imported");
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {} // fall through
+                }
+            }
+            // Direct engine path
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.import_profile(&toml_str) {
+                Ok(name) => {
+                    println!("profile imported as '{name}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error importing profile: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
+    match action {
+        EqPresetAction::Save { name, channel } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetSave {
+                    name: name.clone(),
+                    channel: channel.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' saved from channel '{channel}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.save_eq_preset(&name, &channel) {
+                Ok(()) => {
+                    println!("preset '{name}' saved from channel '{channel}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error saving preset: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        EqPresetAction::Apply { name, channel } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetApply {
+                    preset: name.clone(),
+                    channel: channel.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' applied to channel '{channel}'");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.apply_eq_preset(&name, &channel) {
+                Ok(()) => {
+                    println!("preset '{name}' applied to channel '{channel}'");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error applying preset: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        EqPresetAction::List => {
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::GetState) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            if state.eq_presets.is_empty() {
+                                println!("no EQ presets saved");
+                            } else {
+                                for p in &state.eq_presets {
+                                    println!("  {} ({} bands)", p.name, p.band_count);
+                                }
+                            }
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if cfg.eq_presets.is_empty() {
+                println!("no EQ presets saved");
+            } else {
+                for p in &cfg.eq_presets {
+                    println!("  {} ({} bands)", p.name, p.bands.len());
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        EqPresetAction::Delete { name } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::EqPresetDelete { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("preset '{name}' deleted");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.delete_eq_preset(&name) {
+                Ok(()) => {
+                    println!("preset '{name}' deleted");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error deleting preset: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -1967,5 +2345,141 @@ mod tests {
             e.contains("off | transparency | on"),
             "error should hint at valid values: {e}"
         );
+    }
+
+    // ── Profile management parse tests ───────────────────────────────────────
+
+    #[test]
+    fn profile_rename_parses() {
+        let cmd = parse(&["profile", "rename", "old-name", "new-name"])
+            .expect("profile rename should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Rename { old, new },
+            } => {
+                assert_eq!(old, "old-name");
+                assert_eq!(new, "new-name");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_delete_parses() {
+        let cmd = parse(&["profile", "delete", "myprofile"]).expect("profile delete should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Delete { name },
+            } => assert_eq!(name, "myprofile"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_export_to_stdout_parses() {
+        let cmd = parse(&["profile", "export", "myprofile"]).expect("profile export should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Export { name, out: None },
+            } => assert_eq!(name, "myprofile"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_export_with_out_parses() {
+        let cmd = parse(&["profile", "export", "myprofile", "--out", "/tmp/prof.toml"])
+            .expect("profile export --out should parse");
+        match cmd {
+            super::Command::Profile {
+                action:
+                    super::ProfileAction::Export {
+                        name,
+                        out: Some(path),
+                    },
+            } => {
+                assert_eq!(name, "myprofile");
+                assert_eq!(path, std::path::PathBuf::from("/tmp/prof.toml"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_import_parses() {
+        let cmd =
+            parse(&["profile", "import", "/tmp/prof.toml"]).expect("profile import should parse");
+        match cmd {
+            super::Command::Profile {
+                action: super::ProfileAction::Import { file },
+            } => assert_eq!(file, std::path::PathBuf::from("/tmp/prof.toml")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── EQ preset parse tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn eq_preset_save_parses() {
+        let cmd = parse(&["eq", "preset", "save", "flat", "--channel", "game"])
+            .expect("eq preset save should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Save { name, channel },
+                    },
+            } => {
+                assert_eq!(name, "flat");
+                assert_eq!(channel, "game");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_preset_apply_parses() {
+        let cmd = parse(&["eq", "preset", "apply", "flat", "--channel", "chat"])
+            .expect("eq preset apply should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Apply { name, channel },
+                    },
+            } => {
+                assert_eq!(name, "flat");
+                assert_eq!(channel, "chat");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eq_preset_list_parses() {
+        let cmd = parse(&["eq", "preset", "list"]).expect("eq preset list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Eq {
+                action: super::EqAction::Preset {
+                    action: super::EqPresetAction::List
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn eq_preset_delete_parses() {
+        let cmd =
+            parse(&["eq", "preset", "delete", "flat"]).expect("eq preset delete should parse");
+        match cmd {
+            super::Command::Eq {
+                action:
+                    super::EqAction::Preset {
+                        action: super::EqPresetAction::Delete { name },
+                    },
+            } => assert_eq!(name, "flat"),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

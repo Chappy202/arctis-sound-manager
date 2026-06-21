@@ -207,8 +207,8 @@ impl<R: CommandRunner> Engine<R> {
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&self) -> crate::state::EngineState {
         use crate::state::{
-            ChannelSnapshot, EngineState, EqBandSnapshot, MicSnapshot, MicStageSnapshot, StageName,
-            SuppressionBackend,
+            ChannelSnapshot, EngineState, EqBandSnapshot, EqPresetSnapshot, MicSnapshot,
+            MicStageSnapshot, StageName, SuppressionBackend,
         };
         let active = self.config.active().ok();
         let channels = active
@@ -404,6 +404,16 @@ impl<R: CommandRunner> Engine<R> {
             crate::state::SurroundSnapshot::default()
         };
 
+        let eq_presets = self
+            .config
+            .eq_presets
+            .iter()
+            .map(|p| EqPresetSnapshot {
+                name: p.name.clone(),
+                band_count: p.bands.len(),
+            })
+            .collect();
+
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
@@ -413,6 +423,7 @@ impl<R: CommandRunner> Engine<R> {
             device_fields: dev.fields,
             mic,
             surround,
+            eq_presets,
         }
     }
 
@@ -695,6 +706,197 @@ impl<R: CommandRunner> Engine<R> {
         self.reconcile()?;
         // Emit event
         self.emit(Event::ProfileCreated {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Rename a profile. If it was the active profile, also updates `active_profile`.
+    /// Saves config and emits `ProfileRenamed`.
+    pub fn rename_profile(&mut self, old: &str, new: &str) -> Result<(), EngineError> {
+        // Delegate validation to config layer
+        self.config.rename_profile(old, new)?;
+        // If the renamed profile was active, keep active_profile in sync
+        if self.config.active_profile == old {
+            self.config.active_profile = new.to_string();
+        }
+        self.save_config()?;
+        self.emit(Event::ProfileRenamed {
+            old: old.to_string(),
+            new: new.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Delete a profile. Saves config and emits `ProfileDeleted`.
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), EngineError> {
+        self.config.delete_profile(name)?;
+        self.save_config()?;
+        self.emit(Event::ProfileDeleted {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Export a profile by name as a TOML string. Read-only — no persist, no event.
+    pub fn export_profile(&self, name: &str) -> Result<String, EngineError> {
+        let profile = self
+            .config
+            .profile(name)
+            .ok_or_else(|| EngineError::BadRequest(format!("profile not found: {name}")))?;
+        toml::to_string(profile)
+            .map_err(|e| EngineError::BadRequest(format!("serialize profile: {e}")))
+    }
+
+    /// Import a profile from a TOML string. Resolves name collisions by appending
+    /// "-imported", then "-imported(2)", "-imported(3)", etc. until unique.
+    /// Validates the config after insertion. Returns the resolved name.
+    pub fn import_profile(&mut self, toml_str: &str) -> Result<String, EngineError> {
+        let mut profile: arctis_config::Profile = toml::from_str(toml_str)
+            .map_err(|e| EngineError::BadRequest(format!("invalid profile TOML: {e}")))?;
+
+        // Resolve name collision
+        let base_name = profile.name.clone();
+        let resolved_name = if self.config.profile(&base_name).is_none() {
+            base_name.clone()
+        } else {
+            let candidate = format!("{base_name}-imported");
+            if self.config.profile(&candidate).is_none() {
+                candidate
+            } else {
+                let mut n = 2u32;
+                loop {
+                    let candidate = format!("{base_name}-imported({n})");
+                    if self.config.profile(&candidate).is_none() {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            }
+        };
+
+        profile.name = resolved_name.clone();
+        self.config.upsert_profile(profile);
+        // Validate the config after insertion
+        self.config.validate()?;
+        self.save_config()?;
+        self.emit(Event::ProfileImported {
+            name: resolved_name.clone(),
+        });
+        Ok(resolved_name)
+    }
+
+    /// Save the current EQ bands of `channel_id` in the active profile as a named preset.
+    /// Overwrites if a preset with that name already exists.
+    pub fn save_eq_preset(&mut self, name: &str, channel_id: &str) -> Result<(), EngineError> {
+        // Find channel in active profile
+        let bands = {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| EngineError::BadRequest(format!("channel not found: {channel_id}")))?
+                .eq
+                .clone()
+        };
+
+        let preset = arctis_config::EqPreset {
+            name: name.to_string(),
+            kind_hint: None,
+            bands,
+        };
+
+        // Overwrite if name exists, otherwise push
+        if let Some(existing) = self.config.eq_presets.iter_mut().find(|p| p.name == name) {
+            *existing = preset;
+        } else {
+            self.config.eq_presets.push(preset);
+        }
+
+        self.save_config()?;
+        self.emit(Event::EqPresetSaved {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Apply a named preset's bands to `channel_id` in the active profile. Live-applies via AudioBackend.
+    pub fn apply_eq_preset(&mut self, preset: &str, channel_id: &str) -> Result<(), EngineError> {
+        // Find preset
+        let preset_bands = self
+            .config
+            .eq_presets
+            .iter()
+            .find(|p| p.name == preset)
+            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {preset}")))?
+            .bands
+            .clone();
+
+        // Mutate channel EQ in active profile
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.eq = preset_bands;
+        }
+
+        self.save_config()?;
+
+        // Live-apply all bands (same pattern as reconcile step 2)
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.apply_all(&eq_model) {
+                eprintln!(
+                    "warning: apply_eq_preset apply_all for channel '{channel_id}' failed (ignoring): {e}"
+                );
+            }
+        }
+
+        self.emit(Event::EqPresetApplied {
+            name: preset.to_string(),
+            channel_id: channel_id.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Delete a named EQ preset. Errors if not found.
+    pub fn delete_eq_preset(&mut self, name: &str) -> Result<(), EngineError> {
+        let pos = self
+            .config
+            .eq_presets
+            .iter()
+            .position(|p| p.name == name)
+            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {name}")))?;
+        self.config.eq_presets.remove(pos);
+        self.save_config()?;
+        self.emit(Event::EqPresetDeleted {
             name: name.to_string(),
         });
         Ok(())
@@ -1562,6 +1764,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -1608,6 +1811,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -2083,6 +2287,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         };
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
@@ -2573,6 +2778,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -3158,6 +3364,7 @@ mod tests {
                 mic: mic_enabled_passthrough(),
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -3521,6 +3728,7 @@ mod tests {
                 },
                 surround: arctis_config::SurroundConfig::default(),
             }],
+            eq_presets: vec![],
         }
     }
 
@@ -4115,6 +4323,7 @@ mod tests {
                     hw_sink: None,
                 },
             }],
+            eq_presets: vec![],
         }
     }
 

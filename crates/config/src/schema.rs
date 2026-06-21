@@ -312,12 +312,26 @@ pub struct Profile {
     pub surround: SurroundConfig,
 }
 
+/// A named, reusable set of EQ bands (shared library across all profiles).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EqPreset {
+    pub name: String,
+    /// Optional hint about what kind of audio this preset suits (e.g. "gaming", "music").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_hint: Option<String>,
+    pub bands: Vec<EqBandConfig>,
+}
+
 /// Root configuration object. Versioned for forward-compatibility checking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
     pub active_profile: String,
     pub profiles: Vec<Profile>,
+    /// Shared EQ preset library (not per-profile — presets are reusable across profiles).
+    /// Defaults to empty (back-compat: old configs without this field load correctly).
+    #[serde(default)]
+    pub eq_presets: Vec<EqPreset>,
 }
 
 impl Config {
@@ -364,6 +378,7 @@ impl Config {
                 mic: MicChainConfig::default(),
                 surround: SurroundConfig::default(),
             }],
+            eq_presets: Vec::new(),
         }
     }
 

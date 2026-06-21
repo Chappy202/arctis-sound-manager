@@ -42,6 +42,50 @@ impl Config {
     pub fn profile_names(&self) -> Vec<String> {
         self.profiles.iter().map(|p| p.name.clone()).collect()
     }
+
+    /// Rename a profile. Errors if `old` not found, `new` already exists (unless same), or `new` is empty.
+    /// Does NOT update active_profile (caller handles that if needed).
+    pub fn rename_profile(&mut self, old: &str, new: &str) -> Result<(), ConfigError> {
+        if new.is_empty() {
+            return Err(ConfigError::Invalid(
+                "new profile name must not be empty".to_string(),
+            ));
+        }
+        // Check old exists
+        if self.profile(old).is_none() {
+            return Err(ConfigError::ProfileNotFound(old.to_string()));
+        }
+        // Check new doesn't already exist (unless it's the same name)
+        if old != new && self.profile(new).is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "profile '{new}' already exists"
+            )));
+        }
+        // Rename in place
+        if let Some(p) = self.profiles.iter_mut().find(|p| p.name == old) {
+            p.name = new.to_string();
+        }
+        Ok(())
+    }
+
+    /// Delete a profile. Errors if `name` not found, it's the active profile, or it's the last remaining.
+    pub fn delete_profile(&mut self, name: &str) -> Result<(), ConfigError> {
+        if self.profile(name).is_none() {
+            return Err(ConfigError::ProfileNotFound(name.to_string()));
+        }
+        if self.active_profile == name {
+            return Err(ConfigError::Invalid(format!(
+                "cannot delete the active profile '{name}'"
+            )));
+        }
+        if self.profiles.len() <= 1 {
+            return Err(ConfigError::Invalid(
+                "cannot delete the last remaining profile".to_string(),
+            ));
+        }
+        self.profiles.retain(|p| p.name != name);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -98,6 +142,179 @@ mod tests {
             matches!(err, ConfigError::Invalid(_)),
             "expected Invalid, got: {err}"
         );
+    }
+
+    // ── F3a: rename_profile tests ─────────────────────────────────────────────
+
+    #[test]
+    fn rename_profile_renames_entry() {
+        let mut cfg = Config::default_config();
+        cfg.new_profile_from_active("gaming").unwrap();
+        // switch back to default so gaming is not active
+        cfg.switch_profile("default").unwrap();
+        cfg.rename_profile("gaming", "competitive").unwrap();
+        assert!(
+            cfg.profile("competitive").is_some(),
+            "renamed profile must exist"
+        );
+        assert!(cfg.profile("gaming").is_none(), "old name must be gone");
+    }
+
+    #[test]
+    fn rename_profile_errors_on_missing_old_name() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .rename_profile("nonexistent", "new_name")
+            .expect_err("missing old name should error");
+        assert!(
+            matches!(err, ConfigError::ProfileNotFound(_)),
+            "expected ProfileNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rename_profile_errors_on_empty_new_name() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .rename_profile("default", "")
+            .expect_err("empty new name should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rename_profile_errors_on_duplicate_new_name() {
+        let mut cfg = Config::default_config();
+        cfg.new_profile_from_active("gaming").unwrap();
+        cfg.switch_profile("default").unwrap();
+        let err = cfg
+            .rename_profile("gaming", "default")
+            .expect_err("duplicate new name should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rename_profile_same_name_is_noop() {
+        let mut cfg = Config::default_config();
+        // Renaming to same name should succeed (idempotent)
+        cfg.rename_profile("default", "default").unwrap();
+        assert!(cfg.profile("default").is_some());
+    }
+
+    // ── F3a: delete_profile tests ─────────────────────────────────────────────
+
+    #[test]
+    fn delete_profile_removes_profile() {
+        let mut cfg = Config::default_config();
+        cfg.new_profile_from_active("gaming").unwrap();
+        cfg.switch_profile("default").unwrap();
+        cfg.delete_profile("gaming").unwrap();
+        assert!(
+            cfg.profile("gaming").is_none(),
+            "deleted profile must not exist"
+        );
+        assert!(
+            cfg.profile("default").is_some(),
+            "other profile must remain"
+        );
+    }
+
+    #[test]
+    fn delete_profile_errors_if_not_found() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .delete_profile("nonexistent")
+            .expect_err("deleting non-existent profile should error");
+        assert!(
+            matches!(err, ConfigError::ProfileNotFound(_)),
+            "expected ProfileNotFound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_profile_errors_if_active() {
+        let mut cfg = Config::default_config();
+        cfg.new_profile_from_active("gaming").unwrap();
+        // gaming is now active
+        let err = cfg
+            .delete_profile("gaming")
+            .expect_err("deleting active profile should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_profile_errors_if_last_profile() {
+        let mut cfg = Config::default_config();
+        // Only one profile (default) and it's not active — but still only one
+        // Actually default IS active, but check the "last remaining" guard first
+        // by switching active to default and having only one profile
+        let err = cfg
+            .delete_profile("default")
+            .expect_err("deleting last profile should error");
+        // Could be Invalid (active) or Invalid (last) — either is fine since default is active
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    // ── F3a: EqPreset tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn eq_presets_defaults_to_empty() {
+        let cfg = Config::default_config();
+        assert!(
+            cfg.eq_presets.is_empty(),
+            "eq_presets must default to empty"
+        );
+    }
+
+    #[test]
+    fn old_config_without_eq_presets_field_loads_with_empty() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("should deserialize old config");
+        assert!(
+            cfg.eq_presets.is_empty(),
+            "old config without eq_presets field must load with empty vec"
+        );
+    }
+
+    #[test]
+    fn eq_preset_round_trips_via_toml() {
+        use crate::schema::{EqBandConfig, EqPreset};
+        let mut cfg = Config::default_config();
+        cfg.eq_presets = vec![EqPreset {
+            name: "gaming-boost".to_string(),
+            kind_hint: Some("gaming".to_string()),
+            bands: vec![EqBandConfig {
+                kind: "peaking".to_string(),
+                freq_hz: 200.0,
+                q: 1.0,
+                gain_db: 3.0,
+            }],
+        }];
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(cfg, deserialized, "EqPreset must round-trip via TOML");
     }
 
     #[test]

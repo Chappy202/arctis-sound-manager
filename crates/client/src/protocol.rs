@@ -104,6 +104,37 @@ pub enum Request {
         channel: String,
         muted: bool,
     },
+    /// Rename an existing profile.
+    ProfileRename {
+        old: String,
+        new: String,
+    },
+    /// Delete a profile. The active profile and the last profile cannot be deleted.
+    ProfileDelete {
+        name: String,
+    },
+    /// Export a profile as a standalone TOML string. Returns Response with text payload.
+    ProfileExport {
+        name: String,
+    },
+    /// Import a profile from a TOML string. Resolves name collisions automatically.
+    ProfileImport {
+        toml: String,
+    },
+    /// Save the current EQ bands of a channel as a named preset.
+    EqPresetSave {
+        name: String,
+        channel: String,
+    },
+    /// Apply a named EQ preset to a channel's EQ bands.
+    EqPresetApply {
+        preset: String,
+        channel: String,
+    },
+    /// Delete a named EQ preset.
+    EqPresetDelete {
+        name: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -113,6 +144,9 @@ pub struct Response {
     pub state: Option<EngineState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Export payload (profile TOML string). Populated only for ProfileExport responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl Response {
@@ -121,6 +155,16 @@ impl Response {
             ok: true,
             state: Some(state),
             error: None,
+            text: None,
+        }
+    }
+
+    pub fn ok_with_text(text: String) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: Some(text),
         }
     }
 
@@ -129,6 +173,7 @@ impl Response {
             ok: false,
             state: None,
             error: Some(msg),
+            text: None,
         }
     }
 }
@@ -202,6 +247,7 @@ mod tests {
             ok: true,
             state: None,
             error: None,
+            text: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -788,6 +834,221 @@ mod tests {
         assert!(json.contains("mic-enable"), "cmd tag must be mic-enable");
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ── F3a: new verb wire-tag parse tests ──────────────────────────────────
+
+    #[test]
+    fn parse_profile_rename_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-rename","old":"default","new":"gaming"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileRename {
+                old: "default".into(),
+                new: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_delete_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-delete","name":"gaming"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileDelete {
+                name: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_export_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-export","name":"gaming"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileExport {
+                name: "gaming".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_profile_import_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"profile-import","toml":"name = \"test\""}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileImport {
+                toml: "name = \"test\"".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_save_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"eq-preset-save","name":"my-preset","channel":"game"}"#)
+                .unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetSave {
+                name: "my-preset".into(),
+                channel: "game".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_apply_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"eq-preset-apply","preset":"my-preset","channel":"game"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetApply {
+                preset: "my-preset".into(),
+                channel: "game".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_eq_preset_delete_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"eq-preset-delete","name":"my-preset"}"#).unwrap();
+        assert_eq!(
+            req,
+            Request::EqPresetDelete {
+                name: "my-preset".into()
+            }
+        );
+    }
+
+    // ── F3a: new verb round-trip tests ────────────────────────────────────────
+
+    #[test]
+    fn request_profile_rename_round_trips() {
+        let req = Request::ProfileRename {
+            old: "default".into(),
+            new: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-rename"),
+            "cmd tag must be profile-rename, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_delete_round_trips() {
+        let req = Request::ProfileDelete {
+            name: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-delete"),
+            "cmd tag must be profile-delete, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_export_round_trips() {
+        let req = Request::ProfileExport {
+            name: "gaming".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-export"),
+            "cmd tag must be profile-export, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_profile_import_round_trips() {
+        let req = Request::ProfileImport {
+            toml: "name = \"test\"".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-import"),
+            "cmd tag must be profile-import, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_save_round_trips() {
+        let req = Request::EqPresetSave {
+            name: "gaming-boost".into(),
+            channel: "game".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-save"),
+            "cmd tag must be eq-preset-save, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_apply_round_trips() {
+        let req = Request::EqPresetApply {
+            preset: "gaming-boost".into(),
+            channel: "game".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-apply"),
+            "cmd tag must be eq-preset-apply, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_eq_preset_delete_round_trips() {
+        let req = Request::EqPresetDelete {
+            name: "gaming-boost".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("eq-preset-delete"),
+            "cmd tag must be eq-preset-delete, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn response_ok_with_text_round_trips() {
+        let resp = Response::ok_with_text("profile TOML here".into());
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.text.as_deref(), Some("profile TOML here"));
+        assert!(back.state.is_none());
+        assert!(back.error.is_none());
+    }
+
+    #[test]
+    fn response_ok_with_text_has_no_state_field() {
+        let resp = Response::ok_with_text("exported".into());
+        let json = serde_json::to_string(&resp).unwrap();
+        // `state` should not appear (skip_serializing_if = None)
+        assert!(!json.contains("\"state\""), "state must be absent: {json}");
     }
 
     // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──

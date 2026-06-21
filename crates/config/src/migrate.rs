@@ -73,6 +73,7 @@ fn migrate_v0(raw: &str) -> Result<Config, ConfigError> {
         version: CURRENT_VERSION,
         active_profile: doc.active_profile,
         profiles: vec![profile],
+        eq_presets: Vec::new(),
     })
 }
 
