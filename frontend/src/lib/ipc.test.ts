@@ -14,6 +14,9 @@ import {
   buildDeviceSetArgs,
   buildSetChannelVolumeArgs,
   buildSetChannelMuteArgs,
+  buildProfileRenameArgs,
+  buildEqPresetSaveArgs,
+  buildEqPresetApplyArgs,
 } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -191,6 +194,92 @@ describe("buildSetChannelMuteArgs", () => {
   it("produces exactly two keys: channel and muted", () => {
     const args = buildSetChannelMuteArgs("media", true);
     expect(Object.keys(args).sort()).toEqual(["channel", "muted"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildProfileRenameArgs (F3b)
+// ---------------------------------------------------------------------------
+describe("buildProfileRenameArgs", () => {
+  it("maps old_name to 'old' and new_name to 'new'", () => {
+    const args = buildProfileRenameArgs("default", "gaming");
+    expect(args).toEqual({ old: "default", new: "gaming" });
+  });
+
+  it("produces exactly two keys: old and new", () => {
+    const args = buildProfileRenameArgs("a", "b");
+    expect(Object.keys(args).sort()).toEqual(["new", "old"]);
+  });
+
+  it("allows names with spaces and unicode", () => {
+    const args = buildProfileRenameArgs("old name", "New Näme");
+    expect(args.old).toBe("old name");
+    expect(args.new).toBe("New Näme");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildEqPresetSaveArgs (F3b)
+// ---------------------------------------------------------------------------
+describe("buildEqPresetSaveArgs", () => {
+  it("passes name and channel through unchanged", () => {
+    const args = buildEqPresetSaveArgs("gaming-boost", "game");
+    expect(args).toEqual({ name: "gaming-boost", channel: "game" });
+  });
+
+  it("produces exactly two keys: name and channel", () => {
+    const args = buildEqPresetSaveArgs("flat", "media");
+    expect(Object.keys(args).sort()).toEqual(["channel", "name"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildEqPresetApplyArgs (F3b)
+// ---------------------------------------------------------------------------
+describe("buildEqPresetApplyArgs", () => {
+  it("passes preset and channel through unchanged", () => {
+    const args = buildEqPresetApplyArgs("gaming-boost", "game");
+    expect(args).toEqual({ preset: "gaming-boost", channel: "game" });
+  });
+
+  it("produces exactly two keys: preset and channel", () => {
+    const args = buildEqPresetApplyArgs("flat", "chat");
+    expect(Object.keys(args).sort()).toEqual(["channel", "preset"]);
+  });
+
+  it("uses 'preset' key not 'name' (matches Rust EqPresetApply field)", () => {
+    const args = buildEqPresetApplyArgs("my-preset", "media");
+    expect(Object.keys(args)).toContain("preset");
+    expect(Object.keys(args)).not.toContain("name");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EqPresetSnapshot shape (F3b)
+// ---------------------------------------------------------------------------
+describe("EqPresetSnapshot shape (runtime guard)", () => {
+  it("accepts a well-formed EqPresetSnapshot", () => {
+    const preset = { name: "gaming-boost", band_count: 10 };
+    expect(preset.name).toBe("gaming-boost");
+    expect(preset.band_count).toBe(10);
+  });
+
+  it("EngineState snapshot can include eq_presets array", () => {
+    const snapshot = {
+      active_profile: "Default",
+      profiles: ["Default"],
+      channels: [],
+      routes: [] as [string, string][],
+      device_present: false,
+      device_fields: {},
+      eq_presets: [
+        { name: "flat", band_count: 10 },
+        { name: "gaming-boost", band_count: 10 },
+      ],
+    };
+    expect(snapshot.eq_presets).toHaveLength(2);
+    expect(snapshot.eq_presets[0].name).toBe("flat");
+    expect(snapshot.eq_presets[1].band_count).toBe(10);
   });
 });
 

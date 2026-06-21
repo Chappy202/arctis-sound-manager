@@ -58,6 +58,11 @@ export interface SurroundSnapshot {
   hw_sink: string | null;
 }
 
+export interface EqPresetSnapshot {
+  name: string;
+  band_count: number;
+}
+
 export interface EngineState {
   active_profile: string;
   profiles: string[];
@@ -68,6 +73,7 @@ export interface EngineState {
   device_fields: Record<string, string>;
   mic: MicSnapshot;
   surround: SurroundSnapshot;
+  eq_presets: EqPresetSnapshot[];
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +144,30 @@ export function buildMicEqBandArgs(
   gain_db: number,
 ): { band: number; kind: string; freqHz: number; q: number; gainDb: number } {
   return { band, kind, freqHz: freq_hz, q, gainDb: gain_db };
+}
+
+/** Builds arg object for profile_rename. Old/new are both simple strings — no rename needed. */
+export function buildProfileRenameArgs(
+  old_name: string,
+  new_name: string,
+): { old: string; new: string } {
+  return { old: old_name, new: new_name };
+}
+
+/** Builds arg object for eq_preset_save. */
+export function buildEqPresetSaveArgs(
+  name: string,
+  channel: string,
+): { name: string; channel: string } {
+  return { name, channel };
+}
+
+/** Builds arg object for eq_preset_apply. */
+export function buildEqPresetApplyArgs(
+  preset: string,
+  channel: string,
+): { preset: string; channel: string } {
+  return { preset, channel };
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +277,41 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 /** Pin (or clear) the surround output to a specific hardware sink. */
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
   invoke<EngineState>("surround_set_hw_sink", { hw_sink: hwSink });
+
+// ── F3b: Profile management commands ─────────────────────────────────────────
+
+/** Rename a profile. Returns updated EngineState. */
+export const profileRename = (oldName: string, newName: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_rename", buildProfileRenameArgs(oldName, newName));
+
+/** Delete a profile (cannot delete active or last). Returns updated EngineState. */
+export const profileDelete = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_delete", { name });
+
+/**
+ * Export a profile as a TOML string.
+ * Returns the raw TOML text, NOT an EngineState — use to trigger a download or clipboard copy.
+ */
+export const profileExport = (name: string): Promise<string> =>
+  invoke<string>("profile_export", { name });
+
+/** Import a profile from a TOML string. Resolves name collisions automatically. */
+export const profileImport = (toml: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_import", { toml });
+
+// ── F3b: EQ preset commands ───────────────────────────────────────────────────
+
+/** Save the current EQ bands of a channel as a named preset. */
+export const eqPresetSave = (name: string, channel: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_save", buildEqPresetSaveArgs(name, channel));
+
+/** Apply a named EQ preset to a channel's EQ bands. */
+export const eqPresetApply = (preset: string, channel: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_apply", buildEqPresetApplyArgs(preset, channel));
+
+/** Delete a named EQ preset. */
+export const eqPresetDelete = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("eq_preset_delete", { name });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

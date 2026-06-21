@@ -26,6 +26,26 @@ async fn call(
     }
 }
 
+/// Variant of `call` for verbs that return a text payload (e.g. ProfileExport).
+/// Extracts `resp.text` instead of `resp.state`.
+async fn call_text(
+    state: &State<'_, Mutex<DaemonState>>,
+    req: Request,
+) -> Result<String, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || send_request_to(&socket, &req))
+        .await
+        .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        resp.text
+            .ok_or_else(|| CommandError::Daemon("ok response missing text payload".into()))
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
+}
+
 #[tauri::command]
 pub async fn get_state(state: State<'_, Mutex<DaemonState>>) -> Result<EngineState, CommandError> {
     call(&state, Request::GetState).await
@@ -221,4 +241,68 @@ pub async fn surround_set_hw_sink(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::SurroundSetHwSink { hw_sink }).await
+}
+
+// ── F3b: Profile management commands ─────────────────────────────────────────
+
+#[tauri::command]
+pub async fn profile_rename(
+    old: String,
+    new: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ProfileRename { old, new }).await
+}
+
+#[tauri::command]
+pub async fn profile_delete(
+    name: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ProfileDelete { name }).await
+}
+
+/// Export a profile as TOML text. Returns the raw TOML string, NOT an EngineState.
+#[tauri::command]
+pub async fn profile_export(
+    name: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<String, CommandError> {
+    call_text(&state, Request::ProfileExport { name }).await
+}
+
+#[tauri::command]
+pub async fn profile_import(
+    toml: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ProfileImport { toml }).await
+}
+
+// ── F3b: EQ preset commands ───────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn eq_preset_save(
+    name: String,
+    channel: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::EqPresetSave { name, channel }).await
+}
+
+#[tauri::command]
+pub async fn eq_preset_apply(
+    preset: String,
+    channel: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::EqPresetApply { preset, channel }).await
+}
+
+#[tauri::command]
+pub async fn eq_preset_delete(
+    name: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::EqPresetDelete { name }).await
 }

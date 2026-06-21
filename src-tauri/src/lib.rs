@@ -30,6 +30,15 @@ pub fn run() {
             commands::surround_set_hrir,
             commands::surround_set_channels,
             commands::surround_set_hw_sink,
+            // F3b: profile management
+            commands::profile_rename,
+            commands::profile_delete,
+            commands::profile_export,
+            commands::profile_import,
+            // F3b: EQ presets
+            commands::eq_preset_save,
+            commands::eq_preset_apply,
+            commands::eq_preset_delete,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
