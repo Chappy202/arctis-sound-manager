@@ -12,9 +12,14 @@
     channel: ChannelSnapshot;
     /** Called after output device change so parent can refresh state if needed. */
     onOutputChanged?: () => void;
+    /**
+     * When provided the strip shows a remove button. Should be undefined for
+     * fixed channels (e.g. last remaining channel) to prevent removal.
+     */
+    onRemove?: () => void;
   }
 
-  let { channel, onOutputChanged }: Props = $props();
+  let { channel, onOutputChanged, onRemove }: Props = $props();
 
   // -----------------------------------------------------------------------
   // Channel identity / icon mapping
@@ -150,6 +155,14 @@
   <div class="strip-header">
     <span class="channel-icon" aria-hidden="true">{getIcon(channel.id)}</span>
     <h3 class="channel-label" id={labelId}>{channel.id.toUpperCase()}</h3>
+    {#if onRemove}
+      <button
+        class="remove-btn"
+        title="Remove channel {channel.id.toUpperCase()}"
+        aria-label="Remove channel {channel.id.toUpperCase()}"
+        onclick={onRemove}
+      >×</button>
+    {/if}
   </div>
 
   <p class="channel-node-name" title={displayName}>{displayName}</p>
@@ -251,6 +264,35 @@
     display: flex;
     align-items: center;
     gap: var(--ss-space-2);
+  }
+
+  .remove-btn {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    background: transparent;
+    border: none;
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-tertiary);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    transition: color var(--ss-dur-fast) var(--ss-ease-standard),
+      background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .remove-btn:hover {
+    color: var(--ss-danger);
+    background: var(--ss-danger-soft);
+  }
+
+  .remove-btn:focus-visible {
+    outline: 2px solid var(--ss-danger);
+    outline-offset: 2px;
   }
 
   .channel-icon {

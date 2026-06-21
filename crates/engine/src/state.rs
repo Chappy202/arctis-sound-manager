@@ -255,4 +255,10 @@ pub enum Event {
     SurroundHwSinkSet {
         hw_sink: Option<String>,
     },
+    ChannelAdded {
+        id: String,
+    },
+    ChannelRemoved {
+        id: String,
+    },
 }

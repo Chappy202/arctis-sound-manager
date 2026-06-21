@@ -279,6 +279,24 @@ pub async fn profile_import(
     call(&state, Request::ProfileImport { toml }).await
 }
 
+// ── F4: Channel add / remove commands ────────────────────────────────────────
+
+#[tauri::command]
+pub async fn channel_add(
+    id: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ChannelAdd { id }).await
+}
+
+#[tauri::command]
+pub async fn channel_remove(
+    id: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ChannelRemove { id }).await
+}
+
 // ── F3b: EQ preset commands ───────────────────────────────────────────────────
 
 #[tauri::command]

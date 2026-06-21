@@ -17,6 +17,8 @@ import {
   buildProfileRenameArgs,
   buildEqPresetSaveArgs,
   buildEqPresetApplyArgs,
+  buildChannelAddArgs,
+  buildChannelRemoveArgs,
 } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -280,6 +282,41 @@ describe("EqPresetSnapshot shape (runtime guard)", () => {
     expect(snapshot.eq_presets).toHaveLength(2);
     expect(snapshot.eq_presets[0].name).toBe("flat");
     expect(snapshot.eq_presets[1].band_count).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildChannelAddArgs (F4)
+// ---------------------------------------------------------------------------
+describe("buildChannelAddArgs", () => {
+  it("passes id through unchanged", () => {
+    const args = buildChannelAddArgs("aux");
+    expect(args).toEqual({ id: "aux" });
+  });
+
+  it("produces exactly one key: id", () => {
+    const args = buildChannelAddArgs("aux");
+    expect(Object.keys(args)).toEqual(["id"]);
+  });
+
+  it("accepts arbitrary alphanumeric ids", () => {
+    const args = buildChannelAddArgs("music2");
+    expect(args.id).toBe("music2");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildChannelRemoveArgs (F4)
+// ---------------------------------------------------------------------------
+describe("buildChannelRemoveArgs", () => {
+  it("passes id through unchanged", () => {
+    const args = buildChannelRemoveArgs("aux");
+    expect(args).toEqual({ id: "aux" });
+  });
+
+  it("produces exactly one key: id", () => {
+    const args = buildChannelRemoveArgs("game");
+    expect(Object.keys(args)).toEqual(["id"]);
   });
 });
 

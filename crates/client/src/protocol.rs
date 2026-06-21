@@ -135,6 +135,16 @@ pub enum Request {
     EqPresetDelete {
         name: String,
     },
+    /// Add a new channel to the active profile by id.
+    /// The engine derives node_name and description from the id.
+    ChannelAdd {
+        id: String,
+    },
+    /// Remove a channel from the active profile by id.
+    /// Errors if the channel does not exist or is the last remaining channel.
+    ChannelRemove {
+        id: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1049,6 +1059,44 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         // `state` should not appear (skip_serializing_if = None)
         assert!(!json.contains("\"state\""), "state must be absent: {json}");
+    }
+
+    // ── F4: ChannelAdd / ChannelRemove wire-tag parse tests ──────────────────
+
+    #[test]
+    fn parse_channel_add_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"channel-add","id":"aux"}"#).unwrap();
+        assert_eq!(req, Request::ChannelAdd { id: "aux".into() });
+    }
+
+    #[test]
+    fn parse_channel_remove_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"channel-remove","id":"aux"}"#).unwrap();
+        assert_eq!(req, Request::ChannelRemove { id: "aux".into() });
+    }
+
+    #[test]
+    fn request_channel_add_round_trips() {
+        let req = Request::ChannelAdd { id: "aux".into() };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("channel-add"),
+            "cmd tag must be channel-add, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_channel_remove_round_trips() {
+        let req = Request::ChannelRemove { id: "aux".into() };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("channel-remove"),
+            "cmd tag must be channel-remove, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
     }
 
     // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──

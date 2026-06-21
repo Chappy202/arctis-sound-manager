@@ -170,6 +170,16 @@ export function buildEqPresetApplyArgs(
   return { preset, channel };
 }
 
+/** Builds arg object for channel_add (F4). */
+export function buildChannelAddArgs(id: string): { id: string } {
+  return { id };
+}
+
+/** Builds arg object for channel_remove (F4). */
+export function buildChannelRemoveArgs(id: string): { id: string } {
+  return { id };
+}
+
 // ---------------------------------------------------------------------------
 // IPC commands
 // ---------------------------------------------------------------------------
@@ -312,6 +322,16 @@ export const eqPresetApply = (preset: string, channel: string): Promise<EngineSt
 /** Delete a named EQ preset. */
 export const eqPresetDelete = (name: string): Promise<EngineState> =>
   invoke<EngineState>("eq_preset_delete", { name });
+
+// ── F4: Channel add / remove commands ────────────────────────────────────────
+
+/** Add a new channel by id. Returns updated EngineState. */
+export const channelAdd = (id: string): Promise<EngineState> =>
+  invoke<EngineState>("channel_add", buildChannelAddArgs(id));
+
+/** Remove a channel by id. Returns updated EngineState. */
+export const channelRemove = (id: string): Promise<EngineState> =>
+  invoke<EngineState>("channel_remove", buildChannelRemoveArgs(id));
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

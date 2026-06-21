@@ -39,6 +39,9 @@ pub fn run() {
             commands::eq_preset_save,
             commands::eq_preset_apply,
             commands::eq_preset_delete,
+            // F4: Channel add / remove
+            commands::channel_add,
+            commands::channel_remove,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -214,6 +214,14 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ChannelAdd { id } => match engine.add_channel(&id) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::ChannelRemove { id } => match engine.remove_channel(&id) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
     }
 }
 
@@ -1778,5 +1786,103 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_cfg);
+    }
+
+    // ── F4: channel add/remove dispatch tests ────────────────────────────────
+
+    #[test]
+    fn handle_channel_add_returns_state_with_new_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f4_add_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // add_channel → create sink:
+        //   1. sink_exists() → pw-cli ls Node (Arctis_Aux not in output → absent)
+        //   2. std::fs::write conf (real file in /tmp — OK in tests)
+        //   3. spawn_owned "pipewire -c <conf>" (MockRunner records, returns token)
+        // Queue one ls output that does NOT contain Arctis_Aux so create() spawns.
+        let ls = ls_all_present(); // has Game/Chat/Media but not Aux
+        let runner = MockRunner::new().with_output(0, &ls, ""); // sink_exists ls for Arctis_Aux
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "aux".into() });
+        assert!(
+            resp.ok,
+            "channel-add must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            state.channels.iter().any(|c| c.id == "aux"),
+            "new channel must appear in state: {:?}",
+            state.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_channel_add_duplicate_id_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "game".into() });
+        assert!(!resp.ok, "duplicate id must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_channel_add_empty_id_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "".into() });
+        assert!(!resp.ok, "empty id must return ok:false");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn handle_channel_remove_returns_state_without_channel() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f4_rem_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // remove_channel → AudioBackend::remove:
+        //   1. sink_exists() → pw-cli ls Node (returns present)
+        //   2. find_node_id() → pw-cli ls Node (returns node with id)
+        //   3. pw-cli destroy <id>
+        //   4. pkill -f <conf_path> (best-effort — ignored; still consumes a queue slot)
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // sink_exists ls
+            .with_output(0, &ls, "") // find_node_id ls
+            .with_output(0, "", "") // pw-cli destroy
+            .with_output(1, "", ""); // pkill (exit 1 = nothing matched — ignored)
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "game".into() });
+        assert!(
+            resp.ok,
+            "channel-remove must return ok:true, got: {:?}",
+            resp.error
+        );
+        let state = resp.state.expect("state must be present");
+        assert!(
+            !state.channels.iter().any(|c| c.id == "game"),
+            "removed channel must not appear in state"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_channel_remove_nonexistent_returns_error() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "aux".into() });
+        assert!(!resp.ok, "nonexistent channel must return ok:false");
+        assert!(resp.error.is_some());
     }
 }

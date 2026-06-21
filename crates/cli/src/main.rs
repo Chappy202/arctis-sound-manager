@@ -145,6 +145,19 @@ enum ChannelsAction {
     },
     /// Remove all configured channels (idempotent).
     Down,
+    /// Add a new channel to the active profile. The engine derives node_name and description from id.
+    Add {
+        /// Channel id: e.g. "aux". Must not be empty, contain whitespace or path separators,
+        /// or duplicate an existing channel id.
+        id: String,
+    },
+    /// Remove a channel from the active profile by id. Any channel may be removed
+    /// (including game/chat/media) unless it is the last remaining channel.
+    /// Routes referencing the removed channel become inert.
+    Remove {
+        /// Channel id to remove.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -889,15 +902,11 @@ fn main() -> ExitCode {
                 EqAction::Preset { action } => dispatch_eq_preset(action),
             }
         }
-        Command::Channels { action } => {
-            let target = match &action {
-                ChannelsAction::Up { target } => target.clone(),
-                ChannelsAction::Down => None,
-            };
-            let cfg = ChannelSetConfig::default_sonar(target.as_deref());
-            let mut mgr = ChannelManager::new(RealRunner, cfg);
-            match action {
-                ChannelsAction::Up { .. } => match mgr.up(&EqModel::default_10band()) {
+        Command::Channels { action } => match action {
+            ChannelsAction::Up { target } => {
+                let cfg = ChannelSetConfig::default_sonar(target.as_deref());
+                let mut mgr = ChannelManager::new(RealRunner, cfg);
+                match mgr.up(&EqModel::default_10band()) {
                     Ok(handles) => {
                         println!("channels up: {} sinks ready", handles.len());
                         ExitCode::SUCCESS
@@ -906,8 +915,12 @@ fn main() -> ExitCode {
                         eprintln!("error bringing channels up: {e}");
                         ExitCode::FAILURE
                     }
-                },
-                ChannelsAction::Down => match mgr.down() {
+                }
+            }
+            ChannelsAction::Down => {
+                let cfg = ChannelSetConfig::default_sonar(None);
+                let mut mgr = ChannelManager::new(RealRunner, cfg);
+                match mgr.down() {
                     Ok(()) => {
                         println!("channels down");
                         ExitCode::SUCCESS
@@ -916,9 +929,63 @@ fn main() -> ExitCode {
                         eprintln!("error bringing channels down: {e}");
                         ExitCode::FAILURE
                     }
-                },
+                }
             }
-        }
+            ChannelsAction::Add { id } => {
+                if !daemon::socket_path().exists() {
+                    eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                    eprintln!(
+                        "note: channel add requires the daemon (single worker enforces PipeWire serialisation)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let req = daemon::Request::ChannelAdd { id: id.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{id}' added");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error communicating with daemon: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ChannelsAction::Remove { id } => {
+                if !daemon::socket_path().exists() {
+                    eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                    eprintln!(
+                        "note: channel remove requires the daemon (single worker enforces PipeWire serialisation)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let req = daemon::Request::ChannelRemove { id: id.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("channel '{id}' removed");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!(
+                            "error: {}",
+                            resp.error.unwrap_or_else(|| "unknown error".to_string())
+                        );
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error communicating with daemon: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Command::Route { action } => match action {
             RouteAction::Set {
                 app,
@@ -2481,5 +2548,47 @@ mod tests {
             } => assert_eq!(name, "flat"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── F4: channels add / channels remove parse tests ────────────────────────
+
+    #[test]
+    fn channels_add_parses() {
+        let cmd = parse(&["channels", "add", "aux"]).expect("channels add should parse");
+        match cmd {
+            super::Command::Channels {
+                action: super::ChannelsAction::Add { id },
+            } => assert_eq!(id, "aux"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channels_remove_parses() {
+        let cmd = parse(&["channels", "remove", "aux"]).expect("channels remove should parse");
+        match cmd {
+            super::Command::Channels {
+                action: super::ChannelsAction::Remove { id },
+            } => assert_eq!(id, "aux"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channels_add_no_id_fails() {
+        let result = parse(&["channels", "add"]);
+        assert!(
+            result.is_err(),
+            "channels add with no id should fail to parse"
+        );
+    }
+
+    #[test]
+    fn channels_remove_no_id_fails() {
+        let result = parse(&["channels", "remove"]);
+        assert!(
+            result.is_err(),
+            "channels remove with no id should fail to parse"
+        );
     }
 }

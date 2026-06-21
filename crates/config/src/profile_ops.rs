@@ -4,6 +4,84 @@ use crate::{
 };
 
 impl Config {
+    /// Add a new channel to the active profile.
+    ///
+    /// Errors if:
+    /// - `id` is empty
+    /// - `id` contains ASCII whitespace
+    /// - `id` contains path separators (`/` or `\`)
+    /// - a channel with `id` already exists in the active profile
+    ///
+    /// New channel defaults: flat EQ, volume_db 0.0, muted false, output_device None.
+    pub fn add_channel(
+        &mut self,
+        id: &str,
+        node_name: &str,
+        description: &str,
+    ) -> Result<(), ConfigError> {
+        if id.is_empty() {
+            return Err(ConfigError::Invalid(
+                "channel id must not be empty".to_string(),
+            ));
+        }
+        if id.chars().any(|c| c.is_ascii_whitespace()) {
+            return Err(ConfigError::Invalid(format!(
+                "channel id '{id}' must not contain whitespace"
+            )));
+        }
+        if id.contains('/') || id.contains('\\') {
+            return Err(ConfigError::Invalid(format!(
+                "channel id '{id}' must not contain path separators"
+            )));
+        }
+        let active_name = self.active_profile.clone();
+        let profile = self
+            .profile_mut(&active_name)
+            .ok_or_else(|| ConfigError::ProfileNotFound(active_name.clone()))?;
+        if profile.channels.iter().any(|c| c.id == id) {
+            return Err(ConfigError::Invalid(format!(
+                "channel '{id}' already exists"
+            )));
+        }
+        profile.channels.push(crate::schema::ChannelConfig {
+            id: id.to_string(),
+            node_name: node_name.to_string(),
+            description: description.to_string(),
+            output_device: None,
+            eq: Vec::new(),
+            volume_db: 0.0,
+            muted: false,
+        });
+        Ok(())
+    }
+
+    /// Remove a channel from the active profile by id.
+    ///
+    /// Errors if:
+    /// - the channel does not exist
+    /// - it is the last remaining channel (removing it would leave the profile empty)
+    ///
+    /// Any channels may be removed including defaults (game/chat/media). Routes
+    /// referencing a removed channel become inert (acceptable; documented here).
+    pub fn remove_channel(&mut self, id: &str) -> Result<(), ConfigError> {
+        let active_name = self.active_profile.clone();
+        let profile = self
+            .profile_mut(&active_name)
+            .ok_or_else(|| ConfigError::ProfileNotFound(active_name.clone()))?;
+        let pos = profile
+            .channels
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| ConfigError::Invalid(format!("channel '{id}' not found")))?;
+        if profile.channels.len() <= 1 {
+            return Err(ConfigError::Invalid(
+                "cannot remove the last remaining channel".to_string(),
+            ));
+        }
+        profile.channels.remove(pos);
+        Ok(())
+    }
+
     /// Set active_profile to `name`; error if it doesn't exist.
     pub fn switch_profile(&mut self, name: &str) -> Result<(), ConfigError> {
         if self.profile(name).is_none() {
@@ -315,6 +393,121 @@ description = "Game"
         let serialized = toml::to_string(&cfg).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
         assert_eq!(cfg, deserialized, "EqPreset must round-trip via TOML");
+    }
+
+    // ── F4: add_channel / remove_channel tests ───────────────────────────────
+
+    #[test]
+    fn add_channel_succeeds_for_new_id() {
+        let mut cfg = Config::default_config();
+        cfg.add_channel("aux", "Arctis_Aux", "aux audio channel")
+            .expect("add_channel should succeed for a new id");
+        let profile = cfg.active().unwrap();
+        let channel = profile
+            .channels
+            .iter()
+            .find(|c| c.id == "aux")
+            .expect("aux channel must exist after add");
+        assert_eq!(channel.node_name, "Arctis_Aux");
+        assert_eq!(channel.description, "aux audio channel");
+        assert_eq!(channel.output_device, None);
+        assert!(channel.eq.is_empty());
+        assert!((channel.volume_db - 0.0).abs() < f32::EPSILON);
+        assert!(!channel.muted);
+    }
+
+    #[test]
+    fn add_channel_rejects_empty_id() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .add_channel("", "Arctis_X", "desc")
+            .expect_err("empty id should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_channel_rejects_whitespace_id() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .add_channel("my channel", "Arctis_X", "desc")
+            .expect_err("whitespace in id should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_channel_rejects_existing_id() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .add_channel("game", "Arctis_Game2", "desc")
+            .expect_err("duplicate id should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_channel_rejects_path_separator() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .add_channel("foo/bar", "Arctis_X", "desc")
+            .expect_err("forward slash in id should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_channel_succeeds() {
+        let mut cfg = Config::default_config();
+        cfg.remove_channel("game").expect("remove should succeed");
+        let profile = cfg.active().unwrap();
+        assert_eq!(
+            profile.channels.len(),
+            2,
+            "should have 2 channels remaining"
+        );
+        assert!(
+            profile.channels.iter().all(|c| c.id != "game"),
+            "game channel must be removed"
+        );
+    }
+
+    #[test]
+    fn remove_channel_rejects_nonexistent() {
+        let mut cfg = Config::default_config();
+        let err = cfg
+            .remove_channel("nothere")
+            .expect_err("removing nonexistent channel should error");
+        assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "expected Invalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn add_then_remove_is_idempotent() {
+        let mut cfg = Config::default_config();
+        cfg.add_channel("aux", "Arctis_Aux", "aux audio channel")
+            .unwrap();
+        assert_eq!(cfg.active().unwrap().channels.len(), 4);
+        cfg.remove_channel("aux").unwrap();
+        assert_eq!(
+            cfg.active().unwrap().channels.len(),
+            3,
+            "should be back to 3 channels after add+remove"
+        );
+        assert!(
+            cfg.active().unwrap().channels.iter().all(|c| c.id != "aux"),
+            "aux must be gone"
+        );
     }
 
     #[test]

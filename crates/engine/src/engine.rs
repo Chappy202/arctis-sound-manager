@@ -907,6 +907,107 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Add a new channel to the active profile with sane defaults.
+    ///
+    /// `id` must be non-empty, contain no whitespace or path separators, and not
+    /// already exist in the active profile. `node_name` is derived as `"Arctis_<Title>"`
+    /// and `description` as `"<id> audio channel"`. After adding to config and persisting,
+    /// the new channel sink is brought up (reusing AudioBackend::create). Emits `ChannelAdded`.
+    pub fn add_channel(&mut self, id: &str) -> Result<(), EngineError> {
+        // Derive node_name and description from id
+        let title = {
+            let mut c = id.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        };
+        let node_name = format!("Arctis_{title}");
+        let description = format!("{id} audio channel");
+
+        // Mutate config (validates id constraints)
+        self.config
+            .add_channel(id, &node_name, &description)
+            .map_err(EngineError::Config)?;
+
+        // Persist
+        self.save_config()?;
+
+        // Bring the new channel sink up (reuse channel-up path)
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found after add: {id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            match be.create(&eq_model) {
+                Ok(handle) => {
+                    if let Some(token) = handle.child {
+                        self.children.track(token);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: add_channel create sink for '{id}' failed (post-spawn race?): {e}"
+                    );
+                }
+            }
+        }
+
+        self.emit(Event::ChannelAdded { id: id.to_string() });
+        Ok(())
+    }
+
+    /// Remove a channel from the active profile.
+    ///
+    /// Errors if the channel does not exist or if it is the last remaining channel.
+    /// Any channel may be removed, including game/chat/media.
+    /// Routes referencing the removed channel become inert (no automatic cleanup).
+    ///
+    /// Tears down the channel's PipeWire sink (reusing AudioBackend::remove).
+    /// Emits `ChannelRemoved`.
+    pub fn remove_channel(&mut self, id: &str) -> Result<(), EngineError> {
+        // Snapshot the channel def before removal (needed for teardown)
+        let channel_def = {
+            let profile = self.config.active()?;
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == id)
+                .ok_or_else(|| EngineError::BadRequest(format!("channel not found: {id}")))?;
+            convert::channel_def_from_cfg(channel)
+        };
+
+        // Mutate config (validates last-channel guard)
+        self.config
+            .remove_channel(id)
+            .map_err(EngineError::Config)?;
+
+        // Persist
+        self.save_config()?;
+
+        // Tear down the channel's PipeWire sink (reuse channel-down path)
+        {
+            let spec = channel_def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.remove() {
+                eprintln!(
+                    "warning: remove_channel sink teardown for '{id}' failed (ignoring): {e}"
+                );
+            }
+        }
+
+        self.emit(Event::ChannelRemoved { id: id.to_string() });
+        Ok(())
+    }
+
     /// Persist the in-memory config via arctis_config::store::save.
     pub fn save_config(&self) -> Result<(), EngineError> {
         arctis_config::store::save(&self.config).map_err(EngineError::Config)
