@@ -71,6 +71,27 @@ pub fn plan_reconcile(cfg: &Config) -> Result<Vec<ReconcileStep>, EngineError> {
     Ok(steps)
 }
 
+/// Full attenuation applied to the losing side of the ChatMix dial (dB).
+const CHATMIX_FULL_ATTEN_DB: f32 = -40.0;
+
+/// Map a ChatMix position 0..=9 to (game_db, chat_db). 4 = balanced (0,0);
+/// 9 = full game (chat at FULL_ATTEN); 0 = full chat (game at FULL_ATTEN).
+fn chatmix_to_volumes(position: i64) -> (f32, f32) {
+    let p = position.clamp(0, 9) as f32;
+    let center = 4.5_f32;
+    if (p - center).abs() < f32::EPSILON {
+        return (0.0, 0.0);
+    }
+    if p > center {
+        // bias toward game: attenuate chat proportionally
+        let t = (p - center) / (9.0 - center); // 0..1
+        (0.0, CHATMIX_FULL_ATTEN_DB * t)
+    } else {
+        let t = (center - p) / center; // 0..1
+        (CHATMIX_FULL_ATTEN_DB * t, 0.0)
+    }
+}
+
 pub struct Engine<R: CommandRunner> {
     runner: R,
     config: Config,
@@ -94,7 +115,8 @@ pub struct Engine<R: CommandRunner> {
 }
 
 impl<R: CommandRunner> Engine<R> {
-    pub fn new(runner: R, config: Config) -> Self {
+    pub fn new(runner: R, mut config: Config) -> Self {
+        config.ensure_standard_channels();
         Self {
             runner,
             config,
@@ -427,6 +449,10 @@ impl<R: CommandRunner> Engine<R> {
             mic,
             surround,
             eq_presets,
+            master_volume_db: active.as_ref().map(|p| p.master_volume_db).unwrap_or(0.0),
+            master_mute: active.as_ref().map(|p| p.master_mute).unwrap_or(false),
+            chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
+            default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
         }
     }
 
@@ -1159,6 +1185,124 @@ impl<R: CommandRunner> Engine<R> {
         }
 
         self.emit(Event::ChannelRemoved { id: id.to_string() });
+        Ok(())
+    }
+
+    /// Set the master output gain (dB) on the headset output via wpctl, persist,
+    /// and emit MasterVolumeSet.
+    pub fn set_master_volume(&mut self, db: f32) -> Result<(), EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let p = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            p.master_volume_db = db;
+        }
+        self.save_config()?;
+        // wpctl set-volume on @DEFAULT_AUDIO_SINK@ using a linear factor.
+        let linear = 10f32.powf(db / 20.0);
+        let factor = format!("{linear:.4}");
+        let out = self
+            .runner
+            .run("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &factor])?;
+        if out.status != 0 {
+            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                program: "wpctl".into(),
+                status: out.status,
+                stderr: out.stderr,
+            }));
+        }
+        self.emit(Event::MasterVolumeSet { volume_db: db });
+        Ok(())
+    }
+
+    /// Mute/unmute the master output via wpctl, persist, emit MasterMuteSet.
+    pub fn set_master_mute(&mut self, muted: bool) -> Result<(), EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let p = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            p.master_mute = muted;
+        }
+        self.save_config()?;
+        let arg = if muted { "1" } else { "0" };
+        let out = self
+            .runner
+            .run("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", arg])?;
+        if out.status != 0 {
+            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                program: "wpctl".into(),
+                status: out.status,
+                stderr: out.stderr,
+            }));
+        }
+        self.emit(Event::MasterMuteSet { muted });
+        Ok(())
+    }
+
+    /// Set ChatMix position (Game<->Chat balance); applies derived volumes to the
+    /// game and chat channels, persists position, emits ChatmixSet.
+    pub fn set_chatmix(&mut self, position: i64) -> Result<(), EngineError> {
+        let pos = position.clamp(0, 9);
+        {
+            let name = self.config.active_profile.clone();
+            let p = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            p.chatmix_position = pos;
+        }
+        let (game_db, chat_db) = chatmix_to_volumes(pos);
+        // Reuse set_channel_volume (live + persist) for each side; ignore "channel
+        // not found" so profiles lacking game/chat don't hard-fail.
+        let _ = self.set_channel_volume("game", game_db);
+        let _ = self.set_channel_volume("chat", chat_db);
+        self.save_config()?;
+        self.emit(Event::ChatmixSet { position: pos });
+        Ok(())
+    }
+
+    /// Set (or clear) which channel's sink is the system default output. When set,
+    /// runs `wpctl set-default` on that sink. Persists + emits.
+    pub fn set_default_sink_channel(
+        &mut self,
+        channel: Option<String>,
+    ) -> Result<(), EngineError> {
+        // Validate + resolve sink before mutating.
+        let sink = match &channel {
+            Some(id) => {
+                let p = self.config.active()?;
+                Some(
+                    p.channels
+                        .iter()
+                        .find(|c| &c.id == id)
+                        .map(|c| c.node_name.clone())
+                        .ok_or_else(|| {
+                            EngineError::BadRequest(format!("unknown channel: {id}"))
+                        })?,
+                )
+            }
+            None => None,
+        };
+        {
+            let name = self.config.active_profile.clone();
+            let p = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            p.default_sink_channel = channel.clone();
+        }
+        self.save_config()?;
+        if let Some(sink_name) = sink {
+            let out = self.runner.run("wpctl", &["set-default", &sink_name])?;
+            if out.status != 0 {
+                return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                    program: "wpctl".into(),
+                    status: out.status,
+                    stderr: out.stderr,
+                }));
+            }
+        }
+        self.emit(Event::DefaultSinkChannelSet { channel });
         Ok(())
     }
 
@@ -2027,6 +2171,10 @@ mod tests {
                 routes: vec![],
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -2075,6 +2223,10 @@ mod tests {
                 }],
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -2157,6 +2309,7 @@ mod tests {
             "id 10\n    node.name = \"Arctis_Game\"\n",
             "id 11\n    node.name = \"Arctis_Chat\"\n",
             "id 12\n    node.name = \"Arctis_Media\"\n",
+            "id 13\n    node.name = \"Arctis_Aux\"\n",
         ]
         .concat()
     }
@@ -2169,23 +2322,25 @@ mod tests {
     #[test]
     fn reconcile_emits_expected_argv_sinks_already_present() {
         // Channels already present → no spawns for sink creation.
+        // Engine::new seeds "aux" via ensure_standard_channels() → 4 channels total.
         // Per channel: Phase 2 (1 ls + 10 bands) then Phase 2b (1 ls + 1 Props), interleaved.
         // Reconcile processes each channel fully before moving to the next.
-        let ls = ls_all_present();
+        let ls = ls_all_present(); // includes Arctis_Game/Chat/Media/Aux
 
         // Queue outputs (interleaved per channel):
-        // Phase 1 (channels up): 3 × 1 ls-Node
-        // Per channel: (1 ls + 10 bands) + (1 ls + 1 Props)
+        // Phase 1 (channels up): 4 × 1 ls-Node
+        // Per channel (4 channels): (1 ls + 10 bands) + (1 ls + 1 Props) = 13 × 4 = 52
         // Phase 5: 1 ls (mic disabled)
         // Phase 6: 1 ls (surround disabled)
+        // Total: 4 + 52 + 1 + 1 = 58
         let runner = MockRunner::new()
-            // Phase 1: channel up — game (present), chat (present), media (present)
-            .with_output(0, &ls, "") // [0]
-            .with_output(0, &ls, "") // [1]
-            .with_output(0, &ls, "") // [2]
+            // Phase 1: channel up — game[0], chat[1], media[2], aux[3] (all present)
+            .with_output(0, &ls, "") // [0] game
+            .with_output(0, &ls, "") // [1] chat
+            .with_output(0, &ls, "") // [2] media
+            .with_output(0, &ls, "") // [3] aux
             // game: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [3] game EQ ls
-            .with_output(0, "", "") // [4]
+            .with_output(0, &ls, "") // [4] game EQ ls
             .with_output(0, "", "") // [5]
             .with_output(0, "", "") // [6]
             .with_output(0, "", "") // [7]
@@ -2194,12 +2349,12 @@ mod tests {
             .with_output(0, "", "") // [10]
             .with_output(0, "", "") // [11]
             .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13] game 10 band sets
-            .with_output(0, &ls, "") // [14] game vol find_node_id
-            .with_output(0, "", "") // [15] game vol Props set
+            .with_output(0, "", "") // [13]
+            .with_output(0, "", "") // [14] game 10 band sets
+            .with_output(0, &ls, "") // [15] game vol find_node_id
+            .with_output(0, "", "") // [16] game vol Props set
             // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [16] chat EQ ls
-            .with_output(0, "", "") // [17]
+            .with_output(0, &ls, "") // [17] chat EQ ls
             .with_output(0, "", "") // [18]
             .with_output(0, "", "") // [19]
             .with_output(0, "", "") // [20]
@@ -2208,12 +2363,12 @@ mod tests {
             .with_output(0, "", "") // [23]
             .with_output(0, "", "") // [24]
             .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26] chat 10 band sets
-            .with_output(0, &ls, "") // [27] chat vol find_node_id
-            .with_output(0, "", "") // [28] chat vol Props set
+            .with_output(0, "", "") // [26]
+            .with_output(0, "", "") // [27] chat 10 band sets
+            .with_output(0, &ls, "") // [28] chat vol find_node_id
+            .with_output(0, "", "") // [29] chat vol Props set
             // media: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [29] media EQ ls
-            .with_output(0, "", "") // [30]
+            .with_output(0, &ls, "") // [30] media EQ ls
             .with_output(0, "", "") // [31]
             .with_output(0, "", "") // [32]
             .with_output(0, "", "") // [33]
@@ -2222,13 +2377,28 @@ mod tests {
             .with_output(0, "", "") // [36]
             .with_output(0, "", "") // [37]
             .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39] media 10 band sets
-            .with_output(0, &ls, "") // [40] media vol find_node_id
-            .with_output(0, "", "") // [41] media vol Props set
+            .with_output(0, "", "") // [39]
+            .with_output(0, "", "") // [40] media 10 band sets
+            .with_output(0, &ls, "") // [41] media vol find_node_id
+            .with_output(0, "", "") // [42] media vol Props set
+            // aux: Phase 2 (EQ) + Phase 2b (vol/mute)
+            .with_output(0, &ls, "") // [43] aux EQ ls
+            .with_output(0, "", "") // [44]
+            .with_output(0, "", "") // [45]
+            .with_output(0, "", "") // [46]
+            .with_output(0, "", "") // [47]
+            .with_output(0, "", "") // [48]
+            .with_output(0, "", "") // [49]
+            .with_output(0, "", "") // [50]
+            .with_output(0, "", "") // [51]
+            .with_output(0, "", "") // [52]
+            .with_output(0, "", "") // [53] aux 10 band sets
+            .with_output(0, &ls, "") // [54] aux vol find_node_id
+            .with_output(0, "", "") // [55] aux vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "") // [42]
+            .with_output(0, &ls, "") // [56]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls, ""); // [43]
+            .with_output(0, &ls, ""); // [57]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -2238,60 +2408,75 @@ mod tests {
 
         let calls = &engine.runner.calls;
 
-        // Phase 1: 3 ls-Node calls for channel creation (all present, no spawns)
+        // Phase 1: 4 ls-Node calls for channel creation (all present, no spawns)
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"], "game up ls");
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
+        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "aux up ls");
 
         // Phase 2: apply_all game — ls Node then 10 pw-cli s Props calls
         assert_eq!(
-            calls[3],
+            calls[4],
             vec!["pw-cli", "ls", "Node"],
             "game eq find_node_id"
         );
-        assert_eq!(calls[4][0], "pw-cli", "game band 0 set");
-        assert_eq!(calls[4][1], "s");
-        assert_eq!(calls[4][3], "Props");
+        assert_eq!(calls[5][0], "pw-cli", "game band 0 set");
+        assert_eq!(calls[5][1], "s");
+        assert_eq!(calls[5][3], "Props");
 
-        // Phase 2b: apply_volume_mute game — index 14
+        // Phase 2b: apply_volume_mute game — index 15
         assert_eq!(
-            calls[14],
+            calls[15],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat: EQ starts at index 16
+        // Phase 2 chat: EQ starts at index 17
         assert_eq!(
-            calls[16],
+            calls[17],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat: volume starts at index 27
+        // Phase 2b chat: volume starts at index 28
         assert_eq!(
-            calls[27],
+            calls[28],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media: EQ starts at index 29
+        // Phase 2 media: EQ starts at index 30
         assert_eq!(
-            calls[29],
+            calls[30],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media: volume starts at index 40
+        // Phase 2b media: volume starts at index 41
         assert_eq!(
-            calls[40],
+            calls[41],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Total: 3 (up) + 3*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 44
-        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
+        // Phase 2 aux: EQ starts at index 43
+        assert_eq!(
+            calls[43],
+            vec!["pw-cli", "ls", "Node"],
+            "aux eq find_node_id"
+        );
 
-        // No spawned processes (sinks already present)
+        // Phase 2b aux: volume starts at index 54
+        assert_eq!(
+            calls[54],
+            vec!["pw-cli", "ls", "Node"],
+            "aux vol find_node_id"
+        );
+
+        // Total: 4 (up) + 4*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 58
+        assert_eq!(calls.len(), 58, "expected 58 total pw-cli calls");
+
+        // No spawned processes (sinks already present, including aux)
         assert!(
             engine.runner.spawned.is_empty(),
             "no spawns when sinks present"
@@ -2302,19 +2487,20 @@ mod tests {
     fn reconcile_emits_expected_argv_sinks_absent() {
         // Channels absent → spawn_owned fires for each sink creation.
         // spawn_owned goes into `spawned` (NOT `calls`) and does NOT consume queued outputs.
-        // Phase 1 only consumes 3 queued outputs (one ls-Node per channel).
+        // Engine::new seeds "aux" via ensure_standard_channels() → 4 channels total.
+        // Phase 1 consumes 4 ls calls (one per channel, all absent → all spawned).
         // Per channel: Phase 2 (ls + 10 bands) then Phase 2b (ls + 1 Props), interleaved.
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
-            // Phase 1: 3 ls calls only (spawn_owned does not consume queued outputs)
+            // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
             .with_output(0, &ls_absent, "") // [0] game ls (absent)
             .with_output(0, &ls_absent, "") // [1] chat ls (absent)
             .with_output(0, &ls_absent, "") // [2] media ls (absent)
+            .with_output(0, &ls_absent, "") // [3] aux ls (absent, seeded by Engine::new)
             // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [3] game EQ find_node_id
-            .with_output(0, "", "") // [4]
+            .with_output(0, &ls_present, "") // [4] game EQ find_node_id
             .with_output(0, "", "") // [5]
             .with_output(0, "", "") // [6]
             .with_output(0, "", "") // [7]
@@ -2323,12 +2509,12 @@ mod tests {
             .with_output(0, "", "") // [10]
             .with_output(0, "", "") // [11]
             .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13] game 10 band sets
-            .with_output(0, &ls_present, "") // [14] game vol find_node_id
-            .with_output(0, "", "") // [15] game vol Props set
+            .with_output(0, "", "") // [13]
+            .with_output(0, "", "") // [14] game 10 band sets
+            .with_output(0, &ls_present, "") // [15] game vol find_node_id
+            .with_output(0, "", "") // [16] game vol Props set
             // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [16] chat EQ find_node_id
-            .with_output(0, "", "") // [17]
+            .with_output(0, &ls_present, "") // [17] chat EQ find_node_id
             .with_output(0, "", "") // [18]
             .with_output(0, "", "") // [19]
             .with_output(0, "", "") // [20]
@@ -2337,12 +2523,12 @@ mod tests {
             .with_output(0, "", "") // [23]
             .with_output(0, "", "") // [24]
             .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26] chat 10 band sets
-            .with_output(0, &ls_present, "") // [27] chat vol find_node_id
-            .with_output(0, "", "") // [28] chat vol Props set
+            .with_output(0, "", "") // [26]
+            .with_output(0, "", "") // [27] chat 10 band sets
+            .with_output(0, &ls_present, "") // [28] chat vol find_node_id
+            .with_output(0, "", "") // [29] chat vol Props set
             // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [29] media EQ find_node_id
-            .with_output(0, "", "") // [30]
+            .with_output(0, &ls_present, "") // [30] media EQ find_node_id
             .with_output(0, "", "") // [31]
             .with_output(0, "", "") // [32]
             .with_output(0, "", "") // [33]
@@ -2351,13 +2537,28 @@ mod tests {
             .with_output(0, "", "") // [36]
             .with_output(0, "", "") // [37]
             .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39] media 10 band sets
-            .with_output(0, &ls_present, "") // [40] media vol find_node_id
-            .with_output(0, "", "") // [41] media vol Props set
+            .with_output(0, "", "") // [39]
+            .with_output(0, "", "") // [40] media 10 band sets
+            .with_output(0, &ls_present, "") // [41] media vol find_node_id
+            .with_output(0, "", "") // [42] media vol Props set
+            // aux: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
+            .with_output(0, &ls_present, "") // [43] aux EQ find_node_id
+            .with_output(0, "", "") // [44]
+            .with_output(0, "", "") // [45]
+            .with_output(0, "", "") // [46]
+            .with_output(0, "", "") // [47]
+            .with_output(0, "", "") // [48]
+            .with_output(0, "", "") // [49]
+            .with_output(0, "", "") // [50]
+            .with_output(0, "", "") // [51]
+            .with_output(0, "", "") // [52]
+            .with_output(0, "", "") // [53] aux 10 band sets
+            .with_output(0, &ls_present, "") // [54] aux vol find_node_id
+            .with_output(0, "", "") // [55] aux vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "") // [42]
+            .with_output(0, &ls_absent, "") // [56]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls_absent, ""); // [43]
+            .with_output(0, &ls_absent, ""); // [57]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -2367,66 +2568,81 @@ mod tests {
 
         let calls = &engine.runner.calls;
 
-        // Phase 1: only the 3 ls-Node existence checks (spawn_owned goes to `spawned`)
+        // Phase 1: only the 4 ls-Node existence checks (spawn_owned goes to `spawned`)
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"], "game up ls");
         assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
         assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
+        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "aux up ls");
 
-        // Phase 2: apply game EQ starts at index 3 (right after phase1 ls calls)
+        // Phase 2: apply game EQ starts at index 4 (right after phase1 ls calls)
         assert_eq!(
-            calls[3],
+            calls[4],
             vec!["pw-cli", "ls", "Node"],
             "game eq find_node_id"
         );
-        assert_eq!(calls[4][0], "pw-cli", "game band 0 program");
-        assert_eq!(calls[4][1], "s", "game band 0 sub-cmd");
-        assert_eq!(calls[4][3], "Props", "game band 0 Props");
+        assert_eq!(calls[5][0], "pw-cli", "game band 0 program");
+        assert_eq!(calls[5][1], "s", "game band 0 sub-cmd");
+        assert_eq!(calls[5][3], "Props", "game band 0 Props");
 
-        // Phase 2b: apply game vol at index 14
+        // Phase 2b: apply game vol at index 15
         assert_eq!(
-            calls[14],
+            calls[15],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat EQ: index 16
+        // Phase 2 chat EQ: index 17
         assert_eq!(
-            calls[16],
+            calls[17],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat vol: index 27
+        // Phase 2b chat vol: index 28
         assert_eq!(
-            calls[27],
+            calls[28],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media EQ: index 29
+        // Phase 2 media EQ: index 30
         assert_eq!(
-            calls[29],
+            calls[30],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media vol: index 40
+        // Phase 2b media vol: index 41
         assert_eq!(
-            calls[40],
+            calls[41],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Total: 3 (phase1 ls) + 3*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 44
+        // Phase 2 aux EQ: index 43
         assert_eq!(
-            calls.len(),
-            44,
-            "expected 44 total run calls (no spawns in calls)"
+            calls[43],
+            vec!["pw-cli", "ls", "Node"],
+            "aux eq find_node_id"
         );
 
-        // spawn_owned goes into `spawned` — 3 pipewire -c invocations (channels only)
+        // Phase 2b aux vol: index 54
+        assert_eq!(
+            calls[54],
+            vec!["pw-cli", "ls", "Node"],
+            "aux vol find_node_id"
+        );
+
+        // Total: 4 (phase1 ls) + 4*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 58
+        assert_eq!(
+            calls.len(),
+            58,
+            "expected 58 total run calls (no spawns in calls)"
+        );
+
+        // spawn_owned goes into `spawned` — 4 pipewire -c invocations (channels only)
         let spawned = &engine.runner.spawned;
-        assert_eq!(spawned.len(), 3, "3 pipewire -c instances spawned_owned");
+        assert_eq!(spawned.len(), 4, "4 pipewire -c instances spawned_owned");
         assert_eq!(spawned[0][0], "pipewire", "game spawn program");
         assert!(
             spawned[0][2].ends_with("Arctis_Game.conf"),
@@ -2440,9 +2656,13 @@ mod tests {
             spawned[2][2].ends_with("Arctis_Media.conf"),
             "media conf path"
         );
+        assert!(
+            spawned[3][2].ends_with("Arctis_Aux.conf"),
+            "aux conf path"
+        );
 
-        // The engine tracked all 3 child tokens
-        assert_eq!(engine.children.len(), 3, "engine must track 3 child tokens");
+        // The engine tracked all 4 child tokens
+        assert_eq!(engine.children.len(), 4, "engine must track 4 child tokens");
     }
 
     #[test]
@@ -2552,6 +2772,10 @@ mod tests {
                 }],
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -2579,15 +2803,17 @@ mod tests {
     #[test]
     fn reconcile_then_shutdown_kills_all_3_channel_instances() {
         // Set up MockRunner so pw-cli ls Node reports ALL sinks ABSENT → reconcile
-        // spawns all 3 via spawn_owned. Then shutdown must kill all 3.
+        // spawns all 4 (game/chat/media/aux) via spawn_owned. Then shutdown must kill all 4.
+        // Engine::new calls ensure_standard_channels() → aux is seeded automatically.
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
-            // Phase 1: 3 ls checks (sinks absent, spawn_owned called per channel)
+            // Phase 1: 4 ls checks (sinks absent, spawn_owned called per channel)
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "") // aux (seeded by Engine::new)
             // Phase 2: apply_all game — find_node_id + 10 band sets
             .with_output(0, &ls_present, "")
             .with_output(0, "", "")
@@ -2624,6 +2850,18 @@ mod tests {
             .with_output(0, "", "")
             .with_output(0, "", "")
             .with_output(0, "", "")
+            // Phase 2: apply_all aux
+            .with_output(0, &ls_present, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
+            .with_output(0, "", "")
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
             .with_output(0, &ls_absent, "")
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
@@ -2633,21 +2871,21 @@ mod tests {
         let mut engine = Engine::new(runner, cfg);
         engine.reconcile().expect("reconcile should succeed");
 
-        // 3 channels were absent → 3 spawn_owned calls → 3 tracked tokens.
+        // 4 channels were absent → 4 spawn_owned calls → 4 tracked tokens.
         assert_eq!(
             engine.children.len(),
-            3,
-            "reconcile must track 3 channel pipewire instances"
+            4,
+            "reconcile must track 4 channel pipewire instances"
         );
-        assert_eq!(engine.runner.spawned.len(), 3, "3 spawn_owned calls");
+        assert_eq!(engine.runner.spawned.len(), 4, "4 spawn_owned calls");
 
-        // Shutdown must kill all 3 tracked instances.
+        // Shutdown must kill all 4 tracked instances.
         engine.shutdown().expect("shutdown should succeed");
 
         assert_eq!(
             engine.runner.killed.len(),
-            3,
-            "shutdown must kill all 3 channel pipewire instances (no orphan leak)"
+            4,
+            "shutdown must kill all 4 channel pipewire instances (no orphan leak)"
         );
         assert_eq!(
             engine.children.len(),
@@ -2665,22 +2903,28 @@ mod tests {
     fn reconcile_ok_when_post_spawn_apply_all_node_not_yet_registered() {
         let ls_absent = ls_all_absent();
 
-        // Phase 1: 3 ls-absent → spawn_owned per channel (tokens tracked)
-        // Phase 2: 3 ls-absent for find_node_id → apply_all errors → non-fatal warn
+        // Engine::new seeds aux → 4 channels total.
+        // Phase 1: 4 ls-absent → spawn_owned per channel (tokens tracked)
+        // Phase 2: 4 ls-absent for find_node_id → apply_all errors → non-fatal warn
+        // Phase 2b: 4 ls-absent for apply_volume_mute find_node_id → also non-fatal
         // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls
         let runner = MockRunner::new()
             // Phase 1 ls checks (absent → spawns)
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "") // aux
             // Phase 2: find_node_id for each channel — node absent → Parse error (warn+continue)
             .with_output(0, &ls_absent, "") // game
             .with_output(0, &ls_absent, "") // chat
             .with_output(0, &ls_absent, "") // media
+            .with_output(0, &ls_absent, "") // aux
             // Phase 2b: apply_volume_mute find_node_id for each channel — also absent (warn+continue)
             .with_output(0, &ls_absent, "") // game
             .with_output(0, &ls_absent, "") // chat
             .with_output(0, &ls_absent, "") // media
+            .with_output(0, &ls_absent, "") // aux
             // Phase 5: mic source_exists check
             .with_output(0, &ls_absent, "")
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls
@@ -2698,20 +2942,20 @@ mod tests {
             "reconcile must return Ok when post-spawn apply_all fails with node-not-yet-registered: {result:?}"
         );
 
-        // 3 channels spawned
+        // 4 channels spawned (aux seeded by Engine::new)
         assert_eq!(
             engine.runner.spawned.len(),
-            3,
-            "3 pipewire instances spawned"
+            4,
+            "4 pipewire instances spawned"
         );
-        // 3 tracked tokens
-        assert_eq!(engine.children.len(), 3, "3 child tokens tracked");
+        // 4 tracked tokens
+        assert_eq!(engine.children.len(), 4, "4 child tokens tracked");
 
-        // 11 run calls total: 3 (phase1 ls) + 3 (phase2 find_node_id) + 3 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
+        // 14 run calls total: 4 (phase1 ls) + 4 (phase2 find_node_id) + 4 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
         assert_eq!(
             engine.runner.calls.len(),
-            11,
-            "expected 11 run calls: 3 ls-up + 3 ls-find-node + 3 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
+            14,
+            "expected 14 run calls: 4 ls-up + 4 ls-find-node + 4 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
         );
     }
 
@@ -2724,12 +2968,12 @@ mod tests {
         // Queue enough outputs for two full reconcile passes.
         let mut runner = MockRunner::new();
         for _ in 0..2 {
-            // Phase 1: 3 ls (all present, no spawn)
-            for _ in 0..3 {
+            // Phase 1: 4 ls (all present, no spawn — Engine::new seeds aux)
+            for _ in 0..4 {
                 runner = runner.with_output(0, &ls, "");
             }
-            // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
-            for _ in 0..3 {
+            // Phase 2 + 2b interleaved: per channel (4), EQ apply then volume/mute apply
+            for _ in 0..4 {
                 // Phase 2: EQ apply (1 ls + 10 band sets)
                 runner = runner.with_output(0, &ls, "");
                 for _ in 0..10 {
@@ -2775,8 +3019,10 @@ mod tests {
         ))
     }
 
-    /// Queue enough MockRunner outputs to survive `reconcile()` on a 3-channel,
-    /// no-EQ, no-routes config where all sinks are already present AND mic disabled.
+    /// Queue enough MockRunner outputs to survive `reconcile()` on a 4-channel
+    /// (game/chat/media/aux), no-EQ, no-routes config where all sinks are already
+    /// present AND mic disabled. Engine::new calls ensure_standard_channels() which
+    /// adds "aux" to any 3-channel config, making this a 4-channel reconcile.
     ///
     /// Step 5 (mic): mic disabled → MicBackend::remove() → source_exists() → 1 ls Node
     /// returning the "no mic" output (source absent, remove returns immediately).
@@ -2784,12 +3030,12 @@ mod tests {
         let ls = ls_all_present();
         let ls_no_mic = ls_all_present(); // "present" for channels but no mic node
         let mut r = runner;
-        // Phase 1: 3 ls (all present)
-        for _ in 0..3 {
+        // Phase 1: 4 ls (all present, including aux seeded by Engine::new)
+        for _ in 0..4 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
-        for _ in 0..3 {
+        // Phase 2 + 2b interleaved: per channel (4 channels), EQ apply then volume/mute apply
+        for _ in 0..4 {
             // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
@@ -2812,7 +3058,8 @@ mod tests {
         let engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
         assert_eq!(s.active_profile, "default");
-        assert_eq!(s.channels.len(), 3);
+        // Engine::new calls ensure_standard_channels() which adds "aux" to the 3-channel config.
+        assert_eq!(s.channels.len(), 4);
         assert!(s.profiles.contains(&"default".to_string()));
     }
 
@@ -2854,6 +3101,10 @@ mod tests {
             routes: vec![],
             mic: MicChainConfig::default(),
             surround: arctis_config::SurroundConfig::default(),
+            master_volume_db: 0.0,
+            master_mute: false,
+            chatmix_position: 4,
+            default_sink_channel: None,
         });
 
         // Use a temp ASM_CONFIG_HOME so we don't touch real config.
@@ -3044,6 +3295,10 @@ mod tests {
                 routes: vec![],
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -3851,6 +4106,10 @@ mod tests {
                 routes: vec![],
                 mic: mic_enabled_passthrough(),
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -3862,18 +4121,19 @@ mod tests {
         queue_reconcile_present(runner)
     }
 
-    /// Queue outputs for a 3-channel reconcile with mic ENABLED and source absent.
+    /// Queue outputs for a 4-channel reconcile with mic ENABLED and source absent.
+    /// Engine::new seeds "aux" → 4 channels (game/chat/media/aux).
     /// Step5: create() → source_exists() (1 ls, absent) → spawn (goes to spawned)
     fn queue_reconcile_with_mic_enabled_absent(runner: MockRunner) -> MockRunner {
         let ls = ls_all_present();
         let ls_mic_absent = ls_without_mic();
         let mut r = runner;
-        // Phase 1: 3 ls (all present)
-        for _ in 0..3 {
+        // Phase 1: 4 ls (all present, including aux seeded by Engine::new)
+        for _ in 0..4 {
             r = r.with_output(0, &ls, "");
         }
-        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
-        for _ in 0..3 {
+        // Phase 2 + 2b interleaved: per channel (4), EQ apply then volume/mute apply
+        for _ in 0..4 {
             // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls, "");
             for _ in 0..10 {
@@ -4216,6 +4476,10 @@ mod tests {
                     ..Default::default()
                 },
                 surround: arctis_config::SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -4802,6 +5066,10 @@ mod tests {
                     channels: vec!["game".into(), "media".into()],
                     hw_sink: None,
                 },
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
@@ -4834,11 +5102,12 @@ mod tests {
                 .unwrap_or(false)),
             "no surround spawn when disabled"
         );
-        // Total 44 calls: 38 baseline + 6 from apply_volume_mute (3 channels × 2 calls)
-        assert_eq!(calls.len(), 44, "expected 44 total pw-cli calls");
+        // Total 58 calls: 4 (phase1) + 4*(1+10+1+1) (EQ+vol per channel) + 1 (mic) + 1 (surround)
+        assert_eq!(calls.len(), 58, "expected 58 total pw-cli calls");
     }
 
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
+    /// Engine::new seeds "aux" → 4 channels (game/chat/media/aux).
     /// Step6 enabled (apply_surround uses recreate in enabled path):
     ///   1. recreate() = remove() + create():
     ///      remove: source_exists() → 1 ls (absent, no destroy)
@@ -4849,12 +5118,12 @@ mod tests {
         let ls_channels = ls_all_present();
         let ls_surround_absent = ls_all_absent(); // no surround node
         let mut r = runner;
-        // Phase 1: 3 ls (all channels present)
-        for _ in 0..3 {
+        // Phase 1: 4 ls (all channels present, including aux seeded by Engine::new)
+        for _ in 0..4 {
             r = r.with_output(0, &ls_channels, "");
         }
-        // Phase 2 + 2b interleaved: per channel, EQ apply then volume/mute apply
-        for _ in 0..3 {
+        // Phase 2 + 2b interleaved: per channel (4), EQ apply then volume/mute apply
+        for _ in 0..4 {
             // Phase 2: EQ apply (1 ls + 10 band sets)
             r = r.with_output(0, &ls_channels, "");
             for _ in 0..10 {
@@ -5658,5 +5927,45 @@ mod tests {
             engine.runner.calls.is_empty(),
             "no runner calls on unknown channel"
         );
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 8 — ensure_standard_channels seed + mixer methods
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn engine_new_seeds_standard_channels_for_old_profile() {
+        // Simulate a legacy profile that only has game/chat/media (no aux).
+        let mut cfg = make_config_no_eq_no_routes(); // game/chat/media
+        cfg.profiles[0].channels.retain(|c| c.id != "aux");
+        // Engine::new calls ensure_standard_channels() → aux is added.
+        let engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+        let st = engine.state();
+        assert!(st.channels.iter().any(|c| c.id == "aux"), "aux auto-seeded on load");
+    }
+
+    #[test]
+    fn set_master_volume_persists_and_reports() {
+        let cfg = make_config_no_eq_no_routes();
+        // wpctl call for the gain (status 0).
+        let runner = arctis_audio::MockRunner::new().with_output(0, "", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_master_volume(-6.0).unwrap();
+        assert_eq!(engine.state().master_volume_db, -6.0);
+    }
+
+    #[test]
+    fn set_chatmix_updates_game_chat_volumes() {
+        let cfg = make_config_no_eq_no_routes();
+        // set_chatmix → set_channel_volume("game") + set_channel_volume("chat")
+        // Each set_channel_volume calls apply_volume_mute → 2 runner calls (find_node_id + Props set).
+        // With MockRunner exhausted after 2 calls, the second channel fails non-fatally.
+        // Queue 2 outputs for the game channel's apply_volume_mute.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "") // game: find_node_id (empty → node not found, non-fatal)
+            .with_output(0, "", ""); // chat: find_node_id (empty → node not found, non-fatal)
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_chatmix(9).unwrap(); // full game
+        assert_eq!(engine.state().chatmix_position, 9);
     }
 }

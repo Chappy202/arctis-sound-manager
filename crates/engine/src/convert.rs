@@ -511,6 +511,10 @@ mod tests {
             routes: vec![],
             mic: MicChainConfig::default(),
             surround: SurroundConfig::default(),
+            master_volume_db: 0.0,
+            master_mute: false,
+            chatmix_position: 4,
+            default_sink_channel: None,
         }
     }
 

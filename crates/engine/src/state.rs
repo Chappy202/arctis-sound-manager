@@ -148,6 +148,18 @@ pub struct EngineState {
     pub surround: SurroundSnapshot,
     #[serde(default)]
     pub eq_presets: Vec<EqPresetSnapshot>,
+    /// Master output gain in dB (0.0 = unity). Populated from the active profile.
+    #[serde(default)]
+    pub master_volume_db: f32,
+    /// Whether the master output is muted.
+    #[serde(default)]
+    pub master_mute: bool,
+    /// ChatMix position 0..=9 (0 = full chat, 9 = full game, 4 = balanced).
+    #[serde(default)]
+    pub chatmix_position: i64,
+    /// Channel id whose sink is the system default output, or None.
+    #[serde(default)]
+    pub default_sink_channel: Option<String>,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI
@@ -282,5 +294,17 @@ pub enum Event {
     },
     ChannelRemoved {
         id: String,
+    },
+    MasterVolumeSet {
+        volume_db: f32,
+    },
+    MasterMuteSet {
+        muted: bool,
+    },
+    ChatmixSet {
+        position: i64,
+    },
+    DefaultSinkChannelSet {
+        channel: Option<String>,
     },
 }
