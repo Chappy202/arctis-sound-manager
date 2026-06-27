@@ -2,134 +2,76 @@
   /**
    * EqPage.svelte — Parametric EQ editing page for a selected channel.
    *
-   * Band initialisation: per-band parameters (freqHz / q / gainDb) are read
-   * from the real eq_bands array in the daemon's get-state response and kept
-   * fresh via state-changed events. The fallback to flat default bands is only
-   * used when a channel reports zero eq_bands (e.g. device not present or
-   * engine returns an empty list), and a notice is shown to the user in that
-   * case via the `showingDefaults` flag.
+   * Single source of truth: `bands` is the only band array. The engine snapshot
+   * is reconciled via reconcileBands(), which preserves the local array while any
+   * edit is in progress (pointer drag, scroll, keyboard, numeric field focus),
+   * preventing the "disappearing dots" bug caused by the old 4-way bookkeeping.
    */
 
-  import { onMount } from "svelte";
   import { get } from "svelte/store";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
-  import { dragging } from "../stores/eqDragging.js";
-  import EqCanvas from "./EqCanvas.svelte";
+  import { eqEditing } from "../stores/eqEditing.js";
+  import { reconcileBands, type Band } from "../eq.js";
+  import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
+  import EqGraph from "./EqGraph.svelte";
+  import EqBandPanel from "./EqBandPanel.svelte";
   import BandList from "./BandList.svelte";
-  import { defaultBands, type Band } from "../eq.js";
-  import { eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
 
   // ---------------------------------------------------------------------------
   // Channel selection
   // ---------------------------------------------------------------------------
 
-  // Read the channel id set by ChannelStrip.openEq() or default to the first channel.
   let channelId = $state<string>("");
-
-  // Track bands per-channel so switching channels doesn't lose edits
-  const bandsByChannel = $state<Record<string, Band[]>>({});
-
+  let bands = $state<Band[]>([]);            // SINGLE source of truth for the active channel
   let selectedBandIndex = $state(0);
 
-  // Current channel's bands (derived from per-channel cache or defaults)
-  let bands = $state<Band[]>([]);
-
-  // True when the engine has no real band data and we are showing flat defaults.
-  let showingDefaults = $state(false);
-
-  function getOrInitBands(id: string): Band[] {
-    if (!bandsByChannel[id]) {
-      const channel = $engineState?.channels.find((c) => c.id === id);
-      if (channel?.eq_bands?.length) {
-        // Map the engine's actual band parameters into the local Band[] shape.
-        bandsByChannel[id] = channel.eq_bands.map((b) => ({
-          kind: b.kind as Band["kind"],
-          freqHz: b.freq_hz,
-          q: b.q,
-          gainDb: b.gain_db,
-        }));
-      } else {
-        bandsByChannel[id] = defaultBands(10);
-      }
-    }
-    return bandsByChannel[id];
+  function snapshotToBands(id: string): Band[] {
+    const ch = $engineState?.channels.find((c) => c.id === id);
+    return (ch?.eq_bands ?? []).map((b) => ({
+      kind: b.kind as Band["kind"], freqHz: b.freq_hz, q: b.q, gainDb: b.gain_db,
+    }));
   }
 
   function selectChannel(id: string) {
     channelId = id;
-    bands = getOrInitBands(id);
+    bands = snapshotToBands(id);            // engine is dense-10; no fabrication
     selectedBandIndex = 0;
-    const channel = $engineState?.channels.find((c) => c.id === id);
-    showingDefaults = !(channel?.eq_bands?.length);
   }
 
-  onMount(() => {
-    // Read deep-link from ChannelStrip's openEq()
-    const stored = sessionStorage.getItem("eq:channel");
-    if (stored) sessionStorage.removeItem("eq:channel");
-
-    const channels = $engineState?.channels ?? [];
-    if (channels.length === 0) {
-      // No state yet — use a placeholder; state-changed will trigger re-render
-      channelId = stored ?? "game";
-      bands = defaultBands(10);
-      showingDefaults = true;
-      return;
-    }
-
-    const target = stored
-      ? channels.find((c) => c.id === stored)
-      : channels[0];
-
-    selectChannel(target?.id ?? channels[0].id);
-  });
-
-  // When engine state loads/updates, initialise channelId if not yet set
+  // Init once state is available.
   $effect(() => {
     if (!channelId && $engineState?.channels.length) {
       selectChannel($engineState.channels[0].id);
     }
   });
 
-  // Reflect external state-changed updates into the local band cache.
-  // Guard: skip the refresh while a pointer drag is in progress to avoid
-  // clobbering values the user is actively editing on the canvas.
+  // Reconcile from engine ONLY when idle (covers all edit modalities via eqEditing).
   $effect(() => {
-    // Establish reactivity dependency on engineState.
-    const state = $engineState;
-    if (!channelId || !state) return;
-
-    const channel = state.channels.find((c) => c.id === channelId);
-    if (!channel?.eq_bands?.length) return;
-
-    // Do not overwrite bands mid-drag — the canvas owns them during a drag.
-    if (get(dragging)) return;
-
-    bandsByChannel[channelId] = channel.eq_bands.map((b) => ({
-      kind: b.kind as Band["kind"],
-      freqHz: b.freq_hz,
-      q: b.q,
-      gainDb: b.gain_db,
-    }));
-    bands = [...bandsByChannel[channelId]];
-    showingDefaults = false;
+    const st = $engineState;            // dependency
+    if (!channelId || !st) return;
+    const incoming = snapshotToBands(channelId);
+    if (incoming.length === 0) return;
+    bands = reconcileBands(bands, incoming, get(eqEditing));
   });
 
-  // ---------------------------------------------------------------------------
-  // Band change handler (from canvas or list)
-  // ---------------------------------------------------------------------------
-
+  // Single writer: all child edits land here.
   function handleBandChange(index: number, band: Band) {
-    if (!channelId) return;
-    if (!bandsByChannel[channelId]) return;
-    bandsByChannel[channelId][index] = band;
-    // Trigger reactivity
-    bands = [...bandsByChannel[channelId]];
+    bands = bands.map((b, i) => (i === index ? band : b));
   }
-
-  function handleSelectBand(index: number) {
-    selectedBandIndex = index;
+  function handleSelect(index: number) { selectedBandIndex = index; }
+  // Flush helper passed to the band panel (graph flushes internally via setEqBand).
+  function flushBand(index: number, band: Band) {
+    setEqBand(channelId, index, band.kind, band.freqHz, band.q, band.gainDb)
+      .catch((e) => console.warn("[EqPage] setEqBand failed:", e));
+  }
+  async function flattenAll() {
+    const flat = bands.map((b) => ({ ...b, gainDb: 0 }));
+    bands = flat;
+    for (let i = 0; i < flat.length; i++) {
+      try { await setEqBand(channelId, i, flat[i].kind, flat[i].freqHz, flat[i].q, 0); }
+      catch (e) { console.warn("[EqPage] flatten band failed:", e); }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -265,50 +207,34 @@
     {/if}
   </div>
 
-  <!-- ===== Defaults notice — only when engine reports zero bands ===== -->
-  {#if showingDefaults}
-    <div class="defaults-notice" role="note" aria-label="Band values notice">
-      <span class="notice-icon" aria-hidden="true">ℹ</span>
-      Showing default values — the engine does not yet report live band parameters.
-      Changes take effect immediately in audio but reset on page reload.
-    </div>
-  {/if}
-
-  <!-- ===== EQ Canvas (hero) ===== -->
+  <!-- ===== EQ Graph (hero) ===== -->
   <div class="eq-canvas-card">
     <div class="canvas-area">
-      <EqCanvas
-        {channelId}
-        {bands}
-        {selectedBandIndex}
-        onBandChange={handleBandChange}
-        onSelectBand={handleSelectBand}
-      />
+      <EqGraph {channelId} {bands} selectedIndex={selectedBandIndex}
+        onBandChange={handleBandChange} onSelect={handleSelect} />
     </div>
-
-    <!-- Gesture hint -->
     <div class="gesture-hint" aria-hidden="true">
-      <span>Drag dot = freq / gain</span>
-      <span class="hint-sep">·</span>
-      <span>Scroll on dot = Q</span>
-      <span class="hint-sep">·</span>
-      <span>↑↓ arrows = gain · ←→ arrows = freq · Shift = coarse</span>
+      <span>Drag = freq / gain</span><span class="hint-sep">·</span>
+      <span>Scroll = Q</span><span class="hint-sep">·</span>
+      <span>Dbl-click = flatten band</span><span class="hint-sep">·</span>
+      <span>Arrows = nudge · Alt+↑↓ = Q</span>
     </div>
   </div>
 
-  <!-- ===== Band list ===== -->
-  <div class="band-list-card">
-    <div class="card-header">
-      <h2 class="card-title">BANDS</h2>
-      <span class="band-count">{bands.length}</span>
+  <!-- ===== Band detail row: list + panel ===== -->
+  <div class="eq-detail-row">
+    <div class="band-list-card">
+      <div class="card-header">
+        <h2 class="card-title">BANDS</h2>
+        <span class="band-count">{bands.length}</span>
+        <button class="flatten-btn" onclick={flattenAll}>Flatten</button>
+      </div>
+      <BandList {bands} selectedIndex={selectedBandIndex} onSelectBand={handleSelect} />
     </div>
-    <BandList
-      {channelId}
-      {bands}
-      {selectedBandIndex}
-      onSelectBand={handleSelectBand}
-      onBandChange={handleBandChange}
-    />
+    <div class="band-list-card">
+      <EqBandPanel band={bands[selectedBandIndex] ?? null} index={selectedBandIndex}
+        onBandChange={handleBandChange} onFlush={flushBand} />
+    </div>
   </div>
 
   <!-- ===== EQ Presets ===== -->
@@ -528,27 +454,6 @@
     outline-offset: 1px;
   }
 
-  /* ===== Defaults notice ===== */
-  .defaults-notice {
-    display: flex;
-    align-items: center;
-    gap: var(--ss-space-2);
-    padding: var(--ss-space-2) var(--ss-space-3);
-    background: var(--ss-danger-soft, rgba(229, 72, 77, 0.10));
-    border: 1px solid rgba(229, 72, 77, 0.25);
-    border-radius: var(--ss-radius-xs);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-caption-size);
-    color: var(--ss-text-secondary);
-    flex-shrink: 0;
-  }
-
-  .notice-icon {
-    color: var(--ss-warning);
-    font-size: 12px;
-    flex-shrink: 0;
-  }
-
   /* ===== EQ Canvas card ===== */
   .eq-canvas-card {
     flex: 1;
@@ -582,6 +487,13 @@
     color: var(--ss-border-strong);
   }
 
+  /* ===== Band detail row ===== */
+  .eq-detail-row {
+    display: flex;
+    gap: var(--ss-space-4);
+    flex-wrap: wrap;
+  }
+
   /* ===== Band list card ===== */
   .band-list-card {
     background: var(--ss-surface-1);
@@ -589,6 +501,8 @@
     border-radius: var(--ss-radius-md);
     padding: var(--ss-space-4) var(--ss-space-4) var(--ss-space-3);
     box-shadow: var(--ss-e1);
+    flex: 1;
+    min-width: 220px;
     flex-shrink: 0;
   }
 
@@ -624,6 +538,35 @@
     font-size: var(--ss-type-caption-size);
     font-variant-numeric: tabular-nums;
     color: var(--ss-text-tertiary);
+  }
+
+  /* ===== Flatten button (mirrors .preset-btn) ===== */
+  .flatten-btn {
+    margin-left: auto;
+    height: 22px;
+    padding: 0 var(--ss-space-2);
+    border: var(--ss-border-width) solid var(--ss-border-strong);
+    border-radius: var(--ss-radius-xs);
+    background: transparent;
+    color: var(--ss-text-tertiary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    cursor: pointer;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .flatten-btn:hover {
+    background: var(--ss-accent-soft);
+    color: var(--ss-accent);
+    border-color: var(--ss-accent-border);
+  }
+
+  .flatten-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 1px;
   }
 
   /* ===== Preset card ===== */
