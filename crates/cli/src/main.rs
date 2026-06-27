@@ -95,6 +95,20 @@ enum Command {
         #[command(subcommand)]
         action: StreamsAction,
     },
+    /// Master output: volume + mute.
+    Master {
+        #[command(subcommand)]
+        action: MasterAction,
+    },
+    /// ChatMix Game<->Chat balance (0=chat .. 9=game).
+    Chatmix {
+        position: i64,
+    },
+    /// System default-output channel (apps auto-land here).
+    DefaultSink {
+        #[command(subcommand)]
+        action: DefaultSinkAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -420,6 +434,27 @@ enum StreamsAction {
         /// Target channel id: game | chat | media | aux | ...
         channel: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MasterAction {
+    /// Set the master output volume in dB (e.g. -6.0 for -6 dB).
+    Volume {
+        #[arg(allow_negative_numbers = true)]
+        db: f32,
+    },
+    /// Mute or unmute the master output (`on` to mute, `off` to unmute).
+    Mute {
+        state: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DefaultSinkAction {
+    /// Set the default-output channel by id.
+    Set { channel: String },
+    /// Clear the default-output channel (revert to engine default).
+    Clear,
 }
 
 const SINK_NAME: &str = "arctis_eq";
@@ -1263,6 +1298,37 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Command::Master { action } => {
+            let req = match action {
+                MasterAction::Volume { db } => daemon::Request::SetMasterVolume { volume_db: db },
+                MasterAction::Mute { state } => {
+                    let muted = match state.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => {
+                            eprintln!("mute state must be 'on' or 'off', got: {other}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    daemon::Request::SetMasterMute { muted }
+                }
+            };
+            send_state_request(&req)
+        }
+        Command::Chatmix { position } => {
+            send_state_request(&daemon::Request::SetChatmix { position })
+        }
+        Command::DefaultSink { action } => {
+            let req = match action {
+                DefaultSinkAction::Set { channel } => {
+                    daemon::Request::SetDefaultSinkChannel { channel: Some(channel) }
+                }
+                DefaultSinkAction::Clear => {
+                    daemon::Request::SetDefaultSinkChannel { channel: None }
+                }
+            };
+            send_state_request(&req)
+        }
         Command::Daemon { foreground: _ } => {
             // Coexist check: scan for legacy nodes using pw-cli ls Node output.
             let node_stdout = std::process::Command::new("pw-cli")
@@ -1893,6 +1959,22 @@ fn print_coexist_result(result: &arctis_client::CoexistDisableResult, dry_run: b
     }
     if !result.owner_note.is_empty() {
         println!("note: {}", result.owner_note);
+    }
+}
+
+/// Send a state-mutating request to the daemon and return SUCCESS/FAILURE.
+/// Collapses the repeated send_request + ok/err match used by Master/Chatmix/DefaultSink.
+fn send_state_request(req: &daemon::Request) -> ExitCode {
+    match daemon::send_request(req) {
+        Ok(resp) if resp.ok => ExitCode::SUCCESS,
+        Ok(resp) => {
+            eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("error sending request: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -2925,5 +3007,36 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── Task 9: master/chatmix/default-sink parse tests ─────────────────────
+
+    #[test]
+    fn master_volume_parses() {
+        let cmd = parse(&["master", "volume", "-6"]).expect("master volume -6 should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Master {
+                action: super::MasterAction::Volume { db }
+            } if db == -6.0
+        ));
+    }
+
+    #[test]
+    fn chatmix_parses() {
+        let cmd = parse(&["chatmix", "7"]).expect("chatmix 7 should parse");
+        assert!(matches!(cmd, super::Command::Chatmix { position: 7 }));
+    }
+
+    #[test]
+    fn default_sink_set_parses() {
+        let cmd =
+            parse(&["default-sink", "set", "game"]).expect("default-sink set game should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::DefaultSink {
+                action: super::DefaultSinkAction::Set { channel }
+            } if channel == "game"
+        ));
     }
 }

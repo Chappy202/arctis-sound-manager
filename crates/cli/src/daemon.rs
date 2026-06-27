@@ -234,6 +234,24 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SetMasterVolume { volume_db } => match engine.set_master_volume(volume_db) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SetMasterMute { muted } => match engine.set_master_mute(muted) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SetChatmix { position } => match engine.set_chatmix(position) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SetDefaultSinkChannel { channel } => {
+            match engine.set_default_sink_channel(channel) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::CoexistStatus => {
             // Run pw-cli ls Node + check home dir for legacy components.
             let node_stdout = RealRunner
@@ -785,6 +803,10 @@ mod tests {
                     routes: vec![],
                     mic: MicChainConfig::default(),
                     surround: arctis_config::SurroundConfig::default(),
+                    master_volume_db: 0.0,
+                    master_mute: false,
+                    chatmix_position: 4,
+                    default_sink_channel: None,
                 },
                 Profile {
                     name: "gaming".into(),
@@ -792,6 +814,10 @@ mod tests {
                     routes: vec![],
                     mic: MicChainConfig::default(),
                     surround: arctis_config::SurroundConfig::default(),
+                    master_volume_db: 0.0,
+                    master_mute: false,
+                    chatmix_position: 4,
+                    default_sink_channel: None,
                 },
             ],
             eq_presets: vec![],

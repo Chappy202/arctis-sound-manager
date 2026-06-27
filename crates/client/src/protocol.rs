@@ -198,6 +198,14 @@ pub enum Request {
         stream: String,
         channel: String,
     },
+    /// Set the master output volume (dB). Same range as channel volumes.
+    SetMasterVolume { volume_db: f32 },
+    /// Set the master output mute state.
+    SetMasterMute { muted: bool },
+    /// Set the ChatMix position (0=chat .. 9=game).
+    SetChatmix { position: i64 },
+    /// Set (or clear) the system default-output channel.
+    SetDefaultSinkChannel { channel: Option<String> },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1315,6 +1323,32 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ── Task 9: SetMasterVolume / SetChatmix / SetDefaultSinkChannel round-trip tests ──
+
+    #[test]
+    fn request_set_master_volume_round_trips() {
+        let req = Request::SetMasterVolume { volume_db: -6.0 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("set-master-volume"), "{json}");
+        assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
+    }
+
+    #[test]
+    fn request_set_chatmix_round_trips() {
+        let req = Request::SetChatmix { position: 7 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("set-chatmix"), "{json}");
+        assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
+    }
+
+    #[test]
+    fn request_set_default_sink_channel_round_trips() {
+        let req = Request::SetDefaultSinkChannel { channel: Some("game".into()) };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("set-default-sink-channel"), "{json}");
+        assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
     }
 
     // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──
