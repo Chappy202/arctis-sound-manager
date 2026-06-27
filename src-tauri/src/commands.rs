@@ -1,7 +1,7 @@
 use crate::error::CommandError;
 use crate::state::DaemonState;
 use arctis_client::{send_request_to, Request};
-use arctis_engine::EngineState;
+use arctis_engine::{AppStream, EngineState};
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -42,6 +42,24 @@ async fn call_text(
     if resp.ok {
         resp.text
             .ok_or_else(|| CommandError::Daemon("ok response missing text payload".into()))
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
+}
+
+/// Variant of `call` for ListStreams (returns the `streams` payload).
+async fn call_streams(
+    state: &State<'_, Mutex<DaemonState>>,
+    req: Request,
+) -> Result<Vec<AppStream>, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || send_request_to(&socket, &req))
+        .await
+        .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        Ok(resp.streams.unwrap_or_default())
     } else {
         Err(CommandError::Daemon(
             resp.error.unwrap_or_else(|| "unknown daemon error".into()),
@@ -349,6 +367,56 @@ pub async fn channel_remove(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::ChannelRemove { id }).await
+}
+
+// ── Sonar mixer commands (Task 11) ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_streams(
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<Vec<AppStream>, CommandError> {
+    call_streams(&state, Request::ListStreams).await
+}
+
+#[tauri::command]
+pub async fn move_stream(
+    stream: String,
+    channel: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::MoveStream { stream, channel }).await
+}
+
+#[tauri::command]
+pub async fn set_master_volume(
+    volume_db: f32,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetMasterVolume { volume_db }).await
+}
+
+#[tauri::command]
+pub async fn set_master_mute(
+    muted: bool,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetMasterMute { muted }).await
+}
+
+#[tauri::command]
+pub async fn set_chatmix(
+    position: i64,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetChatmix { position }).await
+}
+
+#[tauri::command]
+pub async fn set_default_sink_channel(
+    channel: Option<String>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetDefaultSinkChannel { channel }).await
 }
 
 // ── F3b: EQ preset commands ───────────────────────────────────────────────────

@@ -48,6 +48,13 @@ pub fn run() {
             // R2: Coexistence teardown
             commands::coexist_status,
             commands::coexist_disable,
+            // Sonar mixer (Task 11)
+            commands::list_streams,
+            commands::move_stream,
+            commands::set_master_volume,
+            commands::set_master_mute,
+            commands::set_chatmix,
+            commands::set_default_sink_channel,
         ])
         .setup(|app| {
             // ── State-poll task (every 2 s) ─────────────────────────────────
@@ -78,6 +85,37 @@ pub fn run() {
                         }
                         // Daemon-down ticks are silently ignored;
                         // the UI keeps its last known good state.
+                    }
+                });
+            }
+
+            // ── Streams-poll task (every ~1.5 s) ────────────────────────────
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_millis(1500));
+                    loop {
+                        ticker.tick().await;
+                        let socket = {
+                            let st = handle.state::<Mutex<DaemonState>>();
+                            let guard = st.lock().await;
+                            guard.socket.clone()
+                        };
+                        let result = tauri::async_runtime::spawn_blocking(move || {
+                            arctis_client::send_request_to(
+                                &socket,
+                                &arctis_client::Request::ListStreams,
+                            )
+                        })
+                        .await;
+                        if let Ok(Ok(resp)) = result {
+                            if resp.ok {
+                                if let Some(streams) = resp.streams {
+                                    let _ = handle.emit("streams-changed", &streams);
+                                }
+                            }
+                        }
                     }
                 });
             }
