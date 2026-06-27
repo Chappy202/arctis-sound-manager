@@ -1,14 +1,40 @@
 <script lang="ts">
   import { engineState, loadError, init, destroy } from "../stores.js";
-  import { channelAdd, channelRemove } from "../ipc.js";
+  import { channelAdd, channelRemove, moveStream, clearRoute } from "../ipc.js";
   import ChannelStrip from "./ChannelStrip.svelte";
   import RouteList from "./RouteList.svelte";
+  import { streamsStore, initStreams, destroyStreams } from "../stores/streams.js";
+  import { groupStreamsByChannel } from "../streams.js";
+  import MasterStrip from "./MasterStrip.svelte";
+  import MicStrip from "./MicStrip.svelte";
+  import ChatmixSlider from "./ChatmixSlider.svelte";
 
   // init() is idempotent — safe to call here AND from AppShell.
   // Calling it here ensures the mixer works even if AppShell hasn't yet mounted.
   $effect(() => {
     init();
   });
+
+  $effect(() => { initStreams(); return () => destroyStreams(); });
+
+  let grouped = $derived(
+    groupStreamsByChannel(
+      $streamsStore,
+      ($engineState?.channels ?? []).map((c) => c.id),
+    ),
+  );
+
+  async function handleDropStream(streamId: string, channelId: string) {
+    try { engineState.set(await moveStream(streamId, channelId)); }
+    catch (e) { console.error("[mixer] moveStream failed:", e); }
+  }
+  async function handleClearStream(streamId: string) {
+    // streamId is a node id; resolve to binary for clearRoute.
+    const s = $streamsStore.find((x) => String(x.id) === streamId);
+    if (!s) return;
+    try { engineState.set(await clearRoute(s.binary)); }
+    catch (e) { console.error("[mixer] clearRoute failed:", e); }
+  }
 
   function refresh() {
     destroy();
@@ -110,10 +136,15 @@
           role="list"
           aria-label="Audio channel strips"
         >
+          <MasterStrip state={$engineState} unrouted={grouped.unrouted}
+            onClearStream={handleClearStream} />
+
           {#each $engineState.channels as channel (channel.id)}
             <div role="listitem">
               <ChannelStrip
                 {channel}
+                streams={grouped.byChannel[channel.id] ?? []}
+                onDropStream={handleDropStream}
                 onOutputChanged={() => {
                   // State will be refreshed via state-changed event.
                   // No extra action needed here.
@@ -124,6 +155,8 @@
               />
             </div>
           {/each}
+
+          <MicStrip mic={$engineState.mic} />
 
           <!-- ===== Add channel affordance ===== -->
           <div class="add-channel-strip" role="listitem">
@@ -152,6 +185,10 @@
         </div>
       {/if}
     </div>
+
+    <!-- ===== ChatMix slider ===== -->
+    <ChatmixSlider position={$engineState.chatmix_position}
+      hardwareActive={$engineState.device_present} />
 
     <!-- ===== Route list ===== -->
     <div class="routes-container">

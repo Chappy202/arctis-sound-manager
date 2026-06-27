@@ -1,13 +1,8 @@
 <script lang="ts">
-  import { setRoute, clearRoute } from "../ipc.js";
+  import { clearRoute } from "../ipc.js";
   import { engineState } from "../stores.js";
 
   let routes = $derived($engineState?.routes ?? []);
-
-  let newApp = $state("");
-  let newSink = $state("");
-  let adding = $state(false);
-  let addError = $state<string | null>(null);
 
   // Per-row remove state: set of app binaries currently being removed
   let removing = $state(new Set<string>());
@@ -26,121 +21,49 @@
       removing = new Set([...removing].filter((a) => a !== app));
     }
   }
-
-  async function handleAdd() {
-    const app = newApp.trim();
-    const sink = newSink.trim();
-    if (!app || !sink || adding) return;
-
-    adding = true;
-    addError = null;
-    try {
-      const next = await setRoute(app, sink);
-      engineState.set(next);
-      newApp = "";
-      newSink = "";
-    } catch (e) {
-      addError = e instanceof Error ? e.message : "Failed to add route";
-    } finally {
-      adding = false;
-    }
-  }
-
-  function handleAddKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      handleAdd();
-    }
-  }
 </script>
 
-<section class="route-list-card" aria-labelledby="route-list-heading">
-  <header class="route-header">
-    <h2 class="route-heading" id="route-list-heading">APP ROUTES</h2>
-    <span class="route-count" aria-label="{routes.length} routes">{routes.length}</span>
-  </header>
+<details class="remembered" aria-labelledby="route-list-heading">
+  <summary class="route-summary">Remembered routes ({routes.length})</summary>
+  <section class="route-list-card">
+    <header class="route-header">
+      <h2 class="route-heading" id="route-list-heading">REMEMBERED ROUTES</h2>
+      <span class="route-count" aria-label="{routes.length} routes">{routes.length}</span>
+    </header>
 
-  {#if routes.length === 0}
-    <p class="route-empty">No routes configured. Add one below to redirect an app's audio.</p>
-  {:else}
-    <ul class="route-table" role="list" aria-label="Configured app routes">
-      <li class="route-table-head" aria-hidden="true">
-        <span>APP BINARY</span>
-        <span>→</span>
-        <span>TARGET SINK</span>
-        <span></span>
-      </li>
-      {#each routes as [app, sink]}
-        <li class="route-row" aria-label="{app} routed to {sink}">
-          <span class="route-app" title={app}>{app}</span>
-          <span class="route-arrow" aria-hidden="true">→</span>
-          <span class="route-sink" title={sink}>{sink}</span>
-          <button
-            class="route-remove-btn"
-            disabled={removing.has(app)}
-            onclick={() => handleRemove(app)}
-            aria-label="Remove route for {app}"
-            title="Remove route for {app}"
-          >
-            {removing.has(app) ? "…" : "✕"}
-          </button>
+    {#if routes.length === 0}
+      <p class="route-empty">No routes remembered yet — drag an app onto a channel.</p>
+    {:else}
+      <ul class="route-table" role="list" aria-label="Remembered app routes">
+        <li class="route-table-head" aria-hidden="true">
+          <span>APP BINARY</span>
+          <span>→</span>
+          <span>TARGET SINK</span>
+          <span></span>
         </li>
-      {/each}
-      {#if removeError}
-        <li class="route-remove-error" role="alert">{removeError}</li>
-      {/if}
-    </ul>
-  {/if}
-
-  <!-- Add route form -->
-  <form class="route-form" onsubmit={(e) => { e.preventDefault(); handleAdd(); }}>
-    <div class="route-inputs">
-      <div class="route-field">
-        <label class="field-label" for="route-app">APP BINARY</label>
-        <input
-          id="route-app"
-          type="text"
-          class="route-input"
-          placeholder="e.g. spotify"
-          bind:value={newApp}
-          disabled={adding}
-          onkeydown={handleAddKeydown}
-          aria-label="Application binary name"
-          autocomplete="off"
-          spellcheck={false}
-        />
-      </div>
-      <span class="form-arrow" aria-hidden="true">→</span>
-      <div class="route-field">
-        <label class="field-label" for="route-sink">TARGET SINK</label>
-        <input
-          id="route-sink"
-          type="text"
-          class="route-input"
-          placeholder="e.g. game"
-          bind:value={newSink}
-          disabled={adding}
-          onkeydown={handleAddKeydown}
-          aria-label="Target audio sink"
-          autocomplete="off"
-          spellcheck={false}
-        />
-      </div>
-      <button
-        type="submit"
-        class="route-add-btn"
-        disabled={adding || !newApp.trim() || !newSink.trim()}
-        aria-label="Add route"
-      >
-        {adding ? "…" : "Add"}
-      </button>
-    </div>
-
-    {#if addError}
-      <p class="route-error" role="alert">{addError}</p>
+        {#each routes as [app, sink]}
+          <li class="route-row" aria-label="{app} routed to {sink}">
+            <span class="route-app" title={app}>{app}</span>
+            <span class="route-arrow" aria-hidden="true">→</span>
+            <span class="route-sink" title={sink}>{sink}</span>
+            <button
+              class="route-remove-btn"
+              disabled={removing.has(app)}
+              onclick={() => handleRemove(app)}
+              aria-label="Remove route for {app}"
+              title="Remove route for {app}"
+            >
+              {removing.has(app) ? "…" : "✕"}
+            </button>
+          </li>
+        {/each}
+        {#if removeError}
+          <li class="route-remove-error" role="alert">{removeError}</li>
+        {/if}
+      </ul>
     {/if}
-  </form>
-</section>
+  </section>
+</details>
 
 <style>
   .route-list-card {
@@ -298,120 +221,35 @@
     font-style: italic;
   }
 
-  /* ===== Add route form ===== */
-  .route-form {
-    display: flex;
-    flex-direction: column;
-    gap: var(--ss-space-2);
-    border-top: var(--ss-border-width) solid var(--ss-border);
-    padding-top: var(--ss-space-3);
+  /* ===== Collapsible details wrapper ===== */
+  .remembered {
+    /* no extra chrome — the inner card provides the surface */
   }
 
-  .route-inputs {
-    display: flex;
-    align-items: flex-end;
-    gap: var(--ss-space-3);
-    flex-wrap: wrap;
-  }
-
-  .route-field {
-    display: flex;
-    flex-direction: column;
-    gap: var(--ss-space-1);
-    flex: 1;
-    min-width: 120px;
-  }
-
-  .field-label {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-micro-size);
-    font-weight: var(--ss-type-micro-weight);
-    letter-spacing: var(--ss-type-micro-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-tertiary);
-  }
-
-  .route-input {
-    height: var(--ss-field-h);
-    padding: 0 var(--ss-space-3);
-    background: var(--ss-surface-input);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    color: var(--ss-text-primary);
-    font-family: var(--ss-font-mono);
-    font-size: var(--ss-type-body-size);
-    transition:
-      border-color var(--ss-dur-fast) var(--ss-ease-standard),
-      background var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .route-input:focus {
-    outline: none;
-    border-color: var(--ss-accent-border);
-    background: var(--ss-surface-2);
-  }
-
-  .route-input:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .route-input::placeholder {
-    color: var(--ss-text-disabled);
-  }
-
-  .form-arrow {
-    font-family: var(--ss-font-mono);
-    font-size: 16px;
-    color: var(--ss-text-tertiary);
-    padding-bottom: calc((var(--ss-field-h) - 1em) / 2);
-  }
-
-  .route-add-btn {
-    height: var(--ss-field-h);
-    padding: 0 var(--ss-space-5);
-    background: var(--ss-gradient-primary);
-    border: none;
-    border-radius: var(--ss-radius-sm);
-    color: var(--ss-text-bright);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-button-size);
-    font-weight: var(--ss-type-button-weight);
-    letter-spacing: var(--ss-type-button-letter-spacing);
-    text-transform: uppercase;
+  .route-summary {
     cursor: pointer;
-    white-space: nowrap;
-    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
-    flex-shrink: 0;
-    align-self: flex-end;
-  }
-
-  .route-add-btn:hover:not(:disabled) {
-    filter: brightness(1.1);
-  }
-
-  .route-add-btn:active:not(:disabled) {
-    filter: brightness(0.9);
-  }
-
-  .route-add-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .route-add-btn:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .route-error {
     font-family: var(--ss-font-ui);
     font-size: var(--ss-type-caption-size);
-    color: var(--ss-danger);
-    margin: 0;
-    padding: var(--ss-space-2) var(--ss-space-3);
-    background: var(--ss-danger-soft);
-    border-radius: var(--ss-radius-xs);
-    border: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ss-text-tertiary);
+    padding: var(--ss-space-2) 0;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-2);
+  }
+
+  .route-summary::-webkit-details-marker { display: none; }
+
+  .route-summary::before {
+    content: "▶";
+    font-size: 10px;
+    transition: transform var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  details[open] .route-summary::before {
+    transform: rotate(90deg);
   }
 </style>
