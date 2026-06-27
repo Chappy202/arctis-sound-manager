@@ -1,0 +1,32 @@
+[
+  { "id": 40, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+  { "id": 41, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Audio/Sink", "node.name": "Arctis_Chat" } } },
+  { "id": 70, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Stream/Output/Audio",
+      "application.name": "Firefox",
+      "application.process.binary": "firefox",
+      "application.process.id": "1234",
+      "application.icon-name": "firefox",
+      "media.name": "YouTube" } } },
+  { "id": 71, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Stream/Output/Audio",
+      "client.api": "pipewire-pulse",
+      "application.name": "Spotify",
+      "application.process.binary": "spotify",
+      "application.process.id": "5678",
+      "media.name": "Some Song" } } },
+  { "id": 72, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Stream/Input/Audio",
+      "application.name": "OBS", "application.process.binary": "obs" } } },
+  { "id": 900, "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 70, "input-node-id": 40 } },
+  { "id": 901, "type": "PipeWire:Interface:Link",
+    "info": { "output-node-id": 70, "input-node-id": 40 } }
+]
