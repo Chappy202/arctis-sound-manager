@@ -7,6 +7,7 @@
 import { writable } from "svelte/store";
 import { getState, onStateChanged, type EngineState } from "./ipc.js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { markConnected, markDisconnected } from "./stores/connection.js";
 
 /** The latest EngineState from the daemon. null = not yet loaded. */
 export const engineState = writable<EngineState | null>(null);
@@ -35,6 +36,7 @@ export async function init(): Promise<void> {
     unlistenFn = await onStateChanged((state) => {
       engineState.set(state);
       loadError.set(null);
+      markConnected();
     });
   } catch (e) {
     // Non-fatal; we'll still try the initial fetch.
@@ -46,6 +48,7 @@ export async function init(): Promise<void> {
     const state = await getState();
     engineState.set(state);
     loadError.set(null);
+    markConnected();
   } catch (e) {
     const msg =
       e instanceof Error
@@ -54,6 +57,7 @@ export async function init(): Promise<void> {
           ? e
           : "Daemon unavailable";
     loadError.set(msg);
+    markDisconnected();
   }
 }
 

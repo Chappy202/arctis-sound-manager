@@ -3,6 +3,7 @@
   import { currentPage, type Page } from "../stores/page.js";
   import { engineState, loadError, init, destroy } from "../stores.js";
   import { deriveConnectionStatus, connectionLabel as getConnectionLabel } from "../connection.js";
+  import { connectionStatus as daemonConnectionStatus, startConnectionMonitor, reconnect } from "../stores/connection.js";
   import ProfilesDropdown from "./ProfilesDropdown.svelte";
   import CoexistBanner from "./CoexistBanner.svelte";
 
@@ -34,6 +35,12 @@
   onMount(() => {
     init();
     return destroy;
+  });
+
+  // Start the health monitor; the returned stop fn is the $effect cleanup.
+  $effect(() => {
+    const stop = startConnectionMonitor();
+    return stop;
   });
 
   // Derive connection status from daemon reachability, NOT device presence.
@@ -113,6 +120,20 @@
 
     <!-- Coexistence warning banner (shown when legacy RPM stack detected) -->
     <CoexistBanner />
+
+    <!-- Daemon disconnected banner — visible only when monitor detects daemon is down -->
+    {#if $daemonConnectionStatus === "disconnected"}
+      <div class="daemon-reconnect-banner" role="alert" aria-live="assertive">
+        <span class="daemon-reconnect-text">Daemon disconnected — changes won't apply</span>
+        <button
+          class="daemon-reconnect-btn"
+          onclick={() => reconnect()}
+          aria-label="Reconnect to daemon"
+        >
+          Reconnect
+        </button>
+      </div>
+    {/if}
 
     <!-- Content area -->
     <main class="content-area" id="main-content">
@@ -317,6 +338,51 @@
 
   .battery-value {
     font-variant-numeric: tabular-nums;
+  }
+
+  /* ===== Daemon reconnect banner ===== */
+  .daemon-reconnect-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ss-space-3);
+    padding: var(--ss-space-2) var(--ss-page-padding);
+    background: color-mix(in srgb, var(--ss-danger) 14%, var(--ss-bg-root));
+    border-bottom: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-primary);
+  }
+
+  .daemon-reconnect-text {
+    flex: 1;
+    min-width: 0;
+    color: var(--ss-danger);
+  }
+
+  .daemon-reconnect-btn {
+    padding: var(--ss-space-1) var(--ss-space-3);
+    background: var(--ss-gradient-primary);
+    border: none;
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text-bright);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    font-weight: var(--ss-type-button-weight);
+    letter-spacing: var(--ss-type-button-letter-spacing);
+    text-transform: uppercase;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: filter var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .daemon-reconnect-btn:hover {
+    filter: brightness(1.1);
+  }
+
+  .daemon-reconnect-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
   }
 
   /* ===== Content area ===== */
