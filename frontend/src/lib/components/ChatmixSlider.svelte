@@ -22,7 +22,7 @@
 </div>
 
 <style>
-  .chatmix { display: flex; align-items: center; gap: var(--ss-space-3);
+  .chatmix { display: flex; align-items: center; flex-wrap: wrap; gap: var(--ss-space-3);
     padding: var(--ss-space-3); background: var(--ss-surface-1);
     border: var(--ss-border-width) solid var(--ss-border); border-radius: var(--ss-radius-md); }
   .chatmix input { flex: 1; accent-color: var(--ss-accent); }

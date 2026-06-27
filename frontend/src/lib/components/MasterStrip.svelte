@@ -15,7 +15,14 @@
       dragOver = true;
     }
   }
-  function handleDragLeave() { dragOver = false; }
+  function handleDragLeave(e: DragEvent) {
+    // Ignore dragleave fired when moving onto a child element of the drop area.
+    const related = e.relatedTarget as Node | null;
+    if (related && e.currentTarget instanceof Node && e.currentTarget.contains(related)) {
+      return;
+    }
+    dragOver = false;
+  }
   function handleDrop(e: DragEvent) {
     e.preventDefault();
     dragOver = false;

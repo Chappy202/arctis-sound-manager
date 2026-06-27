@@ -14,7 +14,7 @@
   <h3 class="strip-name">MIC</h3>
   <button class="mute" class:on={!mic.enabled} onclick={handleToggle}
     aria-pressed={!mic.enabled}>{mic.enabled ? "On" : "Off"}</button>
-  <button class="edit" onclick={() => currentPage.set("mic")}>Edit</button>
+  <button class="edit" aria-label="Edit mic settings" onclick={() => currentPage.set("mic")}>Edit</button>
 </div>
 
 <style>
