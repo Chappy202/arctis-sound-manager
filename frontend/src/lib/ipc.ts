@@ -13,6 +13,17 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 // Types — mirror crates/engine/src/state.rs exactly (serde names = snake_case)
 // ---------------------------------------------------------------------------
 
+export interface AppStream {
+  id: number;
+  binary: string;
+  app_name: string;
+  pid: number | null;
+  icon_name: string | null;
+  media_name: string | null;
+  current_channel: string | null;
+  routed: boolean;
+}
+
 export interface EqBandSnapshot {
   kind: string;
   freq_hz: number;
@@ -76,6 +87,10 @@ export interface EngineState {
   mic: MicSnapshot;
   surround: SurroundSnapshot;
   eq_presets: EqPresetSnapshot[];
+  master_volume_db: number;
+  master_mute: boolean;
+  chatmix_position: number;
+  default_sink_channel: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +354,31 @@ export const channelAdd = (id: string): Promise<EngineState> =>
 export const channelRemove = (id: string): Promise<EngineState> =>
   invoke<EngineState>("channel_remove", buildChannelRemoveArgs(id));
 
+// ── Task 12: Sonar mixer commands ────────────────────────────────────────────
+
+/** List all active PipeWire app streams. */
+export const listStreams = (): Promise<AppStream[]> => invoke<AppStream[]>("list_streams");
+
+/** Move an app stream to a channel (or null to unroute). */
+export const moveStream = (stream: string, channel: string): Promise<EngineState> =>
+  invoke<EngineState>("move_stream", { stream, channel });
+
+/** Set the master volume in dB. */
+export const setMasterVolume = (volumeDb: number): Promise<EngineState> =>
+  invoke<EngineState>("set_master_volume", { volumeDb });
+
+/** Set the master mute state. */
+export const setMasterMute = (muted: boolean): Promise<EngineState> =>
+  invoke<EngineState>("set_master_mute", { muted });
+
+/** Set the ChatMix position (0.0 = all game, 1.0 = all chat). */
+export const setChatmix = (position: number): Promise<EngineState> =>
+  invoke<EngineState>("set_chatmix", { position });
+
+/** Set (or clear) the default sink channel for unrouted streams. */
+export const setDefaultSinkChannel = (channel: string | null): Promise<EngineState> =>
+  invoke<EngineState>("set_default_sink_channel", { channel });
+
 // ── R2: Coexistence teardown types + commands ────────────────────────────────
 
 export interface CoexistReport {
@@ -415,3 +455,11 @@ export type LevelsPayload = Record<string, number>;
  */
 export const onLevels = (cb: (levels: LevelsPayload) => void): Promise<UnlistenFn> =>
   listen<LevelsPayload>("levels", (e) => cb(e.payload));
+
+/**
+ * Subscribe to live AppStream list updates pushed by the daemon.
+ * Emitted whenever PipeWire app streams change (appear/disappear/move).
+ * Returns an unlisten function to clean up the subscription.
+ */
+export const onStreamsChanged = (cb: (s: AppStream[]) => void): Promise<UnlistenFn> =>
+  listen<AppStream[]>("streams-changed", (e) => cb(e.payload));
