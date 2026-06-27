@@ -18,6 +18,7 @@ import {
   freqToX,
   gainToY,
   logFreqAxis,
+  reconcileBands,
   summedCurveDb,
   xToFreq,
   yToGain,
@@ -238,5 +239,28 @@ describe("logFreqAxis", () => {
     for (let i = 1; i < axis.length; i++) {
       expect(axis[i]).toBeGreaterThan(axis[i - 1]);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileBands
+// ---------------------------------------------------------------------------
+
+describe("reconcileBands", () => {
+  const mk = (gainDb: number): Band => ({ kind: "peaking", freqHz: 1000, q: 1, gainDb });
+  it("keeps local bands while editing", () => {
+    const local = [mk(3), mk(0)];
+    const incoming = [mk(-6), mk(0)];
+    expect(reconcileBands(local, incoming, true)).toBe(local);
+  });
+  it("adopts incoming bands when idle", () => {
+    const local = [mk(3), mk(0)];
+    const incoming = [mk(-6), mk(0)];
+    expect(reconcileBands(local, incoming, false)).toEqual(incoming);
+  });
+  it("never returns a shorter array than incoming when idle", () => {
+    const local = [mk(0)];
+    const incoming = [mk(1), mk(2), mk(3)];
+    expect(reconcileBands(local, incoming, false).length).toBe(3);
   });
 });

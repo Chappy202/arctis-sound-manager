@@ -30,7 +30,7 @@ export const DEFAULT_SAMPLE_RATE = 48000;
 
 /** Standard 10-band center frequencies (logarithmically spaced, 20 Hz – 16 kHz). */
 export const DEFAULT_BAND_FREQS: readonly number[] = [
-  31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
+  31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
 ];
 
 // ---------------------------------------------------------------------------
@@ -237,4 +237,19 @@ export function defaultBands(count = 10): Band[] {
     q: 1.0,
     gainDb: 0,
   }));
+}
+
+// ---------------------------------------------------------------------------
+// State reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Reconcile the locally-edited band array against an incoming engine snapshot.
+ * While the user is editing (any modality), keep the local array unchanged so a
+ * background state refresh can never clobber an in-progress edit. When idle,
+ * adopt the incoming array. Pure — unit-testable.
+ */
+export function reconcileBands(local: Band[], incoming: Band[], editing: boolean): Band[] {
+  if (editing) return local;
+  return incoming;
 }
