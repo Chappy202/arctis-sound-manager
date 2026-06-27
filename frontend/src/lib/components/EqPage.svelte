@@ -12,7 +12,7 @@
   import { get } from "svelte/store";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
-  import { eqEditing } from "../stores/eqEditing.js";
+  import { eqEditing, pulseEditing } from "../stores/eqEditing.js";
   import { reconcileBands, type Band } from "../eq.js";
   import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
   import EqGraph from "./EqGraph.svelte";
@@ -67,6 +67,7 @@
       .catch((e) => console.warn("[EqPage] setEqBand failed:", e));
   }
   async function flattenAll() {
+    pulseEditing();
     const flat = bands.map((b) => ({ ...b, gainDb: 0 }));
     bands = flat;
     for (let i = 0; i < flat.length; i++) {

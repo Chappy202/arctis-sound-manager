@@ -30,6 +30,7 @@
   .band-row { display: flex; align-items: center; gap: var(--ss-space-2); width: 100%; padding: var(--ss-space-1) var(--ss-space-2); background: var(--ss-surface-2); border: 1px solid transparent; border-radius: var(--ss-radius-xs); cursor: pointer; font-family: var(--ss-font-mono); font-size: var(--ss-type-caption-size); color: var(--ss-text-secondary); }
   .band-row:hover { background: var(--ss-surface-3); }
   .band-row.selected { border-color: var(--ss-accent-border); color: var(--ss-text-primary); }
+  .band-row:focus-visible { outline: 2px solid var(--ss-accent); outline-offset: 1px; }
   .bn { color: var(--ss-accent); width: 16px; }
   .bf { margin-left: auto; }
 </style>

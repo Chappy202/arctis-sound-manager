@@ -28,7 +28,7 @@ export const Q_MIN = 0.3;
 export const Q_MAX = 10;
 export const DEFAULT_SAMPLE_RATE = 48000;
 
-/** Standard 10-band center frequencies (logarithmically spaced, 20 Hz – 16 kHz). */
+/** Standard 10-band center frequencies (logarithmically spaced, 31 Hz – 16 kHz), matching the engine's EqModel::default_10band(). */
 export const DEFAULT_BAND_FREQS: readonly number[] = [
   31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000,
 ];
@@ -225,19 +225,6 @@ export function logFreqAxis(samples: number): number[] {
 // ---------------------------------------------------------------------------
 // Default band factory
 // ---------------------------------------------------------------------------
-
-/**
- * Build a set of default flat EQ bands at the standard center frequencies.
- * Used when the engine does not yet return band parameters in ChannelSnapshot.
- */
-export function defaultBands(count = 10): Band[] {
-  return DEFAULT_BAND_FREQS.slice(0, count).map((freqHz) => ({
-    kind: "peaking" as const,
-    freqHz,
-    q: 1.0,
-    gainDb: 0,
-  }));
-}
 
 // ---------------------------------------------------------------------------
 // State reconciliation
