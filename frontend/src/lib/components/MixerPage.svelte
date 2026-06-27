@@ -24,16 +24,42 @@
     ),
   );
 
+  // Fix 3: visible error banner for drop/clear failures.
+  let dropError = $state<string | null>(null);
+
   async function handleDropStream(streamId: string, channelId: string) {
-    try { engineState.set(await moveStream(streamId, channelId)); }
-    catch (e) { console.error("[mixer] moveStream failed:", e); }
+    dropError = null;
+    // Fix 2: optimistic pill move — snap and apply before the await.
+    const snapshot = $streamsStore;
+    streamsStore.update((list) =>
+      list.map((s) => (String(s.id) === streamId ? { ...s, current_channel: channelId } : s)),
+    );
+    try {
+      const result = await moveStream(streamId, channelId);
+      engineState.set(result);
+    } catch (e) {
+      streamsStore.set(snapshot); // revert optimistic update
+      dropError = e instanceof Error ? e.message : "Failed to move app";
+      console.error("[mixer] moveStream failed:", e);
+    }
   }
   async function handleClearStream(streamId: string) {
+    dropError = null;
     // streamId is a node id; resolve to binary for clearRoute.
     const s = $streamsStore.find((x) => String(x.id) === streamId);
     if (!s) return;
-    try { engineState.set(await clearRoute(s.binary)); }
-    catch (e) { console.error("[mixer] clearRoute failed:", e); }
+    // Fix 2: optimistic pill clear.
+    const snapshot = $streamsStore;
+    streamsStore.update((list) =>
+      list.map((x) => (String(x.id) === streamId ? { ...x, current_channel: null } : x)),
+    );
+    try {
+      engineState.set(await clearRoute(s.binary));
+    } catch (e) {
+      streamsStore.set(snapshot); // revert optimistic update
+      dropError = e instanceof Error ? e.message : "Failed to move app";
+      console.error("[mixer] clearRoute failed:", e);
+    }
   }
 
   function refresh() {
@@ -186,9 +212,18 @@
       {/if}
     </div>
 
+    <!-- ===== Drop / clear error banner (Fix 3) ===== -->
+    {#if dropError}
+      <p class="drop-error" role="alert">
+        {dropError}
+        <button class="drop-error-dismiss" onclick={() => (dropError = null)} aria-label="Dismiss error">✕</button>
+      </p>
+    {/if}
+
     <!-- ===== ChatMix slider ===== -->
+    <!-- hardwareActive: grey-out only when device present AND dial owns balance (Fix 1) -->
     <ChatmixSlider position={$engineState.chatmix_position}
-      hardwareActive={$engineState.device_present} />
+      hardwareActive={$engineState.device_present && $engineState.dial_controls_balance} />
 
     <!-- ===== Route list ===== -->
     <div class="routes-container">
@@ -476,6 +511,42 @@
     color: var(--ss-danger);
     margin: 0;
     word-break: break-word;
+  }
+
+  /* ===== Drop / clear error banner (Fix 3) ===== */
+  .drop-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--ss-space-3);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    background: var(--ss-danger-soft);
+    border: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
+    border-radius: var(--ss-radius-xs);
+    padding: var(--ss-space-2) var(--ss-space-3);
+    margin: 0;
+  }
+
+  .drop-error-dismiss {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-danger);
+    font-size: 11px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .drop-error-dismiss:hover {
+    background: rgba(229, 72, 77, 0.15);
   }
 
   /* ===== Routes ===== */

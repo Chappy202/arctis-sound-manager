@@ -160,6 +160,10 @@ pub struct EngineState {
     /// Channel id whose sink is the system default output, or None.
     #[serde(default)]
     pub default_sink_channel: Option<String>,
+    /// When true the hardware dial owns ChatMix balance; the GUI slider is read-only.
+    /// When false the GUI slider drives balance (dial_controls_balance=false in config).
+    #[serde(default)]
+    pub dial_controls_balance: bool,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI

@@ -91,6 +91,8 @@ export interface EngineState {
   master_mute: boolean;
   chatmix_position: number;
   default_sink_channel: string | null;
+  /** When true the hardware dial owns ChatMix; GUI slider is read-only. */
+  dial_controls_balance: boolean;
 }
 
 // ---------------------------------------------------------------------------

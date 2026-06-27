@@ -23,7 +23,7 @@
   }
 </script>
 
-<details class="remembered" aria-labelledby="route-list-heading">
+<details class="remembered">
   <summary class="route-summary">Remembered routes ({routes.length})</summary>
   <section class="route-list-card">
     <header class="route-header">

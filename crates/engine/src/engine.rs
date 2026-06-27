@@ -458,6 +458,7 @@ impl<R: CommandRunner> Engine<R> {
             master_mute: active.as_ref().map(|p| p.master_mute).unwrap_or(false),
             chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
             default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
+            dial_controls_balance: self.config.dial_controls_balance,
         }
     }
 
@@ -5875,9 +5876,8 @@ mod tests {
 
         let cfg = make_config_no_eq_no_routes();
         let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
-        // Queue: (1) list_streams pw-dump, (2) pw-metadata move.
-        // set_route's apply_live pw-dump (call 3) gets the MockRunner default empty
-        // output (status=0, stdout="") — parse fails silently, best-effort ignored.
+        // Exact 2-call sequence: (1) pw-dump for list_streams, (2) pw-metadata for the id move.
+        // persist_route (called after the live move) writes config + WP fragment only — no runner calls.
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, dump, "")
             .with_output(0, "", "");
@@ -5986,5 +5986,26 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn state_dial_controls_balance_reflects_config() {
+        // dial_controls_balance defaults to true in make_config_no_eq_no_routes().
+        let cfg = make_config_no_eq_no_routes();
+        assert!(cfg.dial_controls_balance, "fixture must start with true");
+        let engine = Engine::new(MockRunner::new(), cfg);
+        assert!(
+            engine.state().dial_controls_balance,
+            "state() must reflect config=true"
+        );
+
+        // Flip the flag to false and confirm state() follows.
+        let mut cfg2 = make_config_no_eq_no_routes();
+        cfg2.dial_controls_balance = false;
+        let engine2 = Engine::new(MockRunner::new(), cfg2);
+        assert!(
+            !engine2.state().dial_controls_balance,
+            "state() must reflect config=false"
+        );
     }
 }
