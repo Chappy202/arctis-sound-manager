@@ -311,6 +311,22 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
     }
 }
 
+/// Downcasts a `catch_unwind` payload to a human-readable message.
+///
+/// Tries `&str` first (covers `panic!("literal")` and most format-string panics
+/// emitted by the standard library), then `String` (covers `panic!("{}", val)`
+/// when the message is heap-allocated), and falls back to a generic placeholder
+/// for any other payload type.
+fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return s.to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic>".to_string()
+}
+
 /// Serve a single accepted connection.
 ///
 /// Returns `Ok(true)` when the client sends the `shutdown` command,
@@ -351,7 +367,19 @@ where
             }
         };
         let is_shutdown = matches!(req, Request::Shutdown);
-        let resp = handle_request(engine, req);
+        // SAFETY: AssertUnwindSafe is required because `&mut Engine<R>` is not
+        // UnwindSafe. This is sound here: we catch the panic and continue serving
+        // on the same connection; the only observer of a potentially half-mutated
+        // Engine is this same daemon loop. A half-applied mutation is far better
+        // than a dead process with a stale socket blocking all GUI writes.
+        let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_request(engine, req)
+        })) {
+            Ok(r) => r,
+            Err(payload) => {
+                Response::err(format!("internal error: {}", panic_msg(&*payload)))
+            }
+        };
         let resp_str = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
         writeln!(writer, "{resp_str}")?;
@@ -565,6 +593,15 @@ static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::Atomic
 /// For tests, use [`run_daemon_with_engine`] which takes a pre-built engine and does
 /// not touch signal handlers.
 pub fn run_daemon() -> Result<(), EngineError> {
+    // Install a process-global panic hook so caught panics are logged to the
+    // daemon's stderr (e.g. journald). This is production-only: tests must NOT
+    // call set_hook (it is process-global and would leak across test cases).
+    // The hook fires before catch_unwind returns — this gives us a log line
+    // even when the panic is caught and the daemon keeps running.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("daemon: caught panic: {info}");
+    }));
+
     let path = socket_path();
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -2335,5 +2372,121 @@ mod tests {
         let resp = handle_request(&mut engine, Request::ChannelRemove { id: "ghost".into() });
         assert!(!resp.ok, "nonexistent channel must return ok:false");
         assert!(resp.error.is_some());
+    }
+
+    // ── Task 6: panic isolation tests ───────────────────────────────────────────
+
+    /// Test double that panics on every `run` call.
+    /// Used to exercise the `catch_unwind` wrapper in `serve_connection`.
+    struct PanicRunner;
+
+    impl CommandRunner for PanicRunner {
+        fn run(
+            &mut self,
+            _program: &str,
+            _args: &[&str],
+        ) -> Result<arctis_audio::CmdOutput, arctis_audio::AudioError> {
+            panic!("PanicRunner: simulated panic in run");
+        }
+
+        fn spawn_owned(
+            &mut self,
+            _program: &str,
+            _args: &[&str],
+        ) -> Result<arctis_audio::ChildToken, arctis_audio::AudioError> {
+            Ok(arctis_audio::ChildToken {
+                pgid: 0,
+                label: String::new(),
+            })
+        }
+
+        fn kill_owned(
+            &mut self,
+            _token: &arctis_audio::ChildToken,
+        ) -> Result<(), arctis_audio::AudioError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn panic_msg_extracts_str_string_and_fallback() {
+        use std::any::Any;
+
+        // &str payload (most panic!("literal") messages)
+        let str_payload: Box<dyn Any + Send> = Box::new("literal panic");
+        assert_eq!(super::panic_msg(&*str_payload), "literal panic");
+
+        // String payload (panic!("{}", expr) with format)
+        let string_payload: Box<dyn Any + Send> = Box::new(String::from("heap panic message"));
+        assert_eq!(super::panic_msg(&*string_payload), "heap panic message");
+
+        // Non-string payload → generic fallback
+        let other_payload: Box<dyn Any + Send> = Box::new(42u32);
+        assert_eq!(super::panic_msg(&*other_payload), "<non-string panic>");
+    }
+
+    /// Verifies that a panic inside `handle_request` is caught by `serve_connection`
+    /// so that the daemon loop keeps serving subsequent requests.
+    ///
+    /// Strategy:
+    ///  - Feed `list-streams` first: it calls `runner.run("pw-dump")` → `PanicRunner`
+    ///    panics → `catch_unwind` catches it → Response with ok:false, "internal error".
+    ///  - Feed `get-state` second: it reads engine state without calling the runner →
+    ///    succeeds → Response with ok:true and state.
+    ///  - `serve_connection` returns `Ok(false)` (EOF) — it did NOT unwind.
+    #[test]
+    fn serve_connection_isolates_request_panic() {
+        // Suppress the default panic-hook output for this test: catch_unwind catches
+        // the panic but the default hook fires first and would print a "thread panicked"
+        // line to stderr. We replace it with a no-op and restore it afterward.
+        // NOTE: set_hook is process-global state. We restore it before any assertion so
+        // that an assertion failure is still printed by the normal hook. NEVER leave a
+        // custom hook installed after a test exits.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let input = b"{\"cmd\":\"list-streams\"}\n{\"cmd\":\"get-state\"}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input.as_ref()));
+        let mut output = Vec::<u8>::new();
+        let mut engine = Engine::new(PanicRunner, two_profile_config());
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+
+        // Restore the previous hook before asserting so any assertion failures are
+        // reported by the normal hook rather than silently swallowed.
+        std::panic::set_hook(prev_hook);
+
+        // The loop must survive the panic and return Ok(false) (EOF after second req).
+        assert!(
+            matches!(result, Ok(false)),
+            "serve_connection must not unwind on a panicking request: {result:?}"
+        );
+
+        let lines: Vec<&[u8]> = output
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2, "expected two response lines, got {}", lines.len());
+
+        // First response: caught panic → ok:false with "internal error" in message.
+        let err_resp: Response = serde_json::from_slice(lines[0]).unwrap();
+        assert!(!err_resp.ok, "panicking request must produce ok:false");
+        assert!(
+            err_resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("internal error"),
+            "error must contain 'internal error': {:?}",
+            err_resp.error
+        );
+
+        // Second response: daemon kept serving → ok:true with state present.
+        let ok_resp: Response = serde_json::from_slice(lines[1]).unwrap();
+        assert!(ok_resp.ok, "subsequent get-state must return ok:true");
+        assert!(
+            ok_resp.state.is_some(),
+            "state must be present in second response"
+        );
     }
 }
