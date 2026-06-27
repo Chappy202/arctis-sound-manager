@@ -1,6 +1,7 @@
 <script lang="ts">
-  import type { ChannelSnapshot, AppStream } from "../ipc.js";
+  import type { ChannelSnapshot, AppStream, OutputDeviceSnapshot } from "../ipc.js";
   import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
+  import { buildDeviceOptions } from "./channelStripUtils.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
   import LevelMeter from "./LevelMeter.svelte";
@@ -14,6 +15,8 @@
     channel: ChannelSnapshot;
     /** App streams currently assigned to this channel. */
     streams?: AppStream[];
+    /** Real output device list fetched from the daemon via `list_outputs`. */
+    outputDevices?: OutputDeviceSnapshot[];
     /** Called when a stream is dropped onto this channel strip. */
     onDropStream?: (streamId: string, channelId: string) => void;
     /** Called after output device change so parent can refresh state if needed. */
@@ -25,7 +28,7 @@
     onRemove?: () => void;
   }
 
-  let { channel, streams = [], onDropStream = () => {}, onOutputChanged, onRemove }: Props = $props();
+  let { channel, streams = [], outputDevices = [], onDropStream = () => {}, onOutputChanged, onRemove }: Props = $props();
 
   // -----------------------------------------------------------------------
   // Channel identity / icon mapping
@@ -46,22 +49,7 @@
   // -----------------------------------------------------------------------
   // Output device selector state
   // -----------------------------------------------------------------------
-  /**
-   * Known device options: "default" + any named device in the current output.
-   * If the engine returns more devices via device_fields in future, this list
-   * can be extended; for now we keep "Default" + the currently-set device.
-   */
-  function buildDeviceOptions(ch: ChannelSnapshot): { value: string | null; label: string }[] {
-    const opts: { value: string | null; label: string }[] = [
-      { value: null, label: "Default (follow system)" },
-    ];
-    if (ch.output_device && ch.output_device !== "default") {
-      opts.push({ value: ch.output_device, label: ch.output_device });
-    }
-    return opts;
-  }
-
-  let deviceOptions = $derived(buildDeviceOptions(channel));
+  let deviceOptions = $derived(buildDeviceOptions(channel, outputDevices));
   let selectedDevice = $derived(channel.output_device);
   let changing = $state(false);
 
