@@ -4,8 +4,8 @@
   import { engineState } from "../stores.js";
   import AppPill from "./AppPill.svelte";
 
-  let { state, unrouted, onClearStream }:
-    { state: EngineState; unrouted: AppStream[]; onClearStream: (id: string) => void } = $props();
+  let { mixerState, unrouted, onClearStream }:
+    { mixerState: EngineState; unrouted: AppStream[]; onClearStream: (id: string) => void } = $props();
 
   let dragOver = $state(false);
 
@@ -35,7 +35,7 @@
     engineState.set(await setMasterVolume(db));
   }
   async function handleMuteToggle() {
-    engineState.set(await setMasterMute(!state.master_mute));
+    engineState.set(await setMasterMute(!mixerState.master_mute));
   }
   async function handleDefaultToggle(e: Event) {
     const checked = (e.target as HTMLInputElement).checked;
@@ -46,13 +46,13 @@
 <div class="strip master" style="--accent: var(--ss-accent-master)">
   <h3 class="strip-name">MASTER</h3>
   <input class="vol" type="range" min="-60" max="6" step="1"
-    value={state.master_volume_db} oninput={handleVolumeChange} aria-label="Master volume" />
-  <span class="vol-label">{state.master_volume_db.toFixed(0)} dB</span>
-  <button class="mute" class:on={state.master_mute} onclick={handleMuteToggle}
-    aria-pressed={state.master_mute}>{state.master_mute ? "Muted" : "Mute"}</button>
+    value={mixerState.master_volume_db} oninput={handleVolumeChange} aria-label="Master volume" />
+  <span class="vol-label">{mixerState.master_volume_db.toFixed(0)} dB</span>
+  <button class="mute" class:on={mixerState.master_mute} onclick={handleMuteToggle}
+    aria-pressed={mixerState.master_mute}>{mixerState.master_mute ? "Muted" : "Mute"}</button>
 
   <label class="default-toggle">
-    <input type="checkbox" checked={state.default_sink_channel != null}
+    <input type="checkbox" checked={mixerState.default_sink_channel != null}
       onchange={handleDefaultToggle} />
     Auto-route new apps
   </label>

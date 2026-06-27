@@ -136,7 +136,7 @@
           role="list"
           aria-label="Audio channel strips"
         >
-          <MasterStrip state={$engineState} unrouted={grouped.unrouted}
+          <MasterStrip mixerState={$engineState} unrouted={grouped.unrouted}
             onClearStream={handleClearStream} />
 
           {#each $engineState.channels as channel (channel.id)}
