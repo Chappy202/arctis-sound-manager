@@ -1,8 +1,8 @@
 use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
-    query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
-    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
-    SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
+    move_stream_argv, query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend,
+    ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule,
+    Router, StageKind, SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
@@ -628,6 +628,50 @@ impl<R: CommandRunner> Engine<R> {
                 media_name: p.media_name,
             })
             .collect())
+    }
+
+    /// Route a running stream to a channel: resolve channel id → sink node.name,
+    /// live-move the specific stream (by node id) via pw-metadata, and persist a
+    /// binary→sink rule so it sticks next launch. `stream` may be a node id or a
+    /// binary; the binary is resolved from discovery for persistence.
+    pub fn move_stream(&mut self, stream: &str, channel_id: &str) -> Result<(), EngineError> {
+        // Resolve channel -> sink node.name from the active profile.
+        let sink = {
+            let profile = self.config.active()?;
+            profile
+                .channels
+                .iter()
+                .find(|c| c.id == channel_id)
+                .map(|c| c.node_name.clone())
+                .ok_or_else(|| EngineError::BadRequest(format!("unknown channel: {channel_id}")))?
+        };
+
+        // Find the target stream (by node id string or by binary) for its id + binary.
+        let streams = self.list_streams()?;
+        let target = streams
+            .iter()
+            .find(|s| s.id.to_string() == stream || s.binary == stream)
+            .ok_or_else(|| EngineError::BadRequest(format!("no running stream: {stream}")))?
+            .clone();
+
+        // Live move the exact stream node id.
+        let argv = move_stream_argv(&target.id.to_string(), &sink)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-metadata", &args)?;
+        if out.status != 0 {
+            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                program: "pw-metadata".into(),
+                status: out.status,
+                stderr: out.stderr,
+            }));
+        }
+
+        // Persist binary -> sink (reuses set_route's persistence path).
+        // id-move above targets the exact instance; set_route writes the persistent
+        // rule + WirePlumber fragment and emits RouteSet. A second best-effort live
+        // move by binary inside set_route is intentional design.
+        self.set_route(&target.binary, &sink)?;
+        Ok(())
     }
 
     /// Set (or clear) the output device for a single channel in the active profile.
@@ -5520,5 +5564,84 @@ mod tests {
         let sp = streams.iter().find(|s| s.binary == "spotify").unwrap();
         assert_eq!(sp.current_channel, None, "unlinked spotify is unrouted");
         assert!(!sp.routed);
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 3 TDD: move_stream (live move + persist)
+    // ─────────────────────────────────────────────
+
+    /// Exact MockRunner call sequence for move_stream("70", "chat"):
+    ///   [0] pw-dump          — list_streams
+    ///   [1] pw-metadata      — explicit id-move (target.object on node 70)
+    ///   [2] pw-dump          — apply_live inside set_route (best-effort; parse fails on empty stdout, ignored)
+    ///
+    /// Outputs needed: [0]=dump fixture, [1]="", [2]=default-empty (queue exhausted → MockRunner default).
+    #[test]
+    fn move_stream_by_id_persists_rule_and_moves_live() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("move_stream");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("move_stream_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let cfg = make_config_no_eq_no_routes();
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        // Queue: (1) list_streams pw-dump, (2) pw-metadata move.
+        // set_route's apply_live pw-dump (call 3) gets the MockRunner default empty
+        // output (status=0, stdout="") — parse fails silently, best-effort ignored.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, dump, "")
+            .with_output(0, "", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.move_stream("70", "chat").unwrap(); // firefox node id 70 → chat
+
+        // Persistent route recorded in the in-memory active profile.
+        let active = engine.config().active().unwrap();
+        assert!(
+            active
+                .routes
+                .iter()
+                .any(|r| r.app_binary == "firefox" && r.target_sink == "Arctis_Chat"),
+            "expected persisted firefox->Arctis_Chat route: {:?}",
+            active.routes
+        );
+
+        // pw-metadata call was issued for the live move.
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.get(0).map(|s| s.as_str()) == Some("pw-metadata")),
+            "pw-metadata must be called for live move"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn move_stream_unknown_channel_errors() {
+        let cfg = make_config_no_eq_no_routes();
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        let runner = arctis_audio::MockRunner::new().with_output(0, dump, "");
+        let mut engine = Engine::new(runner, cfg);
+        let result = engine.move_stream("70", "nope");
+        assert!(
+            result.is_err(),
+            "unknown channel_id must return an error"
+        );
+        // Verify it's a BadRequest (channel check fires before any runner call).
+        assert!(
+            matches!(result, Err(EngineError::BadRequest(_))),
+            "must be BadRequest, got: {result:?}"
+        );
+        // No runner calls consumed (channel error fires before list_streams).
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no runner calls on unknown channel"
+        );
     }
 }
