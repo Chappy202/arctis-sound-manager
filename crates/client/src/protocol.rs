@@ -190,6 +190,14 @@ pub enum Request {
     CoexistDisable {
         dry_run: bool,
     },
+    /// List running application output streams resolved to channel ids.
+    ListStreams,
+    /// Move a running stream to a channel (live + persistent). `stream` is a
+    /// node id or a binary; `channel` is a channel id.
+    MoveStream {
+        stream: String,
+        channel: String,
+    },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -202,6 +210,9 @@ pub struct Response {
     /// Export payload (profile TOML string). Populated only for ProfileExport responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Stream list payload. Populated only for ListStreams responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streams: Option<Vec<arctis_engine::AppStream>>,
     /// Coexistence status report. Populated only for CoexistStatus responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coexist_report: Option<CoexistReport>,
@@ -217,6 +228,7 @@ impl Response {
             state: Some(state),
             error: None,
             text: None,
+            streams: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -228,6 +240,7 @@ impl Response {
             state: None,
             error: None,
             text: Some(text),
+            streams: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -239,6 +252,7 @@ impl Response {
             state: None,
             error: Some(msg),
             text: None,
+            streams: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -250,6 +264,7 @@ impl Response {
             state: None,
             error: None,
             text: None,
+            streams: None,
             coexist_report: Some(report),
             coexist_result: None,
         }
@@ -261,8 +276,21 @@ impl Response {
             state: None,
             error: None,
             text: None,
+            streams: None,
             coexist_report: None,
             coexist_result: Some(result),
+        }
+    }
+
+    pub fn ok_with_streams(streams: Vec<arctis_engine::AppStream>) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: None,
+            streams: Some(streams),
+            coexist_report: None,
+            coexist_result: None,
         }
     }
 }
@@ -337,6 +365,7 @@ mod tests {
             state: None,
             error: None,
             text: None,
+            streams: None,
             coexist_report: None,
             coexist_result: None,
         };
@@ -1229,6 +1258,39 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ── Task 4: ListStreams + MoveStream wire-tag + round-trip tests ──────────
+
+    #[test]
+    fn parse_list_streams_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"list-streams"}"#).unwrap();
+        assert_eq!(req, Request::ListStreams);
+    }
+
+    #[test]
+    fn parse_move_stream_wire_tag() {
+        let req: Request =
+            serde_json::from_str(r#"{"cmd":"move-stream","stream":"70","channel":"chat"}"#).unwrap();
+        assert_eq!(req, Request::MoveStream { stream: "70".into(), channel: "chat".into() });
+    }
+
+    #[test]
+    fn request_move_stream_round_trips() {
+        let req = Request::MoveStream { stream: "firefox".into(), channel: "game".into() };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("move-stream"), "cmd tag must be move-stream: {json}");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn response_ok_with_streams_round_trips() {
+        let resp = Response::ok_with_streams(vec![]);
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert!(back.streams.is_some());
     }
 
     #[test]
