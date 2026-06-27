@@ -3,8 +3,8 @@
    * MicPage.svelte — Mic DSP chain tuning page.
    *
    * Thin view: all logic is in mic.ts (stageWireName, stagePluginPath,
-   * isStageDisabled, stageUnavailableTooltip, micBandToArgs). Reuses EqCanvas
-   * via the additive onFlush prop (E4) and BandList as-is.
+   * isStageDisabled, stageUnavailableTooltip, micBandToArgs). Reuses EqGraph
+   * via the additive onFlush prop and BandList as-is.
    *
    * E8 NOTE: The live input meter is a static placeholder. EngineState carries
    * no level/metering data in this plan. A future plan must add telemetry.
@@ -29,7 +29,7 @@
     backendAvailable,
     backendTooltip,
   } from "../mic.js";
-  import EqCanvas from "./EqCanvas.svelte";
+  import EqGraph from "./EqGraph.svelte";
   import BandList from "./BandList.svelte";
   import LevelMeter from "./LevelMeter.svelte";
   import { type Band } from "../eq.js";
@@ -705,22 +705,19 @@
         {#if micEqBands.length > 0}
           <div class="card-body mic-eq-body">
             <div class="canvas-area">
-              <EqCanvas
-                channelId="mic"
+              <EqGraph
                 bands={micEqBands}
-                {selectedBandIndex}
+                selectedIndex={selectedBandIndex}
                 onBandChange={handleMicEqBandChange}
-                onSelectBand={handleSelectBand}
+                onSelect={handleSelectBand}
                 onFlush={handleMicEqFlush}
               />
             </div>
             <div class="band-list-wrap">
               <BandList
-                channelId="mic"
                 bands={micEqBands}
-                {selectedBandIndex}
+                selectedIndex={selectedBandIndex}
                 onSelectBand={handleSelectBand}
-                onBandChange={handleMicEqBandChange}
               />
             </div>
           </div>

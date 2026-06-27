@@ -133,7 +133,7 @@ export function stageUnavailableTooltip(stage: MicStageSnapshot): string | undef
 // ---------------------------------------------------------------------------
 
 /**
- * Maps a Band (camelCase EqCanvas format) and its index to the snake_case args
+ * Maps a Band (camelCase EqGraph format) and its index to the snake_case args
  * expected by the `micEqBand` IPC wrapper (and ultimately `Request::MicEqBand`).
  */
 export function micBandToArgs(

@@ -2,7 +2,7 @@
  * eqEditing.ts — Tracks whether an EQ edit is in progress, across ALL input
  * modalities (pointer drag, scroll-Q, keyboard, numeric-field focus). The EQ
  * page reads this before applying a background state refresh, so no refresh
- * clobbers an in-progress edit. Replaces the old pointer-only `eqDragging`.
+ * clobbers an in-progress edit. Supersedes the old pointer-only dragging store.
  */
 import { writable } from "svelte/store";
 
