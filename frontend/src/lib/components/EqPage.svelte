@@ -8,6 +8,7 @@
    * preventing the "disappearing dots" bug caused by the old 4-way bookkeeping.
    */
 
+  import { untrack } from "svelte";
   import { get } from "svelte/store";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
@@ -52,7 +53,7 @@
     if (!channelId || !st) return;
     const incoming = snapshotToBands(channelId);
     if (incoming.length === 0) return;
-    bands = reconcileBands(bands, incoming, get(eqEditing));
+    bands = reconcileBands(untrack(() => bands), incoming, get(eqEditing));
   });
 
   // Single writer: all child edits land here.
@@ -503,7 +504,6 @@
     box-shadow: var(--ss-e1);
     flex: 1;
     min-width: 220px;
-    flex-shrink: 0;
   }
 
   .card-header {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { clampBand, FREQ_MIN, FREQ_MAX, GAIN_MIN, GAIN_MAX, Q_MIN, Q_MAX, type Band } from "../eq.js";
-  import { beginEditing, endEditing } from "../stores/eqEditing.js";
+  import { beginEditing, endEditing, pulseEditing } from "../stores/eqEditing.js";
 
   interface Props {
     band: Band | null;
@@ -18,6 +18,7 @@
   function commit(patch: Partial<Band>) {
     if (!band) return;
     const next = clampBand({ ...band, ...patch });
+    pulseEditing();
     onBandChange(index, next);
     onFlush(index, next);
   }
