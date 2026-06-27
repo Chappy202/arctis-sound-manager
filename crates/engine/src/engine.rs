@@ -506,8 +506,12 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Add/upsert a route in the active profile, persist, set_rule + save_persistent + apply_live.
-    pub fn set_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
+    /// Persist a route rule without doing a live move.
+    ///
+    /// Upserts the route in the active profile's in-memory config, writes the unified
+    /// config to disk, and updates the WirePlumber persistent fragment via Router.
+    /// Emits `RouteSet`. Does NOT call `apply_live`.
+    fn persist_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
         // Update in-memory config
         {
             let active_name = self.config.active_profile.clone();
@@ -531,19 +535,28 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Persist unified config
         self.save_config()?;
-        // Apply via Router (persistent fragment + best-effort live move)
+        // Write persistent WirePlumber fragment via Router (no live move)
         {
             let mut router = Router::new(&mut self.runner);
             router.set_rule(RouteRule::new(app_binary, target_sink));
             router.save_persistent()?;
-            // Best-effort live move (ignore error if app not running)
-            let _ = router.apply_live(&AppMatch::Binary(app_binary.to_string()), target_sink);
         }
         // Emit event
         self.emit(Event::RouteSet {
             app_binary: app_binary.to_string(),
             target_sink: target_sink.to_string(),
         });
+        Ok(())
+    }
+
+    /// Add/upsert a route in the active profile, persist, set_rule + save_persistent + apply_live.
+    pub fn set_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
+        self.persist_route(app_binary, target_sink)?;
+        // Best-effort live move by binary (ignore error if app not running)
+        {
+            let mut router = Router::new(&mut self.runner);
+            let _ = router.apply_live(&AppMatch::Binary(app_binary.to_string()), target_sink);
+        }
         Ok(())
     }
 
@@ -666,11 +679,13 @@ impl<R: CommandRunner> Engine<R> {
             }));
         }
 
-        // Persist binary -> sink (reuses set_route's persistence path).
-        // id-move above targets the exact instance; set_route writes the persistent
-        // rule + WirePlumber fragment and emits RouteSet. A second best-effort live
-        // move by binary inside set_route is intentional design.
-        self.set_route(&target.binary, &sink)?;
+        // Persist binary -> sink without a second live move.
+        // The exact-id move above already targeted the specific instance; calling
+        // set_route would also trigger a best-effort binary-match live move that
+        // could silently target the wrong instance when multiple instances of the
+        // same binary are running. persist_route writes config + WP fragment +
+        // emits RouteSet without any additional pw-dump / pw-metadata calls.
+        self.persist_route(&target.binary, &sink)?;
         Ok(())
     }
 
@@ -5573,9 +5588,9 @@ mod tests {
     /// Exact MockRunner call sequence for move_stream("70", "chat"):
     ///   [0] pw-dump          — list_streams
     ///   [1] pw-metadata      — explicit id-move (target.object on node 70)
-    ///   [2] pw-dump          — apply_live inside set_route (best-effort; parse fails on empty stdout, ignored)
     ///
-    /// Outputs needed: [0]=dump fixture, [1]="", [2]=default-empty (queue exhausted → MockRunner default).
+    /// move_stream now calls persist_route (not set_route), so there is NO third
+    /// pw-dump / apply_live call. Outputs needed: [0]=dump fixture, [1]="".
     #[test]
     fn move_stream_by_id_persists_rule_and_moves_live() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
