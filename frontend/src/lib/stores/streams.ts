@@ -28,4 +28,5 @@ export function destroyStreams(): void {
     unlisten = null;
   }
   started = false;
+  streamsStore.set([]);
 }

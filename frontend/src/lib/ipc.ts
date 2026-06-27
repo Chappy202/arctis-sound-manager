@@ -365,7 +365,7 @@ export const moveStream = (stream: string, channel: string): Promise<EngineState
 
 /** Set the master volume in dB. */
 export const setMasterVolume = (volumeDb: number): Promise<EngineState> =>
-  invoke<EngineState>("set_master_volume", { volumeDb });
+  invoke<EngineState>("set_master_volume", { volume_db: volumeDb });
 
 /** Set the master mute state. */
 export const setMasterMute = (muted: boolean): Promise<EngineState> =>
