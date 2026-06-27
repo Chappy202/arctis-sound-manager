@@ -15,6 +15,29 @@ pub struct OutputSink {
     pub is_default: bool,
 }
 
+/// Extract the default audio sink name from `pw-metadata 0` stdout.
+///
+/// Scans for a line of the form:
+/// `update: id:0 key:'default.audio.sink' value:'{"name":"..."}' type:...`
+/// and returns the inner `name` string.  Returns `None` if the key is absent,
+/// the line is malformed, or the embedded JSON cannot be parsed.
+pub fn parse_default_sink_name(pw_metadata_stdout: &str) -> Option<String> {
+    for line in pw_metadata_stdout.lines() {
+        if !line.contains("key:'default.audio.sink'") {
+            continue;
+        }
+        // Locate value:'<json>' in the line.
+        let value_start = line.find("value:'")?;
+        let rest = &line[value_start + 7..]; // skip `value:'`
+        let value_end = rest.find('\'')?;
+        let value_json = &rest[..value_end];
+        // The embedded value is a JSON object like {"name":"<node.name>"}.
+        let v: serde_json::Value = serde_json::from_str(value_json).ok()?;
+        return v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+    }
+    None
+}
+
 /// Parse `pw-dump` JSON into the list of real output sinks, excluding virtual
 /// sinks and filter-chain nodes.
 ///
@@ -101,6 +124,30 @@ mod tests {
     use super::*;
 
     const DUMP: &str = include_str!("../tests/fixtures/pw_dump_sinks.json");
+
+    // ── TDD: parse_default_sink_name ──────────────────────────────────────────
+
+    #[test]
+    fn parse_default_sink_name_extracts_name() {
+        let input = concat!(
+            "update: id:0 key:'default.audio.sink' ",
+            r#"value:'{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}' type:Spa:String"#
+        );
+        let name = parse_default_sink_name(input);
+        assert_eq!(
+            name.as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+    }
+
+    #[test]
+    fn parse_default_sink_name_returns_none_when_key_absent() {
+        let input = concat!(
+            "update: id:0 key:'some.other.key' ",
+            r#"value:'{"name":"something"}' type:Spa:String"#
+        );
+        assert!(parse_default_sink_name(input).is_none());
+    }
 
     #[test]
     fn lists_real_sinks_excludes_virtual() {

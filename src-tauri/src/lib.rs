@@ -50,6 +50,7 @@ pub fn run() {
             commands::coexist_disable,
             // Sonar mixer (Task 11)
             commands::list_streams,
+            commands::list_outputs,
             commands::move_stream,
             commands::set_master_volume,
             commands::set_master_mute,

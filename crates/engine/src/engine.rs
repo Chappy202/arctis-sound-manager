@@ -683,6 +683,40 @@ impl<R: CommandRunner> Engine<R> {
             .collect())
     }
 
+    /// Discover real output devices (physical sinks) via `pw-metadata 0` + `pw-dump`.
+    ///
+    /// Returns a best-effort `Vec` for the UI output selector: on any subprocess
+    /// failure an empty `Vec` is returned.  Never panics; never returns `Err`.
+    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+        // Step 1: get default sink name from pw-metadata 0.
+        let default_sink = match self.runner.run("pw-metadata", &["0"]) {
+            Ok(out) if out.status == 0 => arctis_audio::parse_default_sink_name(&out.stdout),
+            _ => None,
+        };
+
+        // Step 2: run pw-dump to enumerate all nodes.
+        let out = match self.runner.run("pw-dump", &[]) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        if out.status != 0 {
+            return Vec::new();
+        }
+
+        // Step 3: parse and map OutputSink → OutputDeviceSnapshot.
+        match arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref()) {
+            Ok(sinks) => sinks
+                .into_iter()
+                .map(|s| crate::state::OutputDeviceSnapshot {
+                    node_name: s.node_name,
+                    description: s.description,
+                    is_default: s.is_default,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Route a running stream to a channel: resolve channel id → sink node.name,
     /// live-move the specific stream (by node id) via pw-metadata, and persist a
     /// binary→sink rule so it sticks next launch. `stream` may be a node id or a
@@ -5876,6 +5910,57 @@ mod tests {
         let sp = streams.iter().find(|s| s.binary == "spotify").unwrap();
         assert_eq!(sp.current_channel, None, "unlinked spotify is unrouted");
         assert!(!sp.routed);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 3 (engine output): list_output_devices
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const PW_METADATA_SINK: &str = concat!(
+        "update: id:0 key:'default.audio.sink' ",
+        r#"value:'{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}' type:Spa:String"#
+    );
+
+    #[test]
+    fn list_output_devices_returns_real_sinks_and_marks_default() {
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        // Runner queue: [0] pw-metadata 0, [1] pw-dump
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(0, dump, ""); // pw-dump
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let devices = engine.list_output_devices();
+
+        // Headset sink present
+        assert!(
+            devices.iter().any(|d| d.node_name.contains("SteelSeries_Arctis")),
+            "headset sink missing: {devices:?}"
+        );
+        // Virtual sinks excluded
+        assert!(
+            !devices.iter().any(|d| d.node_name.starts_with("Arctis_")),
+            "virtual sinks must be excluded: {devices:?}"
+        );
+        // Onboard marked default
+        let onboard = devices
+            .iter()
+            .find(|d| d.node_name.contains("analog-stereo"))
+            .expect("onboard sink missing");
+        assert!(onboard.is_default, "onboard must be is_default=true");
+    }
+
+    #[test]
+    fn list_output_devices_returns_empty_on_pw_dump_error() {
+        // Queue [0] pw-metadata (ok), [1] pw-dump with non-zero exit
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(1, "", "pw-dump: error"); // pw-dump fails
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let devices = engine.list_output_devices();
+        assert!(
+            devices.is_empty(),
+            "must return empty Vec on pw-dump failure, got: {devices:?}"
+        );
     }
 
     // ─────────────────────────────────────────────

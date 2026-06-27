@@ -230,6 +230,7 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(streams) => Response::ok_with_streams(streams),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ListOutputs => Response::ok_with_outputs(engine.list_output_devices()),
         Request::MoveStream { stream, channel } => match engine.move_stream(&stream, &channel) {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
