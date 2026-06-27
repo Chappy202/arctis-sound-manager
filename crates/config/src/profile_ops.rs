@@ -400,16 +400,16 @@ description = "Game"
     #[test]
     fn add_channel_succeeds_for_new_id() {
         let mut cfg = Config::default_config();
-        cfg.add_channel("aux", "Arctis_Aux", "aux audio channel")
+        cfg.add_channel("stream", "Arctis_Stream", "stream audio channel")
             .expect("add_channel should succeed for a new id");
         let profile = cfg.active().unwrap();
         let channel = profile
             .channels
             .iter()
-            .find(|c| c.id == "aux")
-            .expect("aux channel must exist after add");
-        assert_eq!(channel.node_name, "Arctis_Aux");
-        assert_eq!(channel.description, "aux audio channel");
+            .find(|c| c.id == "stream")
+            .expect("stream channel must exist after add");
+        assert_eq!(channel.node_name, "Arctis_Stream");
+        assert_eq!(channel.description, "stream audio channel");
         assert_eq!(channel.output_device, None);
         assert!(channel.eq.is_empty());
         assert!((channel.volume_db - 0.0).abs() < f32::EPSILON);
@@ -471,8 +471,8 @@ description = "Game"
         let profile = cfg.active().unwrap();
         assert_eq!(
             profile.channels.len(),
-            2,
-            "should have 2 channels remaining"
+            3,
+            "should have 3 channels remaining"
         );
         assert!(
             profile.channels.iter().all(|c| c.id != "game"),
@@ -495,18 +495,18 @@ description = "Game"
     #[test]
     fn add_then_remove_is_idempotent() {
         let mut cfg = Config::default_config();
-        cfg.add_channel("aux", "Arctis_Aux", "aux audio channel")
+        cfg.add_channel("stream", "Arctis_Stream", "stream audio channel")
             .unwrap();
-        assert_eq!(cfg.active().unwrap().channels.len(), 4);
-        cfg.remove_channel("aux").unwrap();
+        assert_eq!(cfg.active().unwrap().channels.len(), 5);
+        cfg.remove_channel("stream").unwrap();
         assert_eq!(
             cfg.active().unwrap().channels.len(),
-            3,
-            "should be back to 3 channels after add+remove"
+            4,
+            "should be back to 4 channels after add+remove"
         );
         assert!(
-            cfg.active().unwrap().channels.iter().all(|c| c.id != "aux"),
-            "aux must be gone"
+            cfg.active().unwrap().channels.iter().all(|c| c.id != "stream"),
+            "stream must be gone"
         );
     }
 

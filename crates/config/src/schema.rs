@@ -310,6 +310,18 @@ pub struct Profile {
     /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
     #[serde(default)]
     pub surround: SurroundConfig,
+    /// Master output gain in dB applied to the headset output. 0.0 = unity.
+    #[serde(default)]
+    pub master_volume_db: f32,
+    /// Master mute (mutes the headset output).
+    #[serde(default)]
+    pub master_mute: bool,
+    /// ChatMix position 0..=9 (0 = full chat, 9 = full game, 4 = balanced).
+    #[serde(default = "default_chatmix")]
+    pub chatmix_position: i64,
+    /// Channel id whose sink is set as the system default output, or None.
+    #[serde(default)]
+    pub default_sink_channel: Option<String>,
 }
 
 /// A named, reusable set of EQ bands (shared library across all profiles).
@@ -324,6 +336,10 @@ pub struct EqPreset {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_chatmix() -> i64 {
+    4
 }
 
 /// Root configuration object. Versioned for forward-compatibility checking.
@@ -377,6 +393,15 @@ impl Config {
                 volume_db: 0.0,
                 muted: false,
             },
+            ChannelConfig {
+                id: "aux".to_string(),
+                node_name: "Arctis_Aux".to_string(),
+                description: "Aux audio channel".to_string(),
+                output_device: None,
+                eq: Vec::new(),
+                volume_db: 0.0,
+                muted: false,
+            },
         ];
 
         Config {
@@ -388,6 +413,10 @@ impl Config {
                 routes: Vec::new(),
                 mic: MicChainConfig::default(),
                 surround: SurroundConfig::default(),
+                master_volume_db: 0.0,
+                master_mute: false,
+                chatmix_position: 4,
+                default_sink_channel: None,
             }],
             eq_presets: Vec::new(),
             dial_controls_balance: true,
@@ -408,6 +437,32 @@ impl Config {
     /// Look up a profile by name (mutable).
     pub fn profile_mut(&mut self, name: &str) -> Option<&mut Profile> {
         self.profiles.iter_mut().find(|p| p.name == name)
+    }
+
+    /// Ensure every profile has the standard channels (game, chat, media, aux),
+    /// preserving any custom channels and existing settings. Idempotent.
+    pub fn ensure_standard_channels(&mut self) {
+        const STANDARD: &[(&str, &str, &str)] = &[
+            ("game", "Arctis_Game", "Game audio channel"),
+            ("chat", "Arctis_Chat", "Chat audio channel"),
+            ("media", "Arctis_Media", "Media audio channel"),
+            ("aux", "Arctis_Aux", "Aux audio channel"),
+        ];
+        for profile in &mut self.profiles {
+            for (id, node, desc) in STANDARD {
+                if !profile.channels.iter().any(|c| c.id == *id) {
+                    profile.channels.push(ChannelConfig {
+                        id: id.to_string(),
+                        node_name: node.to_string(),
+                        description: desc.to_string(),
+                        output_device: None,
+                        eq: Vec::new(),
+                        volume_db: 0.0,
+                        muted: false,
+                    });
+                }
+            }
+        }
     }
 
     /// Structural validation: version supported, active_profile exists, channel ids unique,
@@ -644,11 +699,12 @@ mod tests {
         assert_eq!(cfg.version, CURRENT_VERSION);
         assert_eq!(cfg.active_profile, "default");
         let profile = cfg.active().expect("active profile should exist");
-        assert_eq!(profile.channels.len(), 3);
+        assert_eq!(profile.channels.len(), 4);
         let ids: Vec<&str> = profile.channels.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.contains(&"game"), "should have 'game' channel");
         assert!(ids.contains(&"chat"), "should have 'chat' channel");
         assert!(ids.contains(&"media"), "should have 'media' channel");
+        assert!(ids.contains(&"aux"), "should have 'aux' channel");
     }
 
     #[test]
@@ -1385,5 +1441,40 @@ description = "Chat"
             !deserialized.dial_controls_balance,
             "dial_controls_balance=false must survive TOML round-trip"
         );
+    }
+
+    // ── Task 7: Master/ChatMix/default-sink fields + Aux default + ensure_standard_channels ──
+
+    #[test]
+    fn default_config_includes_aux_channel() {
+        let cfg = Config::default_config();
+        let ids: Vec<&str> = cfg.profiles[0].channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["game", "chat", "media", "aux"]);
+    }
+
+    #[test]
+    fn ensure_standard_channels_adds_missing_aux_preserving_custom() {
+        let mut cfg = Config::default_config();
+        // Simulate an old profile without aux but with a custom channel.
+        cfg.profiles[0].channels.retain(|c| c.id != "aux");
+        cfg.profiles[0].channels.push(ChannelConfig {
+            id: "stream".into(), node_name: "Arctis_Stream".into(),
+            description: "Custom".into(), output_device: None,
+            eq: vec![], volume_db: 0.0, muted: false,
+        });
+        cfg.ensure_standard_channels();
+        let ids: Vec<String> = cfg.profiles[0].channels.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&"aux".to_string()), "aux seeded: {ids:?}");
+        assert!(ids.contains(&"stream".to_string()), "custom preserved: {ids:?}");
+    }
+
+    #[test]
+    fn profile_new_fields_default_sane() {
+        let cfg = Config::default_config();
+        let p = &cfg.profiles[0];
+        assert_eq!(p.master_volume_db, 0.0);
+        assert!(!p.master_mute);
+        assert_eq!(p.chatmix_position, 4); // center of 0..=9 (game/chat balanced)
+        assert_eq!(p.default_sink_channel, None);
     }
 }
