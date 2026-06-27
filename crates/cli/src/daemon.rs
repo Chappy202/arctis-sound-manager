@@ -2243,16 +2243,18 @@ mod tests {
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         // add_channel → create sink:
-        //   1. sink_exists() → pw-cli ls Node (Arctis_Aux not in output → absent)
+        //   1. sink_exists() → pw-cli ls Node (Arctis_Stream not in output → absent)
         //   2. std::fs::write conf (real file in /tmp — OK in tests)
         //   3. spawn_owned "pipewire -c <conf>" (MockRunner records, returns token)
-        // Queue one ls output that does NOT contain Arctis_Aux so create() spawns.
-        let ls = ls_all_present(); // has Game/Chat/Media but not Aux
-        let runner = MockRunner::new().with_output(0, &ls, ""); // sink_exists ls for Arctis_Aux
+        // Queue one ls output that does NOT contain Arctis_Stream so create() spawns.
+        // Use a non-standard id ("stream") — standard ids (game/chat/media/aux) are
+        // seeded by Engine::new via ensure_standard_channels() and would already exist.
+        let ls = ls_all_present(); // has Game/Chat/Media but not Stream
+        let runner = MockRunner::new().with_output(0, &ls, ""); // sink_exists ls for Arctis_Stream
         let cfg = two_profile_config();
         let mut engine = Engine::new(runner, cfg);
 
-        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "aux".into() });
+        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "stream".into() });
         assert!(
             resp.ok,
             "channel-add must return ok:true, got: {:?}",
@@ -2260,7 +2262,7 @@ mod tests {
         );
         let state = resp.state.expect("state must be present");
         assert!(
-            state.channels.iter().any(|c| c.id == "aux"),
+            state.channels.iter().any(|c| c.id == "stream"),
             "new channel must appear in state: {:?}",
             state.channels.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
@@ -2327,7 +2329,9 @@ mod tests {
     fn handle_channel_remove_nonexistent_returns_error() {
         let cfg = two_profile_config();
         let mut engine = Engine::new(MockRunner::new(), cfg);
-        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "aux".into() });
+        // Use a genuinely nonexistent id — standard ids (game/chat/media/aux) are seeded
+        // by Engine::new via ensure_standard_channels() and would be found successfully.
+        let resp = handle_request(&mut engine, Request::ChannelRemove { id: "ghost".into() });
         assert!(!resp.ok, "nonexistent channel must return ok:false");
         assert!(resp.error.is_some());
     }

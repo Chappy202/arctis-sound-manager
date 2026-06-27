@@ -353,7 +353,16 @@ mod tests {
     /// When "game" or "chat" channels are absent, apply returns Ok(false) without panic.
     #[test]
     fn apply_dial_balance_graceful_when_channels_absent() {
-        // Config with only "media" channel — no game or chat
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("asm_dial_absent_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Build config with only "media" channel, then let Engine::new seed the standards.
+        // Engine::new calls ensure_standard_channels() which adds game/chat/aux, so we must
+        // explicitly remove game and chat after construction to re-establish the intended
+        // "channels absent" precondition. This faithfully exercises the graceful-skip path
+        // that fires at runtime when a user removes a channel within a session.
         let mut cfg = arctis_config::Config::default_config();
         cfg.profiles[0].channels = vec![arctis_config::ChannelConfig {
             id: "media".into(),
@@ -366,6 +375,12 @@ mod tests {
         }];
 
         let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+
+        // Remove the seeded channels. MockRunner default empty response causes
+        // AudioBackend::sink_exists() to return false → teardown is a no-op.
+        engine.remove_channel("game").expect("remove game must succeed");
+        engine.remove_channel("chat").expect("remove chat must succeed");
+
         let mut last: Option<i64> = None;
 
         let result = apply_dial_balance(&mut engine, 0, &mut last, true);
@@ -374,5 +389,8 @@ mod tests {
             !result.unwrap(),
             "absent channels must return false (graceful skip)"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
