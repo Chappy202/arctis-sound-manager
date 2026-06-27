@@ -377,16 +377,22 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
             ];
-            let eq_bands = mc
-                .eq
-                .iter()
-                .map(|b| EqBandSnapshot {
-                    kind: b.kind.clone(),
-                    freq_hz: b.freq_hz,
-                    q: b.q,
-                    gain_db: b.gain_db,
-                })
-                .collect();
+            // Dense 10-band mic EQ: canonical defaults overlaid with stored mic bands.
+            let eq_bands: Vec<EqBandSnapshot> = {
+                let mut dense = convert::default_eq_band_configs();
+                for (i, b) in mc.eq.iter().enumerate().take(dense.len()) {
+                    dense[i] = b.clone();
+                }
+                dense
+                    .iter()
+                    .map(|b| EqBandSnapshot {
+                        kind: b.kind.clone(),
+                        freq_hz: b.freq_hz,
+                        q: b.q,
+                        gain_db: b.gain_db,
+                    })
+                    .collect()
+            };
 
             // Map config SuppressionBackend → state SuppressionBackend
             let suppression_backend = match mc.suppression.backend {
@@ -1669,6 +1675,13 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Set a single mic EQ band live via `apply_control` (no restart).
     pub fn mic_set_eq_band(&mut self, band: usize, cfg: EqBandConfig) -> Result<(), EngineError> {
+        // Bounds guard: reject out-of-range band indices.
+        if band >= arctis_audio::MAX_BANDS {
+            return Err(EngineError::BadRequest(format!(
+                "band index {band} out of range (0..{})",
+                arctis_audio::MAX_BANDS
+            )));
+        }
         // Validate band
         let eq_band = convert::eq_band_from_cfg(&cfg)?;
         // Mutate config
@@ -1677,13 +1690,15 @@ impl<R: CommandRunner> Engine<R> {
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
                 EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
             })?;
-            while profile.mic.eq.len() <= band {
-                profile.mic.eq.push(EqBandConfig {
-                    kind: "peaking".to_string(),
-                    freq_hz: 1000.0,
-                    q: 1.0,
-                    gain_db: 0.0,
-                });
+            // Seed the dense canonical defaults (correct freqs, NOT 1000 Hz)
+            // while preserving any existing overrides, so unedited lower bands
+            // keep their real default frequencies.
+            if profile.mic.eq.len() < arctis_audio::MAX_BANDS {
+                let mut dense = convert::default_eq_band_configs();
+                for (i, b) in profile.mic.eq.iter().enumerate().take(dense.len()) {
+                    dense[i] = b.clone();
+                }
+                profile.mic.eq = dense;
             }
             profile.mic.eq[band] = cfg.clone();
         }
@@ -6048,6 +6063,31 @@ mod tests {
         let mut engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
         let band = arctis_config::EqBandConfig { kind: "peaking".into(), freq_hz: 1000.0, q: 1.0, gain_db: 0.0 };
         assert!(engine.set_eq_band("game", 10, band).is_err());
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 2: dense fixed-10-band mic EQ model
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn state_returns_ten_dense_mic_eq_bands() {
+        let engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let st = engine.state();
+        assert_eq!(st.mic.eq_bands.len(), 10, "mic EQ must report 10 dense bands");
+        assert_eq!(st.mic.eq_bands[0].freq_hz, 31.0);
+        assert_eq!(st.mic.eq_bands[9].freq_hz, 16000.0);
+    }
+
+    #[test]
+    fn set_mic_eq_band_rejects_out_of_range_index() {
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let band = arctis_config::EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 1000.0,
+            q: 1.0,
+            gain_db: 0.0,
+        };
+        assert!(engine.mic_set_eq_band(10, band).is_err());
     }
 
     #[test]
