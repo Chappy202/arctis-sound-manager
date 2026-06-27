@@ -48,10 +48,13 @@ Three findings drive correctness and resolve open questions:
   `Stream/Output/Audio` nodes uniformly.
 - **Current sink via Link objects.** A stream's *actual* sink is found by walking
   `PipeWire:Interface:Link` objects (`output-node-id` → `input-node-id`), not by reading
-  `target.object` metadata (which is intent, not reality). Our channels are filter-chain
-  sinks whose link target is the **internal** node name (e.g. `effect_input.sonar-game-eq`),
-  so we must map internal names back to channel ids using a map **built from the names we
-  create**.
+  `target.object` metadata (which is intent, not reality). **Topology note (verified):** each
+  of our channels is a single sink whose exposed `node.name` *is* the channel sink (e.g.
+  `Arctis_Game`) — streams link directly to it; there is no `effect_input.*` indirection (that
+  was the old Python app's filter-chain design, not ours; confirmed by `meters.rs` capturing
+  `Arctis_Game.monitor`). So the sink→channel reverse map is simply
+  `{ node_name → channel_id }`, built **dynamically from the active profile's channels**, not
+  hard-coded.
 - **`target.object` accepts a `node.name`.** Confirmed against PipeWire docs
   (`PW_KEY_TARGET_OBJECT`: "an object name or object.serial"). Our existing
   `routing.rs::move_stream_argv` (which passes the sink `node.name`) is **already correct**;
@@ -102,8 +105,9 @@ pub struct AppStream {
 }
 ```
 
-Surfaced to the GUI via a dedicated event (`StreamsChanged`), kept in a **separate frontend
-store** from `EngineState` so frequent stream churn does not re-render the whole app.
+Surfaced to the GUI via a dedicated `streams-changed` Tauri event (emitted by a src-tauri
+poll task, see §7.1), kept in a **separate frontend store** from `EngineState` so frequent
+stream churn does not re-render the whole app.
 
 ### 4.3 Sink → channel reverse map
 
@@ -127,9 +131,10 @@ Each new verb follows the established 7-layer parity recipe:
 | `SetChatmix { position }` | `set_chatmix(pos)` | Reuses `dial.rs::apply_dial_balance` (Game↔Chat). Store position in profile. |
 | `SetDefaultSinkChannel { channel: Option<String> }` | `set_default_sink_channel(opt)` | `wpctl set-default` on that channel's sink; store in profile (`default_sink_channel`). `None` = leave system default untouched. |
 
-New events: `StreamsChanged { streams }`, `MasterVolumeSet`, `MasterMuteSet`, `ChatmixSet`,
-`DefaultSinkChannelSet`. `StreamsChanged` is emitted by the daemon poller; the rest by their
-engine methods (existing pattern).
+New engine `Event` variants: `MasterVolumeSet`, `MasterMuteSet`, `ChatmixSet`,
+`DefaultSinkChannelSet` (emitted by their engine methods, existing pattern). Stream freshness
+is **not** an engine event — it is the `streams-changed` Tauri event emitted by a src-tauri
+poll task calling `ListStreams` (§7.1).
 
 New `Profile`/`Config` fields: `master_volume_db`, `master_mute`, `chatmix_position`,
 `default_sink_channel: Option<String>`. All `#[serde(default)]` for backward compatibility
@@ -168,7 +173,7 @@ New `streams` command group, mirroring `route`/`channel` style:
   (`icon_name`) + `app_name`, with `media_name` as a subtitle when present.
 - **Drag/drop:** native HTML5 `draggable` pills; `dragover`/`drop` on Playback strips with a
   drop-target highlight (`--ss-drag-highlight` token). On drop → `moveStream(id, channelId)`,
-  optimistic pill move, reconciled by the next `StreamsChanged`. Dragging a pill back to the
+  optimistic pill move, reconciled by the next `streams-changed`. Dragging a pill back to the
   Master tray clears its binding.
 - **Apps-to-be-routed tray** lives on the Master strip; shows `current_channel == None`
   streams. A default-sink toggle on Master controls whether new apps auto-land in a channel.
@@ -182,9 +187,10 @@ New `streams` command group, mirroring `route`/`channel` style:
 ### 7.1 Live update flow
 
 `init()` calls `ListStreams` once for an immediate render, then subscribes to a dedicated
-`streams-changed` Tauri event (separate from `state-changed`). The daemon poller emits
-`StreamsChanged` ~every 1.5s and on relevant graph changes; the frontend updates a `streams`
-store; only the pills re-render.
+`streams-changed` Tauri event (separate from `state-changed`). A src-tauri poll task in
+`src-tauri/src/lib.rs` (a third `setup` task alongside the existing `state-changed` and
+`levels` tasks) sends `ListStreams` to the daemon ~every 1.5s and emits `streams-changed` with
+the `Vec<AppStream>`; the frontend updates a `streams` store; only the pills re-render.
 
 ## 8. Error handling
 
