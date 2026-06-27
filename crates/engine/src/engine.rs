@@ -5951,16 +5951,27 @@ mod tests {
 
     #[test]
     fn set_master_volume_persists_and_reports() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_vol");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
         let cfg = make_config_no_eq_no_routes();
         // wpctl call for the gain (status 0).
         let runner = arctis_audio::MockRunner::new().with_output(0, "", "");
         let mut engine = Engine::new(runner, cfg);
         engine.set_master_volume(-6.0).unwrap();
         assert_eq!(engine.state().master_volume_db, -6.0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]
     fn set_chatmix_updates_game_chat_volumes() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("chatmix");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
         let cfg = make_config_no_eq_no_routes();
         // set_chatmix → set_channel_volume("game") + set_channel_volume("chat")
         // Each set_channel_volume calls apply_volume_mute → 2 runner calls (find_node_id + Props set).
@@ -5972,5 +5983,8 @@ mod tests {
         let mut engine = Engine::new(runner, cfg);
         engine.set_chatmix(9).unwrap(); // full game
         assert_eq!(engine.state().chatmix_position, 9);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
