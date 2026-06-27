@@ -584,6 +584,15 @@ unsafe fn install_signal_pipe(write_fd: libc::c_int) {
 /// Global write-end fd for the signal self-pipe. -1 = not installed.
 static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Check if a unix socket file has a live listener.
+///
+/// Attempts to connect to the socket. If the connection succeeds, something is listening
+/// (socket is live). If the connection fails (ECONNREFUSED or other error), the socket is
+/// either stale (file exists but no listener) or absent.
+fn socket_is_live(path: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
 /// Production daemon entry point: opens real PipeWire + HID, installs process-global
 /// SIGTERM/SIGINT handlers, then runs the accept loop.
 ///
@@ -604,6 +613,12 @@ pub fn run_daemon() -> Result<(), EngineError> {
 
     let path = socket_path();
     if path.exists() {
+        if socket_is_live(&path) {
+            return Err(EngineError::Ipc(format!(
+                "daemon already running (socket {} is live)", path.display()
+            )));
+        }
+        // Stale socket from a previous crash — remove and rebind.
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2487,6 +2502,69 @@ mod tests {
         assert!(
             ok_resp.state.is_some(),
             "state must be present in second response"
+        );
+    }
+
+    // ── Task 7: socket_is_live tests ────────────────────────────────────────
+
+    #[test]
+    fn socket_is_live_true_when_listener_bound() {
+        // Create a unique temp socket path per test.
+        let tmp_path = std::env::temp_dir()
+            .join(format!("asm_sock_live_{}", std::process::id()));
+
+        // Bind a UnixListener at the temp path.
+        let _listener = std::os::unix::net::UnixListener::bind(&tmp_path)
+            .expect("failed to bind listener");
+
+        // Assert that socket_is_live returns true (listener is present).
+        assert!(
+            super::socket_is_live(&tmp_path),
+            "socket_is_live must return true when listener is bound"
+        );
+
+        // Clean up: drop listener and remove the file.
+        drop(_listener);
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn socket_is_live_false_when_stale() {
+        // Create a unique temp socket path per test.
+        let tmp_path = std::env::temp_dir()
+            .join(format!("asm_sock_stale_{}", std::process::id()));
+
+        // Bind a UnixListener, then drop it without removing the file.
+        // std UnixListener does NOT unlink on drop, so the file remains.
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&tmp_path)
+                .expect("failed to bind listener");
+            // Listener is dropped here, but the file persists.
+        }
+
+        // Assert that socket_is_live returns false (file exists but no listener).
+        assert!(
+            !super::socket_is_live(&tmp_path),
+            "socket_is_live must return false for a stale socket file"
+        );
+
+        // Clean up: remove the stale file.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn socket_is_live_false_when_absent() {
+        // Create a path that does not exist.
+        let tmp_path = std::env::temp_dir()
+            .join(format!("asm_sock_absent_{}", std::process::id()));
+
+        // Ensure the path does not exist.
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // Assert that socket_is_live returns false (path doesn't exist).
+        assert!(
+            !super::socket_is_live(&tmp_path),
+            "socket_is_live must return false for a non-existent path"
         );
     }
 }
