@@ -14,7 +14,7 @@ pub use device::{DeviceCommand, DeviceOpener};
 pub use engine::Engine;
 pub use error::EngineError;
 pub use state::{
-    ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, EqPresetSnapshot, Event, MicParam,
-    MicSnapshot, MicStageSnapshot, StageAvailability, StageName, SuppressionBackend,
+    AppStream, ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, EqPresetSnapshot, Event,
+    MicParam, MicSnapshot, MicStageSnapshot, StageAvailability, StageName, SuppressionBackend,
     SurroundSnapshot,
 };

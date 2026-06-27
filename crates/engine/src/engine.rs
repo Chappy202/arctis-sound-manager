@@ -580,6 +580,56 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Discover running application output streams, resolving each to a channel id
+    /// (via its linked sink node.name) and flagging those with a persistent route.
+    /// One `pw-dump` per call; pure mapping otherwise. Read-only (no graph mutation).
+    pub fn list_streams(&mut self) -> Result<Vec<crate::state::AppStream>, EngineError> {
+        // node.name -> channel id, built from the active profile (never hard-coded).
+        let (name_to_id, routed_bins): (
+            std::collections::HashMap<String, String>,
+            std::collections::HashSet<String>,
+        ) = {
+            let profile = self.config.active()?;
+            let map = profile
+                .channels
+                .iter()
+                .map(|c| (c.node_name.clone(), c.id.clone()))
+                .collect();
+            let routed = profile
+                .routes
+                .iter()
+                .map(|r| r.app_binary.clone())
+                .collect();
+            (map, routed)
+        };
+
+        let out = self.runner.run("pw-dump", &[])?;
+        if out.status != 0 {
+            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                program: "pw-dump".into(),
+                status: out.status,
+                stderr: out.stderr,
+            }));
+        }
+        let parsed = arctis_audio::parse_app_streams(&out.stdout)?;
+        Ok(parsed
+            .into_iter()
+            .map(|p| crate::state::AppStream {
+                current_channel: p
+                    .sink_node_name
+                    .as_ref()
+                    .and_then(|n| name_to_id.get(n).cloned()),
+                routed: routed_bins.contains(&p.binary),
+                id: p.id,
+                binary: p.binary,
+                app_name: p.app_name,
+                pid: p.pid,
+                icon_name: p.icon_name,
+                media_name: p.media_name,
+            })
+            .collect())
+    }
+
     /// Set (or clear) the output device for a single channel in the active profile.
     ///
     /// Updates the in-memory config, persists it atomically, rebuilds that
@@ -5447,5 +5497,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn list_streams_maps_sink_to_channel_and_marks_routed() {
+        // Active profile: game/chat/media (node_name Arctis_Game/Chat/Media).
+        let mut cfg = make_config_no_eq_no_routes();
+        // Add a persistent route so `routed` flips for firefox.
+        cfg.profiles[0].routes = vec![arctis_config::RouteConfig {
+            app_binary: "firefox".into(),
+            target_sink: "Arctis_Game".into(),
+        }];
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        let runner = arctis_audio::MockRunner::new().with_output(0, dump, ""); // pw-dump
+        let mut engine = Engine::new(runner, cfg);
+        let streams = engine.list_streams().unwrap();
+
+        let ff = streams.iter().find(|s| s.binary == "firefox").unwrap();
+        assert_eq!(ff.current_channel.as_deref(), Some("game")); // Arctis_Game → game
+        assert!(ff.routed, "firefox has a persistent rule");
+
+        let sp = streams.iter().find(|s| s.binary == "spotify").unwrap();
+        assert_eq!(sp.current_channel, None, "unlinked spotify is unrouted");
+        assert!(!sp.routed);
     }
 }

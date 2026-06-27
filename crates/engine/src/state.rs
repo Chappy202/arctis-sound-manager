@@ -173,6 +173,21 @@ pub struct ChannelSnapshot {
     pub muted: bool,
 }
 
+/// One running application audio stream, resolved to a channel id, for the UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppStream {
+    pub id: u32,
+    pub binary: String,
+    pub app_name: String,
+    pub pid: Option<u32>,
+    pub icon_name: Option<String>,
+    pub media_name: Option<String>,
+    /// Resolved channel id, or None = unrouted (shown in the Master tray).
+    pub current_channel: Option<String>,
+    /// True when a persistent routing rule exists for this binary.
+    pub routed: bool,
+}
+
 /// Events emitted on the engine's outbound stream (mpsc::Receiver<Event> for the daemon/UI).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
