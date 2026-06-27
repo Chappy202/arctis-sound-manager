@@ -90,6 +90,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Live application audio streams: list and move between channels.
+    Streams {
+        #[command(subcommand)]
+        action: StreamsAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -401,6 +406,19 @@ enum CoexistAction {
         /// Preview actions without executing them.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StreamsAction {
+    /// List running app streams with their current channel.
+    List,
+    /// Move a running stream to a channel: `streams move <stream> <channel>`.
+    Move {
+        /// Stream node id or app binary.
+        stream: String,
+        /// Target channel id: game | chat | media | aux | ...
+        channel: String,
     },
 }
 
@@ -1198,6 +1216,53 @@ fn main() -> ExitCode {
         Command::Coexist { action } => dispatch_coexist(action),
         Command::Apply => dispatch_apply(),
         Command::SetupUdev { dry_run } => setup_udev::dispatch_setup_udev(&mut RealRunner, dry_run),
+        Command::Streams { action } => match action {
+            StreamsAction::List => {
+                match daemon::send_request(&daemon::Request::ListStreams) {
+                    Ok(resp) if resp.ok => {
+                        let streams = resp.streams.unwrap_or_default();
+                        if streams.is_empty() {
+                            println!("no running app streams");
+                        } else {
+                            for s in &streams {
+                                let ch = s.current_channel.as_deref().unwrap_or("(unrouted)");
+                                let pin = if s.routed { " [pinned]" } else { "" };
+                                println!("{:>5}  {:<20} -> {}{}", s.id, s.app_name, ch, pin);
+                            }
+                        }
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            StreamsAction::Move { stream, channel } => {
+                let req = daemon::Request::MoveStream {
+                    stream: stream.clone(),
+                    channel: channel.clone(),
+                };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("moved stream '{stream}' -> {channel}");
+                        ExitCode::SUCCESS
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("error sending request: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Command::Daemon { foreground: _ } => {
             // Coexist check: scan for legacy nodes using pw-cli ls Node output.
             let node_stdout = std::process::Command::new("pw-cli")
@@ -2831,6 +2896,33 @@ mod tests {
             super::Command::Coexist {
                 action: super::CoexistAction::Disable { dry_run },
             } => assert!(dry_run, "dry_run must be true when --dry-run is passed"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── Task 5: streams subcommand parse tests ─────────────────────────────────
+
+    #[test]
+    fn streams_list_parses() {
+        let cmd = parse(&["streams", "list"]).expect("streams list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Streams {
+                action: super::StreamsAction::List
+            }
+        ));
+    }
+
+    #[test]
+    fn streams_move_parses() {
+        let cmd = parse(&["streams", "move", "70", "chat"]).expect("streams move should parse");
+        match cmd {
+            super::Command::Streams {
+                action: super::StreamsAction::Move { stream, channel },
+            } => {
+                assert_eq!(stream, "70");
+                assert_eq!(channel, "chat");
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -226,6 +226,14 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ListStreams => match engine.list_streams() {
+            Ok(streams) => Response::ok_with_streams(streams),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::MoveStream { stream, channel } => match engine.move_stream(&stream, &channel) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::CoexistStatus => {
             // Run pw-cli ls Node + check home dir for legacy components.
             let node_stdout = RealRunner
