@@ -44,7 +44,7 @@
     setEqBand(channelId, index, band.kind, band.freqHz, band.q, band.gainDb)
       .catch((e) => console.warn("[EqGraph] setEqBand failed:", e));
   }
-  function throttledFlush(index: number, band: Band) {
+  function throttledFlush(index: number) {
     if (throttleTimer !== null) return;
     throttleTimer = setTimeout(() => { throttleTimer = null; flush(index, bands[index]); }, THROTTLE_MS);
   }
@@ -91,13 +91,19 @@
     const [vx, vy] = toViewBox(e);
     const next = clampBand({ ...bands[i], freqHz: xToFreq(vx, VW), gainDb: yToGain(vy, VH) });
     onBandChange(i, next);
-    throttledFlush(i, next);
+    throttledFlush(i);
   }
   function onHandleUp(e: PointerEvent, i: number) {
     if (dragIndex !== i) return;
     e.preventDefault();
     if (throttleTimer !== null) { clearTimeout(throttleTimer); throttleTimer = null; }
     flush(i, bands[i]);
+    dragIndex = -1;
+    endEditing();
+  }
+  function onHandleCancel(_e: PointerEvent, i: number) {
+    if (dragIndex !== i) return;
+    if (throttleTimer !== null) { clearTimeout(throttleTimer); throttleTimer = null; }
     dragIndex = -1;
     endEditing();
   }
@@ -152,7 +158,7 @@
 
   function fmt(b: Band) {
     const f = b.freqHz >= 1000 ? `${(b.freqHz / 1000).toFixed(1)}k` : `${Math.round(b.freqHz)}`;
-    return `Band ${"?"}, ${b.kind}, ${f} Hz, ${b.gainDb >= 0 ? "+" : ""}${b.gainDb.toFixed(1)} dB, Q ${b.q.toFixed(2)}`;
+    return `${b.kind}, ${f} Hz, ${b.gainDb >= 0 ? "+" : ""}${b.gainDb.toFixed(1)} dB, Q ${b.q.toFixed(2)}`;
   }
 </script>
 
@@ -179,12 +185,13 @@
         <!-- larger transparent hit/focus target -->
         <circle cx={handleX(b)} cy={handleY(b)} r="18" class="hit"
           role="slider" tabindex="0"
-          aria-label={fmt(b).replace("Band ?", `Band ${i + 1}`)}
+          aria-label={`Band ${i + 1} (${b.kind})`}
           aria-valuemin={GAIN_MIN} aria-valuemax={GAIN_MAX} aria-valuenow={b.gainDb}
-          aria-valuetext={fmt(b).replace("Band ?", `Band ${i + 1}`)}
+          aria-valuetext={`Band ${i + 1}, ${fmt(b)}`}
           onpointerdown={(e) => onHandleDown(e, i)}
           onpointermove={(e) => onHandleMove(e, i)}
           onpointerup={(e) => onHandleUp(e, i)}
+          onpointercancel={(e) => onHandleCancel(e, i)}
           onwheel={(e) => onHandleWheel(e, i)}
           onkeydown={(e) => onHandleKey(e, i)}
           ondblclick={() => onHandleDblClick(i)}
