@@ -74,8 +74,13 @@ pub fn plan_reconcile(cfg: &Config) -> Result<Vec<ReconcileStep>, EngineError> {
 /// Full attenuation applied to the losing side of the ChatMix dial (dB).
 const CHATMIX_FULL_ATTEN_DB: f32 = -40.0;
 
-/// Map a ChatMix position 0..=9 to (game_db, chat_db). 4 = balanced (0,0);
-/// 9 = full game (chat at FULL_ATTEN); 0 = full chat (game at FULL_ATTEN).
+/// Map a ChatMix position 0..=9 to (game_db, chat_db) attenuations.
+/// center = 4.5 is the true midpoint of the 0..=9 range and matches the hardware
+/// Nova Pro dial mapping in `crates/cli/src/dial.rs`, so the GUI ChatMix slider and
+/// the physical dial behave identically. Because the center is 4.5, no integer
+/// position is exactly neutral: position 4 leans slightly toward chat (game ~-4.4 dB)
+/// and position 5 slightly toward game; true balance sits between 4 and 5.
+/// Endpoints: 9 => full game (chat fully attenuated), 0 => full chat (game attenuated).
 fn chatmix_to_volumes(position: i64) -> (f32, f32) {
     let p = position.clamp(0, 9) as f32;
     let center = 4.5_f32;
