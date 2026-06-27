@@ -5,6 +5,15 @@
  */
 import type { ChannelSnapshot, OutputDeviceSnapshot } from "../ipc.js";
 
+/**
+ * Extract a human-readable message from an unknown catch value.
+ * Used in the channel strip's write-failure catch blocks so the same
+ * message is passed to `console.error` and to the `onError` callback.
+ */
+export function toErrorMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export interface DeviceOption {
   value: string | null;
   label: string;

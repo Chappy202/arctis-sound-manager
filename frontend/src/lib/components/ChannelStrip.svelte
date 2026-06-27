@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { ChannelSnapshot, AppStream, OutputDeviceSnapshot } from "../ipc.js";
   import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
-  import { buildDeviceOptions } from "./channelStripUtils.js";
+  import { buildDeviceOptions, toErrorMsg } from "./channelStripUtils.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
   import LevelMeter from "./LevelMeter.svelte";
@@ -26,9 +26,15 @@
      * fixed channels (e.g. last remaining channel) to prevent removal.
      */
     onRemove?: () => void;
+    /**
+     * Called whenever a channel write (volume / mute / output) fails.
+     * Receives the error message so the parent can surface it (e.g. in an
+     * existing error banner). The optimistic revert still runs regardless.
+     */
+    onError?: (msg: string) => void;
   }
 
-  let { channel, streams = [], outputDevices = [], onDropStream = () => {}, onOutputChanged, onRemove }: Props = $props();
+  let { channel, streams = [], outputDevices = [], onDropStream = () => {}, onOutputChanged, onRemove, onError = () => {} }: Props = $props();
 
   // -----------------------------------------------------------------------
   // Channel identity / icon mapping
@@ -68,7 +74,9 @@
       }
       onOutputChanged?.();
     } catch (err) {
+      const msg = toErrorMsg(err);
       console.error("[ChannelStrip] setChannelOutput failed:", err);
+      onError(msg);
       // Revert the select back to reflect actual state
       select.value = selectedDevice ?? "__default__";
     } finally {
@@ -105,7 +113,9 @@
         engineState.set(newState);
       }
     } catch (err) {
+      const msg = toErrorMsg(err);
       console.error("[ChannelStrip] setChannelVolume failed:", err);
+      onError(msg);
       // Revert input to reflect actual state
       input.value = String(channel.volume_db);
     } finally {
@@ -122,7 +132,9 @@
         engineState.set(newState);
       }
     } catch (err) {
+      const msg = toErrorMsg(err);
       console.error("[ChannelStrip] setChannelMute failed:", err);
+      onError(msg);
     } finally {
       muteBusy = false;
     }

@@ -187,6 +187,7 @@
                 onRemove={$engineState.channels.length > 1 && !removeBusy
                   ? () => handleRemoveChannel(channel.id)
                   : undefined}
+                onError={(m) => (dropError = m)}
               />
             </div>
           {/each}

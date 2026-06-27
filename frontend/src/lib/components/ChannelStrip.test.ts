@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildDeviceOptions } from "./channelStripUtils.js";
+import { buildDeviceOptions, toErrorMsg } from "./channelStripUtils.js";
 import type { ChannelSnapshot, OutputDeviceSnapshot } from "../ipc.js";
 
 // Minimal ChannelSnapshot fixture
@@ -17,6 +17,48 @@ const mkDevice = (node_name: string, description: string, is_default: boolean): 
   node_name,
   description,
   is_default,
+});
+
+// ---------------------------------------------------------------------------
+// toErrorMsg — the helper used in every ChannelStrip write-failure catch block
+// to produce the message forwarded to the `onError` prop.
+// ---------------------------------------------------------------------------
+describe("toErrorMsg", () => {
+  it("returns err.message for an Error instance", () => {
+    expect(toErrorMsg(new Error("setChannelVolume rejected"))).toBe("setChannelVolume rejected");
+  });
+
+  it("returns String(err) for a plain string throw", () => {
+    expect(toErrorMsg("daemon hiccup")).toBe("daemon hiccup");
+  });
+
+  it("returns String(err) for a numeric throw", () => {
+    expect(toErrorMsg(42)).toBe("42");
+  });
+
+  it("returns String(err) for null / undefined", () => {
+    expect(toErrorMsg(null)).toBe("null");
+    expect(toErrorMsg(undefined)).toBe("undefined");
+  });
+
+  // Confirm onError integration: simulate the pattern used in every catch block.
+  // This is the closest we can get to a component-level assertion without a DOM
+  // harness (no jsdom / happy-dom in this project).
+  it("when used with an onError callback, forwards the error message correctly", () => {
+    const received: string[] = [];
+    const onError = (msg: string) => received.push(msg);
+    const err = new Error("write failed");
+    onError(toErrorMsg(err));
+    expect(received).toEqual(["write failed"]);
+  });
+
+  it("handles mute / output failures the same way", () => {
+    const muteErr = new Error("setChannelMute rejected");
+    expect(toErrorMsg(muteErr)).toBe("setChannelMute rejected");
+
+    const outputErr = new Error("setChannelOutput rejected");
+    expect(toErrorMsg(outputErr)).toBe("setChannelOutput rejected");
+  });
 });
 
 describe("buildDeviceOptions", () => {
