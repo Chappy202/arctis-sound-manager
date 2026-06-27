@@ -77,6 +77,24 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
         if !media_class.starts_with("Stream/Output/Audio") {
             continue;
         }
+        // Exclude filter-chain infrastructure nodes.
+        let link_group = props
+            .get("node.link-group")
+            .and_then(|v| v.as_str())
+            .or_else(|| props.get("node.group").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        if link_group.starts_with("filter-chain-") {
+            continue;
+        }
+        // Exclude nodes with no application identity (neither binary nor app name).
+        let has_app_binary = props
+            .get("application.process.binary")
+            .and_then(|v| v.as_str())
+            .is_some();
+        let has_app_name = props.get("application.name").and_then(|v| v.as_str()).is_some();
+        if !has_app_binary && !has_app_name {
+            continue;
+        }
         // Identify the app. Require a binary (fallback to node.name) so anonymous
         // streams without any identity are skipped.
         let binary = props
@@ -175,5 +193,14 @@ mod tests {
     fn malformed_json_is_parse_error() {
         let err = parse_app_streams("not json").unwrap_err();
         assert!(matches!(err, AudioError::Parse { .. }));
+    }
+
+    #[test]
+    fn excludes_our_filter_chain_outputs() {
+        let streams = parse_app_streams(DUMP).unwrap();
+        let bins: Vec<&str> = streams.iter().map(|s| s.binary.as_str()).collect();
+        assert!(!bins.iter().any(|b| b.contains(".output")),
+            "filter-chain infra must be excluded: {bins:?}");
+        assert!(bins.contains(&"firefox"), "real apps must remain: {bins:?}");
     }
 }
