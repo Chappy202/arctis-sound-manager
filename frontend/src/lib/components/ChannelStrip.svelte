@@ -1,9 +1,10 @@
 <script lang="ts">
-  import type { ChannelSnapshot } from "../ipc.js";
+  import type { ChannelSnapshot, AppStream } from "../ipc.js";
   import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
   import LevelMeter from "./LevelMeter.svelte";
+  import AppPill from "./AppPill.svelte";
 
   // Domain bounds — mirror crates/domain/src/eq_bounds.rs CHANNEL_VOLUME_MIN/MAX_DB
   const VOLUME_MIN_DB = -60;
@@ -11,6 +12,10 @@
 
   interface Props {
     channel: ChannelSnapshot;
+    /** App streams currently assigned to this channel. */
+    streams?: AppStream[];
+    /** Called when a stream is dropped onto this channel strip. */
+    onDropStream?: (streamId: string, channelId: string) => void;
     /** Called after output device change so parent can refresh state if needed. */
     onOutputChanged?: () => void;
     /**
@@ -20,7 +25,7 @@
     onRemove?: () => void;
   }
 
-  let { channel, onOutputChanged, onRemove }: Props = $props();
+  let { channel, streams = [], onDropStream = () => {}, onOutputChanged, onRemove }: Props = $props();
 
   // -----------------------------------------------------------------------
   // Channel identity / icon mapping
@@ -145,6 +150,36 @@
   const displayName = $derived(channel.node_name || channel.id.toUpperCase());
   const labelId = $derived(`channel-label-${channel.id}`);
   const selectId = $derived(`channel-output-${channel.id}`);
+
+  // -----------------------------------------------------------------------
+  // Drag-and-drop — app stream drop target
+  // -----------------------------------------------------------------------
+  let dragOver = $state(false);
+
+  function handleDragOver(e: DragEvent) {
+    if (e.dataTransfer?.types.includes("text/asm-stream-id")) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      dragOver = true;
+    }
+  }
+  function handleDragLeave() { dragOver = false; }
+  function handleDrop(e: DragEvent) {
+    e.preventDefault();
+    dragOver = false;
+    const id = e.dataTransfer?.getData("text/asm-stream-id");
+    if (id) onDropStream(id, channel.id);
+  }
+
+  function accentFor(id: string): string {
+    const map: Record<string, string> = {
+      game:  "var(--ss-accent-game)",
+      chat:  "var(--ss-accent-chat)",
+      media: "var(--ss-accent-media)",
+      aux:   "var(--ss-accent-aux)",
+    };
+    return map[id] ?? "var(--ss-accent)";
+  }
 </script>
 
 <article
@@ -250,6 +285,21 @@
     >
       EQ
     </button>
+  </div>
+
+  <!-- ===== App stream drop area ===== -->
+  <div
+    class="strip-apps"
+    class:drag-over={dragOver}
+    role="list"
+    aria-label="{channel.id} applications"
+    ondragover={handleDragOver}
+    ondragleave={handleDragLeave}
+    ondrop={handleDrop}
+  >
+    {#each streams as s (s.id)}
+      <AppPill stream={s} accent={accentFor(channel.id)} />
+    {/each}
   </div>
 </article>
 
@@ -582,5 +632,23 @@
 
   .eq-btn:active {
     background: var(--ss-surface-input);
+  }
+
+  /* ===== App stream drop area ===== */
+  .strip-apps {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-1);
+    min-height: 48px;
+    padding: var(--ss-space-2);
+    margin-top: var(--ss-space-2);
+    border: var(--ss-border-width) dashed var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    transition: background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .strip-apps.drag-over {
+    background: var(--ss-drag-highlight);
+    border-color: var(--ss-accent);
   }
 </style>

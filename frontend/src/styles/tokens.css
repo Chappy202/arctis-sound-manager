@@ -54,6 +54,17 @@
   --ss-muted:               #A5A7AA;         /* muted channel inactive state */
 
   /* =========================================================================
+   * COLORS — Drag / interaction
+   * ========================================================================= */
+  --ss-drag-highlight: rgba(255, 82, 0, 0.18);
+  --ss-accent-game:    #41d18b;
+  --ss-accent-chat:    #38b6ff;
+  --ss-accent-media:   #ff3d7f;
+  --ss-accent-aux:     #9b6bff;
+  --ss-accent-mic:     #ffb020;
+  --ss-accent-master:  #6b8cff;
+
+  /* =========================================================================
    * COLORS — Data-viz / EQ band identity colors (10 bands)
    * ========================================================================= */
   --ss-band-1:              #FF5200;
