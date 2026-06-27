@@ -26,16 +26,36 @@ pub fn eq_band_from_cfg(c: &EqBandConfig) -> Result<EqBand, EngineError> {
     Ok(EqBand::new(kind, c.freq_hz, c.q, c.gain_db))
 }
 
-/// Build an `EqModel` for a channel config.
-///
-/// - Empty `cfg.eq` → `EqModel::default_10band()` (flat EQ).
-/// - Non-empty → map each band via `eq_band_from_cfg`.
-pub fn eq_model_for(channel: &ChannelConfig) -> Result<EqModel, EngineError> {
-    if channel.eq.is_empty() {
-        return Ok(EqModel::default_10band());
+/// The canonical dense default 10-band set, in config form (kind strings).
+/// Frequencies come from `EqModel::default_10band()` (single source of truth).
+pub fn default_eq_band_configs() -> Vec<arctis_config::EqBandConfig> {
+    arctis_audio::EqModel::default_10band()
+        .bands
+        .iter()
+        .map(|b| arctis_config::EqBandConfig {
+            kind: "peaking".to_string(),
+            freq_hz: b.freq_hz,
+            q: b.q,
+            gain_db: b.gain_db,
+        })
+        .collect()
+}
+
+/// A dense, fixed-length (10) band vector for a channel: canonical defaults with
+/// any stored overrides overlaid by index. Never empty, never `1000 Hz` padding.
+pub fn dense_eq_bands(channel: &arctis_config::ChannelConfig) -> Vec<arctis_config::EqBandConfig> {
+    let mut dense = default_eq_band_configs();
+    for (i, b) in channel.eq.iter().enumerate().take(dense.len()) {
+        dense[i] = b.clone();
     }
-    let bands = channel
-        .eq
+    dense
+}
+
+/// Build an `EqModel` for a channel config — ALWAYS the dense 10-band model
+/// (canonical defaults overlaid with stored overrides), so the live filter
+/// chain has a stable 10 biquads and `set_eq_band` can always target any band.
+pub fn eq_model_for(channel: &ChannelConfig) -> Result<EqModel, EngineError> {
+    let bands = dense_eq_bands(channel)
         .iter()
         .map(eq_band_from_cfg)
         .collect::<Result<Vec<_>, _>>()?;
@@ -574,6 +594,7 @@ mod tests {
 
     #[test]
     fn eq_model_for_non_empty_maps_bands() {
+        // A single override at index 0 → still yields a dense 10-band model.
         let ch = ChannelConfig {
             id: "game".into(),
             node_name: "Arctis_Game".into(),
@@ -589,9 +610,56 @@ mod tests {
             muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
-        assert_eq!(model.bands.len(), 1);
+        // Dense model: 10 bands total (override at index 0 + canonical defaults for 1..9).
+        assert_eq!(model.bands.len(), 10);
         assert_eq!(model.bands[0].freq_hz, 500.0);
         assert_eq!(model.bands[0].gain_db, 2.0);
+        // Canonical defaults fill the remaining bands.
+        assert_eq!(model.bands[9].freq_hz, 16000.0);
+        assert_eq!(model.bands[9].gain_db, 0.0);
+    }
+
+    #[test]
+    fn default_eq_band_configs_is_ten_canonical_flat_bands() {
+        let v = default_eq_band_configs();
+        assert_eq!(v.len(), 10);
+        let freqs: Vec<f32> = v.iter().map(|b| b.freq_hz).collect();
+        assert_eq!(
+            freqs,
+            vec![31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
+        );
+        assert!(v.iter().all(|b| b.kind == "peaking" && b.gain_db == 0.0 && b.q == 1.0));
+    }
+
+    #[test]
+    fn dense_eq_bands_overlays_overrides_on_defaults() {
+        let mut ch = arctis_config::ChannelConfig {
+            id: "game".into(), node_name: "Arctis_Game".into(), description: "g".into(),
+            output_device: None, eq: vec![], volume_db: 0.0, muted: false,
+        };
+        // Sparse override: only band index 2 set (a +3 dB highshelf at 300 Hz).
+        ch.eq = vec![
+            arctis_config::EqBandConfig { kind: "peaking".into(), freq_hz: 31.0, q: 1.0, gain_db: 0.0 },
+            arctis_config::EqBandConfig { kind: "peaking".into(), freq_hz: 62.0, q: 1.0, gain_db: 0.0 },
+            arctis_config::EqBandConfig { kind: "highshelf".into(), freq_hz: 300.0, q: 1.0, gain_db: 3.0 },
+        ];
+        let dense = dense_eq_bands(&ch);
+        assert_eq!(dense.len(), 10);
+        assert_eq!(dense[2].kind, "highshelf");
+        assert_eq!(dense[2].freq_hz, 300.0);
+        assert_eq!(dense[2].gain_db, 3.0);
+        // Untouched slots keep canonical defaults.
+        assert_eq!(dense[9].freq_hz, 16000.0);
+        assert_eq!(dense[9].gain_db, 0.0);
+    }
+
+    #[test]
+    fn dense_eq_bands_empty_config_is_ten_defaults() {
+        let ch = arctis_config::ChannelConfig {
+            id: "chat".into(), node_name: "Arctis_Chat".into(), description: "c".into(),
+            output_device: None, eq: vec![], volume_db: 0.0, muted: false,
+        };
+        assert_eq!(dense_eq_bands(&ch), default_eq_band_configs());
     }
 
     #[test]

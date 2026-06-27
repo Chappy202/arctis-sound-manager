@@ -246,8 +246,7 @@ impl<R: CommandRunner> Engine<R> {
                         id: ch.id.clone(),
                         node_name: ch.node_name.clone(),
                         output_device: ch.output_device.clone(),
-                        eq_bands: ch
-                            .eq
+                        eq_bands: convert::dense_eq_bands(ch)
                             .iter()
                             .map(|b| EqBandSnapshot {
                                 kind: b.kind.clone(),
@@ -499,14 +498,17 @@ impl<R: CommandRunner> Engine<R> {
                 .ok_or_else(|| {
                     EngineError::BadRequest(format!("channel not found: {channel_id}"))
                 })?;
-            // Ensure there are enough bands (extend if needed)
-            while channel.eq.len() <= band {
-                channel.eq.push(EqBandConfig {
-                    kind: "peaking".to_string(),
-                    freq_hz: 1000.0,
-                    q: 1.0,
-                    gain_db: 0.0,
-                });
+            if band >= arctis_audio::MAX_BANDS {
+                return Err(EngineError::BadRequest(format!(
+                    "band index {band} out of range (0..{})",
+                    arctis_audio::MAX_BANDS
+                )));
+            }
+            // Seed the dense canonical defaults (correct freqs, NOT 1000 Hz)
+            // while preserving any existing overrides, so unedited lower bands
+            // keep their real default frequencies.
+            if channel.eq.len() < arctis_audio::MAX_BANDS {
+                channel.eq = convert::dense_eq_bands(channel);
             }
             channel.eq[band] = cfg.clone();
         }
@@ -3323,7 +3325,8 @@ mod tests {
             .iter()
             .find(|c| c.id == "game")
             .expect("game channel");
-        assert_eq!(game.eq_bands.len(), 2, "game should have 2 EQ bands");
+        // Dense model: 10 bands (2 config overrides at index 0+1, canonical defaults for 2..9).
+        assert_eq!(game.eq_bands.len(), 10, "game should have 10 dense EQ bands");
 
         // Verify band values come from config (not just a count)
         let b0 = &game.eq_bands[0];
@@ -3345,7 +3348,11 @@ mod tests {
             .find(|c| c.id == "chat")
             .expect("chat channel");
         assert_eq!(chat.output_device, Some("alsa_output.headphones".into()));
-        assert!(chat.eq_bands.is_empty(), "chat has no configured EQ");
+        // Dense model: flat channel reports 10 canonical default bands.
+        assert_eq!(chat.eq_bands.len(), 10, "flat channel emits 10 dense default bands");
+        assert_eq!(chat.eq_bands[0].freq_hz, 31.0);
+        assert_eq!(chat.eq_bands[9].freq_hz, 16000.0);
+        assert!(chat.eq_bands.iter().all(|b| b.gain_db == 0.0 && b.kind == "peaking"));
     }
 
     #[test]
@@ -5986,6 +5993,61 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 1: dense fixed-10-band EQ model
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn state_returns_ten_dense_bands_for_flat_channel() {
+        let engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let st = engine.state();
+        let game = st.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game.eq_bands.len(), 10, "flat channel must report 10 dense bands");
+        assert_eq!(game.eq_bands[0].freq_hz, 31.0);
+        assert_eq!(game.eq_bands[9].freq_hz, 16000.0);
+        assert!(game.eq_bands.iter().all(|b| b.gain_db == 0.0 && b.kind == "peaking"));
+    }
+
+    #[test]
+    fn set_eq_band_seeds_dense_defaults_no_1000hz_padding() {
+        // Editing band index 3 first must NOT create 1000 Hz placeholders at 0..2.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_band_dense_seed");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        // apply_band call sequence: find_node_id (pw-cli ls Node) + pw-cli s <id> Props.
+        // Provide a proper ls response so find_node_id can resolve "Arctis_Game" to id 10.
+        let ls = ls_all_present();
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id: pw-cli ls Node
+            .with_output(0, "", ""); // pw-cli s <id> Props
+        let mut engine = Engine::new(runner, cfg);
+        let band = arctis_config::EqBandConfig {
+            kind: "peaking".into(), freq_hz: 250.0, q: 1.4, gain_db: 3.0,
+        };
+        engine.set_eq_band("game", 3, band).unwrap();
+        let st = engine.state();
+        let game = st.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(game.eq_bands.len(), 10);
+        // Band 3 is the edit; bands 0-2 are canonical defaults (NOT 1000 Hz).
+        assert_eq!(game.eq_bands[3].freq_hz, 250.0);
+        assert_eq!(game.eq_bands[3].gain_db, 3.0);
+        assert_eq!(game.eq_bands[0].freq_hz, 31.0, "band 0 must be canonical default, not 1000 Hz");
+        assert_eq!(game.eq_bands[1].freq_hz, 62.0);
+        assert_eq!(game.eq_bands[2].freq_hz, 125.0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_eq_band_rejects_out_of_range_index() {
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let band = arctis_config::EqBandConfig { kind: "peaking".into(), freq_hz: 1000.0, q: 1.0, gain_db: 0.0 };
+        assert!(engine.set_eq_band("game", 10, band).is_err());
     }
 
     #[test]
