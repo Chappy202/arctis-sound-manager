@@ -10,7 +10,9 @@
    * no level/metering data in this plan. A future plan must add telemetry.
    */
 
+  import { get } from "svelte/store";
   import { engineState } from "../stores.js";
+  import { eqEditing } from "../stores/eqEditing.js";
   import {
     micEnable,
     micStage,
@@ -81,6 +83,7 @@
   let selectedBandIndex = $state(0);
 
   $effect(() => {
+    if (get(eqEditing)) return;
     const eqBands = mic?.eq_bands ?? [];
     if (eqBands.length > 0) {
       micEqBands = eqBands.map((b) => ({
