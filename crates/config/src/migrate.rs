@@ -87,6 +87,7 @@ fn migrate_v0(raw: &str) -> Result<Config, ConfigError> {
         profiles: vec![profile],
         eq_presets: Vec::new(),
         dial_controls_balance: true,
+        knob_controls_master: true,
     };
     backfill_volume_pct(&mut cfg);
     Ok(cfg)

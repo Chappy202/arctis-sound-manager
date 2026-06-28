@@ -78,7 +78,14 @@ pub struct StatusField {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Parser {
-    Percentage { min: u8, max: u8 },
+    Percentage {
+        min: u8,
+        max: u8,
+        /// When true, the scale is inverted (raw `max` → 0 %, raw `min` → 100 %).
+        /// `serde` default = false keeps existing percentage fields unchanged.
+        #[serde(default)]
+        invert: bool,
+    },
     Bool { true_value: u8 },
     Enum { entries: Vec<EnumEntry> },
     Int,
@@ -154,6 +161,34 @@ mod tests {
             d.init_writes[0],
             vec![0x06, 0x20],
             "init_writes[0] must be the wake/probe [0x06,0x20]"
+        );
+    }
+
+    #[test]
+    fn nova_descriptor_has_station_volume_inverted_percentage_field() {
+        use crate::registry::Registry;
+        use arctis_domain::DeviceId;
+        let d = Registry::builtin()
+            .unwrap()
+            .find(DeviceId::new(0x1038, 0x12e5))
+            .unwrap()
+            .clone();
+        let field = d
+            .status
+            .fields
+            .iter()
+            .find(|f| f.name == "station_volume")
+            .expect("station_volume field must be present");
+        assert_eq!(field.match_prefix, vec![0x07, 0x25]);
+        assert_eq!(field.offset, 2);
+        assert_eq!(
+            field.parser,
+            Parser::Percentage {
+                min: 0,
+                max: 56,
+                invert: true
+            },
+            "station_volume must use an inverted 0..56 percentage parser"
         );
     }
 
@@ -263,7 +298,11 @@ mod tests {
         assert_eq!(d.status.fields[0].offset, 6);
         assert_eq!(
             d.status.fields[0].parser,
-            Parser::Percentage { min: 0, max: 8 }
+            Parser::Percentage {
+                min: 0,
+                max: 8,
+                invert: false
+            }
         );
     }
 }

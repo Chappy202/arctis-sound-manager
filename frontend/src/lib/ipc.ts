@@ -102,6 +102,8 @@ export interface EngineState {
   default_sink_channel: string | null;
   /** When true the hardware dial owns ChatMix; GUI slider is read-only. */
   dial_controls_balance: boolean;
+  /** When true the base-station volume knob mirrors into master_volume_pct (read-only). */
+  knob_controls_master: boolean;
 }
 
 // ---------------------------------------------------------------------------

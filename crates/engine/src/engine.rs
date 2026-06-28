@@ -574,6 +574,7 @@ impl<R: CommandRunner> Engine<R> {
             chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
             default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
             dial_controls_balance: self.config.dial_controls_balance,
+            knob_controls_master: self.config.knob_controls_master,
         }
     }
 
@@ -1561,6 +1562,30 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Mirror the hardware base-station volume KNOB position into the app's master
+    /// volume VALUE (read-only hardware mirror).
+    ///
+    /// This updates the active profile's in-memory `master_volume_pct` (clamped to
+    /// 0..=100) and emits `MasterVolumeSet` so the GUI reflects the physical knob.
+    /// SAFETY/SEMANTICS: the knob is itself the hardware gain — this does NOT apply
+    /// any software gain (no `wpctl`) and does NOT persist to disk (no `save_config`);
+    /// it is a transient value mirror, re-read from hardware on every poll. No-op-safe
+    /// when there is no active profile.
+    pub fn apply_hardware_master_volume(&mut self, pct: u8) -> Result<(), EngineError> {
+        let pct = pct.min(100);
+        let active_name = self.config.active_profile.clone();
+        // Graceful no-op if the active profile is missing.
+        let Some(profile) = self.config.profile_mut(&active_name) else {
+            return Ok(());
+        };
+        profile.master_volume_pct = pct;
+        // No volume-cache stamp: `state()` reads master_volume_pct straight from the
+        // active profile (not from the pw-dump cache), so no `last_volume_write` stamp
+        // is needed — and stamping would needlessly mask channel pw-dump reads.
+        self.emit(Event::MasterVolumeSet { volume_pct: pct });
+        Ok(())
+    }
+
     /// Set (or clear) which channel's sink is the system default output. When set,
     /// runs `wpctl set-default` on that sink. Persists + emits.
     pub fn set_default_sink_channel(
@@ -2493,6 +2518,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -2549,6 +2575,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -3112,6 +3139,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         };
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
@@ -3655,6 +3683,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -4756,6 +4785,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -5133,6 +5163,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -5727,6 +5758,7 @@ mod tests {
             }],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -6980,6 +7012,50 @@ mod tests {
         assert_eq!(
             state.chatmix_position, expected_pos,
             "state().chatmix_position must reflect mix_to_chatmix_position(80,100)={expected_pos}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// apply_hardware_master_volume(73) mirrors the knob value into master_volume_pct
+    /// WITHOUT calling wpctl (no software gain) and WITHOUT persisting to disk.
+    #[test]
+    fn apply_hardware_master_volume_mirrors_value_no_wpctl_no_save() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_knob_master_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        engine
+            .apply_hardware_master_volume(73)
+            .expect("apply_hardware_master_volume must succeed");
+
+        // No wpctl call — the knob is the hardware gain; we mirror the VALUE only.
+        assert!(
+            !engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.first().map(|s| s.as_str()) == Some("wpctl")),
+            "apply_hardware_master_volume must NOT call wpctl, calls: {:?}",
+            engine.runner.calls
+        );
+
+        // No config persisted to disk (transient hardware mirror; no save_config).
+        let cfg_path = tmp.join("config.toml");
+        assert!(
+            !cfg_path.exists(),
+            "config.toml must NOT be written by apply_hardware_master_volume"
+        );
+
+        // state() reflects the mirrored master volume (read straight from config).
+        let state = engine.state();
+        assert_eq!(
+            state.master_volume_pct, 73,
+            "state().master_volume_pct must mirror the knob value"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

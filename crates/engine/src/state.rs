@@ -171,6 +171,10 @@ pub struct EngineState {
     /// When false the GUI slider drives balance (dial_controls_balance=false in config).
     #[serde(default)]
     pub dial_controls_balance: bool,
+    /// When true the base-station volume KNOB mirrors its position into `master_volume_pct`
+    /// (read-only hardware mirror; knob_controls_master=true in config).
+    #[serde(default)]
+    pub knob_controls_master: bool,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI

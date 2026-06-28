@@ -110,6 +110,12 @@ match_prefix = [0x07, 0x45]
 offset = 3
 parser = { type = "int" }
 
+[[status.fields]]
+name = "station_volume"          # base-station main volume KNOB (read-only; HID-only, not in PipeWire)
+match_prefix = [0x07, 0x25]      # station→host frame 0x0725, value @ offset 2; INVERTED scale
+offset = 2
+parser = { type = "percentage", min = 0, max = 56, invert = true }   # raw 56=0%, raw 0=100%
+
 # ── WRITE COMMANDS ─────────────────────────────────────────────────────────
 # Each is a SINGLE opcode. No OLED. Capability-gated.
 # (init_writes above handles the dial-enable burst — not a per-command write.)

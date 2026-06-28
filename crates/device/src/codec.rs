@@ -23,10 +23,13 @@ fn frame_matches(frame: &[u8], prefix: &[u8]) -> bool {
 fn parse_field(field: &StatusField, frame: &[u8]) -> Option<StatusValue> {
     let raw = *frame.get(field.offset)?;
     Some(match &field.parser {
-        Parser::Percentage { min, max } => {
+        Parser::Percentage { min, max, invert } => {
             let span = max.saturating_sub(*min).max(1) as u32;
             let clamped = raw.clamp(*min, *max);
-            let pct = (clamped.saturating_sub(*min) as u32 * 100 / span) as u8;
+            let mut pct = (clamped.saturating_sub(*min) as u32 * 100 / span) as u8;
+            if *invert {
+                pct = 100 - pct;
+            }
             StatusValue::Percentage(pct)
         }
         Parser::Bool { true_value } => StatusValue::Bool(raw == *true_value),
@@ -387,6 +390,46 @@ mod tests {
             Some(&StatusValue::Percentage(0)),
             "raw value below min should clamp to 0%"
         );
+    }
+
+    /// An inverted Percentage parser maps raw max→0%, raw min→100%, midpoint→~50%.
+    #[test]
+    fn percentage_invert_maps_high_raw_to_low_pct() {
+        let d = parse_descriptor(
+            r#"
+            name = "Test"
+            vendor_id = 0x1038
+            product_ids = [0x0004]
+            interface = 4
+            report_id = 0x06
+            report_length = 64
+            capabilities = []
+
+            [status]
+            request = [0xb0]
+
+            [[status.fields]]
+            name = "knob"
+            match_prefix = [0x07, 0x25]
+            offset = 2
+            parser = { type = "percentage", min = 0, max = 56, invert = true }
+        "#,
+        )
+        .expect("parse");
+
+        // raw 0 (min) -> 100%, raw 56 (max) -> 0%, raw 28 (mid) -> ~50%.
+        let at = |raw: u8| {
+            let f = frame(&[0x07, 0x25], &[(2, raw)]);
+            decode_frame(&d, &f).fields.get("knob").cloned()
+        };
+        assert_eq!(at(0), Some(StatusValue::Percentage(100)), "raw 0 -> 100%");
+        assert_eq!(at(56), Some(StatusValue::Percentage(0)), "raw 56 -> 0%");
+        match at(28) {
+            Some(StatusValue::Percentage(p)) => {
+                assert!((49..=51).contains(&p), "raw 28 -> ~50%, got {p}");
+            }
+            other => panic!("expected Percentage, got {other:?}"),
+        }
     }
 
     /// An Enum field whose raw value is not in the entries list falls back to Int.

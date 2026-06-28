@@ -647,6 +647,7 @@ pub fn run_daemon() -> Result<(), EngineError> {
 
     let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
     let dial_controls_balance = cfg.dial_controls_balance;
+    let knob_controls_master = cfg.knob_controls_master;
     let mut engine = Engine::new(RealRunner, cfg);
     if let Err(e) = engine.reconcile() {
         eprintln!("warning: reconcile on start failed: {e}");
@@ -717,15 +718,21 @@ pub fn run_daemon() -> Result<(), EngineError> {
         .name("dial-balance".into())
         .spawn(move || {
             let mut last_mix: Option<(i64, i64)> = None;
+            let mut last_station: Option<i64> = None;
             while !stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
-                // Read BOTH media_mix (game level) and chat_mix from shared device state.
-                let mix_opt: Option<(i64, i64)> = {
+                // Read media_mix (game level), chat_mix, and the base-station volume
+                // KNOB (station_volume) from shared device state in one lock take.
+                let (mix_opt, station_opt): (Option<(i64, i64)>, Option<i64>) = {
                     if let Ok(g) = device_shared_for_dial.lock() {
                         let media = g.fields.get("media_mix").and_then(|s| s.parse::<i64>().ok());
                         let chat = g.fields.get("chat_mix").and_then(|s| s.parse::<i64>().ok());
-                        media.zip(chat)
+                        let station = g
+                            .fields
+                            .get("station_volume")
+                            .and_then(|s| s.parse::<i64>().ok());
+                        (media.zip(chat), station)
                     } else {
-                        None
+                        (None, None)
                     }
                 };
 
@@ -739,6 +746,20 @@ pub fn run_daemon() -> Result<(), EngineError> {
                             dial_controls_balance,
                         ) {
                             eprintln!("daemon: dial-balance apply error (ignoring): {e}");
+                        }
+                    }
+                }
+
+                // Mirror the hardware volume knob into the app master (read-only).
+                if let Some(station) = station_opt {
+                    if let Ok(mut eng) = engine_for_dial.lock() {
+                        if let Err(e) = crate::dial::apply_knob_master(
+                            &mut *eng,
+                            station,
+                            &mut last_station,
+                            knob_controls_master,
+                        ) {
+                            eprintln!("daemon: knob-master apply error (ignoring): {e}");
                         }
                     }
                 }
@@ -903,6 +924,7 @@ mod tests {
             ],
             eq_presets: vec![],
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 

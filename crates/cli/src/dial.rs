@@ -61,6 +61,44 @@ pub fn apply_dial_balance<R: CommandRunner>(
     Ok(true)
 }
 
+/// Mirror the hardware base-station volume KNOB position into the engine's master
+/// volume VALUE (read-only).
+///
+/// The knob reports its position via the `station_volume` HID field on an inverted
+/// percentage scale (already inverted by the codec, so `station` is a 0..=100 %).
+/// Only applied when:
+/// - `knob_controls_master` is true in the config
+/// - `station` differs from `last_station` (avoids thrash on every poll tick)
+///
+/// On change, calls `engine.apply_hardware_master_volume(station as u8)`, which
+/// updates `master_volume_pct` in memory and emits `MasterVolumeSet` — WITHOUT
+/// applying any software gain (no wpctl) and WITHOUT persisting to disk. The knob
+/// is the hardware gain; this is a pure value mirror.
+///
+/// Returns `Ok(true)` when the value was applied, `Ok(false)` when skipped (no
+/// change or flag off).
+pub fn apply_knob_master<R: CommandRunner>(
+    engine: &mut Engine<R>,
+    station: i64,
+    last_station: &mut Option<i64>,
+    knob_controls_master: bool,
+) -> Result<bool, EngineError> {
+    if !knob_controls_master {
+        return Ok(false);
+    }
+
+    // Skip if the reading hasn't changed (avoids thrash on every poll tick).
+    if *last_station == Some(station) {
+        return Ok(false);
+    }
+
+    let clamped = station.clamp(0, 100) as u8;
+    engine.apply_hardware_master_volume(clamped)?;
+
+    *last_station = Some(station);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +195,62 @@ mod tests {
         assert!(result.is_ok(), "no-op must not error");
         assert!(!result.unwrap(), "no-op must return false");
         assert_eq!(last, Some((60, 80)), "last must remain unchanged on no-op");
+    }
+
+    /// A knob change (from None) → master is mirrored; no wpctl call (no software gain).
+    #[test]
+    fn apply_knob_master_mirrors_on_change_no_wpctl() {
+        let cfg = make_config_with_game_chat();
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+        let mut last: Option<i64> = None;
+
+        let result = apply_knob_master(&mut engine, 73, &mut last, true);
+        assert!(result.is_ok(), "apply must not error: {result:?}");
+        assert!(result.unwrap(), "apply must return true when value changed");
+        assert_eq!(last, Some(73), "last_station must be updated");
+        assert_eq!(
+            engine.state().master_volume_pct,
+            73,
+            "master_volume_pct must mirror the knob value"
+        );
+        // No wpctl: the knob is the hardware gain, not a software gain.
+        assert!(
+            !engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.first().map(|s| s.as_str()) == Some("wpctl")),
+            "apply_knob_master must not call wpctl"
+        );
+    }
+
+    /// When knob_controls_master is false, nothing is applied and last is untouched.
+    #[test]
+    fn apply_knob_master_skips_when_flag_off() {
+        let cfg = make_config_with_game_chat();
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+        let mut last: Option<i64> = None;
+
+        let result = apply_knob_master(&mut engine, 73, &mut last, false);
+        assert!(result.is_ok(), "apply must not error when flag off");
+        assert!(!result.unwrap(), "apply must return false when flag off");
+        assert_eq!(last, None, "last must not be updated when flag off");
+    }
+
+    /// The same reading twice is a no-op the second time.
+    #[test]
+    fn apply_knob_master_no_op_on_same_reading() {
+        let cfg = make_config_with_game_chat();
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+        let mut last: Option<i64> = None;
+
+        let _ = apply_knob_master(&mut engine, 40, &mut last, true);
+        assert_eq!(last, Some(40));
+
+        let result = apply_knob_master(&mut engine, 40, &mut last, true);
+        assert!(result.is_ok(), "no-op must not error");
+        assert!(!result.unwrap(), "no-op must return false");
+        assert_eq!(last, Some(40), "last must remain unchanged on no-op");
     }
 
     /// Serialize tests that mutate ASM_CONFIG_HOME to avoid parallel env-var races.

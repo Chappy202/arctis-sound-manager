@@ -396,6 +396,13 @@ pub struct Config {
     /// Old configs without this field default to true (back-compat).
     #[serde(default = "default_true")]
     pub dial_controls_balance: bool,
+    /// Global flag: when true (the default), the physical base-station volume KNOB
+    /// (read via the HID `station_volume` frame) mirrors its position into the app's
+    /// master volume VALUE. This is a read-only mirror — the knob is the hardware gain,
+    /// so no extra software gain is applied. Set to false to ignore the hardware knob.
+    /// Old configs without this field default to true (back-compat).
+    #[serde(default = "default_true")]
+    pub knob_controls_master: bool,
 }
 
 impl Config {
@@ -462,6 +469,7 @@ impl Config {
             }],
             eq_presets: Vec::new(),
             dial_controls_balance: true,
+            knob_controls_master: true,
         }
     }
 
@@ -1471,6 +1479,56 @@ description = "Chat"
         assert!(
             cfg.dial_controls_balance,
             "old config without dial_controls_balance must default to true"
+        );
+    }
+
+    /// default_config() has knob_controls_master = true.
+    #[test]
+    fn knob_controls_master_defaults_to_true_in_default_config() {
+        let cfg = Config::default_config();
+        assert!(
+            cfg.knob_controls_master,
+            "knob_controls_master must default to true in default_config()"
+        );
+    }
+
+    /// Old TOML without knob_controls_master deserializes to true (back-compat).
+    #[test]
+    fn old_config_without_knob_controls_master_deserializes_to_true() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[[profiles.channels]]
+id = "chat"
+node_name = "Arctis_Chat"
+description = "Chat"
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("old config must deserialize");
+        assert!(
+            cfg.knob_controls_master,
+            "old config without knob_controls_master must default to true"
+        );
+    }
+
+    /// Explicit knob_controls_master = false round-trips via TOML.
+    #[test]
+    fn knob_controls_master_false_round_trips() {
+        let mut cfg = Config::default_config();
+        cfg.knob_controls_master = false;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert!(
+            !deserialized.knob_controls_master,
+            "knob_controls_master=false must survive TOML round-trip"
         );
     }
 
