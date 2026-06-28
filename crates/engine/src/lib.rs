@@ -7,6 +7,7 @@ pub mod convert;
 pub mod device;
 pub mod engine;
 pub mod error;
+pub mod presets;
 pub mod state;
 
 pub use children::ChildOwner;
