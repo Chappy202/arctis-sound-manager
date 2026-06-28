@@ -43,6 +43,19 @@ fn drain_commands<T: Transport>(
     }
 }
 
+/// Send the one-time ChatMix-enable init write on attach, IFF the opener enabled it.
+///
+/// Goes through the gated `controller.set` (no bypass); a no-op when `chatmix_enable`
+/// is not in `enabled` (the production default — HidOpener's allowlist is empty until
+/// the owner validates [0x06,0x49,0x01] and opts in). Surfaces failures via log.
+fn maybe_send_chatmix_init<T: Transport>(controller: &mut DeviceController<T>, enabled: &[String]) {
+    if enabled.iter().any(|n| n == "chatmix_enable") {
+        if let Err(e) = controller.set("chatmix_enable", 1) {
+            eprintln!("[device] chatmix-enable init on attach failed: {e}");
+        }
+    }
+}
+
 /// The read-loop: owns a controller and loops until `stop` is set.
 ///
 /// `cmd_rx` is the write-command channel; when `None`, the loop is read-only
@@ -58,7 +71,9 @@ pub fn run_read_loop<O: DeviceOpener>(
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
         match opener.open() {
-            Ok(Some((mut controller, _enabled))) => {
+            Ok(Some((mut controller, enabled))) => {
+                // One-time init on attach (no-op unless owner opts in via allowlist).
+                maybe_send_chatmix_init(&mut controller, &enabled);
                 // Read until error/disconnect, then fall back to re-open.
                 while !stop.load(Ordering::Relaxed) {
                     // Drain pending write commands before the next read.
@@ -389,6 +404,54 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("worker must not panic");
+    }
+
+    // ─────────────────────────────────────────────
+    // Task B3: maybe_send_chatmix_init helper tests
+    // ─────────────────────────────────────────────
+
+    /// Enabled → exactly one report with bytes [0x06,0x49,0x01] is sent to the transport.
+    #[test]
+    fn chatmix_init_sent_when_enabled() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
+            .with_enabled_writes(&["chatmix_enable"]);
+        maybe_send_chatmix_init(&mut c, &["chatmix_enable".to_string()]);
+        let written = &c.transport().written;
+        assert_eq!(written.len(), 1, "exactly one report must be written on attach");
+        assert_eq!(written[0][0], 0x06, "report_id must be 0x06");
+        assert_eq!(written[0][1], 0x49, "opcode must be 0x49");
+        assert_eq!(written[0][2], 0x01, "value must be 0x01 (enabled)");
+        assert!(
+            written[0][3..].iter().all(|&b| b == 0),
+            "remainder must be zero-padded"
+        );
+    }
+
+    /// Not enabled → zero bytes written (G2 core property: no init in production).
+    #[test]
+    fn chatmix_init_not_sent_when_not_enabled() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
+            .with_enabled_writes(&[]);
+        maybe_send_chatmix_init(&mut c, &[]);
+        assert!(
+            c.transport().written.is_empty(),
+            "no bytes must be written when chatmix_enable is absent from the enabled list"
+        );
+    }
+
+    /// Enabled list names chatmix_enable but controller gate is empty → nothing written,
+    /// no panic. The controller's own allowlist is the real gate; the helper's enabled
+    /// check is a fast-path skip; errors from set() are logged, not propagated.
+    #[test]
+    fn chatmix_init_controller_gate_blocks_even_if_enabled_list_set() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
+            .with_enabled_writes(&[]); // controller gate closed
+        // enabled list says yes, controller says no → set() returns Err, eprintln!, no write
+        maybe_send_chatmix_init(&mut c, &["chatmix_enable".to_string()]);
+        assert!(
+            c.transport().written.is_empty(),
+            "controller gate must block the write even when enabled list contains chatmix_enable"
+        );
     }
 
     /// send device-set for an ENABLED control → reply must be Ok(()).
