@@ -142,13 +142,12 @@ export function buildDeviceSetArgs(
   return { control, value };
 }
 
-/** Builds the arg object for set_channel_volume.
- * volume_db has no rename — Tauri v2 snake_case param names pass through as-is. */
+/** Builds the camelCase arg object for set_channel_volume. */
 export function buildSetChannelVolumeArgs(
   channel: string,
   volume_db: number,
-): { channel: string; volume_db: number } {
-  return { channel, volume_db };
+): { channel: string; volumeDb: number } {
+  return { channel, volumeDb: volume_db };
 }
 
 /** Builds the arg object for set_channel_mute. */
@@ -316,7 +315,7 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 
 /** Pin (or clear) the surround output to a specific hardware sink. */
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
-  invoke<EngineState>("surround_set_hw_sink", { hw_sink: hwSink });
+  invoke<EngineState>("surround_set_hw_sink", { hwSink });
 
 // ── F3b: Profile management commands ─────────────────────────────────────────
 
@@ -377,7 +376,7 @@ export const moveStream = (stream: string, channel: string): Promise<EngineState
 
 /** Set the master volume in dB. */
 export const setMasterVolume = (volumeDb: number): Promise<EngineState> =>
-  invoke<EngineState>("set_master_volume", { volume_db: volumeDb });
+  invoke<EngineState>("set_master_volume", { volumeDb });
 
 /** Set the master mute state. */
 export const setMasterMute = (muted: boolean): Promise<EngineState> =>
@@ -427,10 +426,10 @@ export const coexistStatus = (): Promise<CoexistReport> =>
 /**
  * Disable the legacy arctis-sound-manager RPM stack.
  * Stops and disables user services; destroys live loopback nodes.
- * Pass dry_run=true to preview without making changes.
+ * Pass dryRun=true to preview without making changes.
  */
 export const coexistDisable = (dryRun: boolean = false): Promise<CoexistDisableResult> =>
-  invoke<CoexistDisableResult>("coexist_disable", { dry_run: dryRun });
+  invoke<CoexistDisableResult>("coexist_disable", { dryRun });
 
 // ---------------------------------------------------------------------------
 // Event subscriptions

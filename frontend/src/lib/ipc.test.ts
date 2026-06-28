@@ -147,35 +147,35 @@ describe("buildDeviceSetArgs", () => {
 // buildSetChannelVolumeArgs
 // ---------------------------------------------------------------------------
 describe("buildSetChannelVolumeArgs", () => {
-  it("passes channel and volume_db through with snake_case key", () => {
+  it("maps volume_db to volumeDb (camelCase for Tauri v2)", () => {
     const args = buildSetChannelVolumeArgs("game", -6.0);
-    expect(args).toEqual({ channel: "game", volume_db: -6.0 });
+    expect(args).toEqual({ channel: "game", volumeDb: -6.0 });
   });
 
-  it("uses snake_case volume_db key (not camelCase)", () => {
+  it("uses camelCase volumeDb key (not snake_case)", () => {
     const args = buildSetChannelVolumeArgs("chat", 0.0);
-    expect(Object.keys(args)).toContain("volume_db");
-    expect(Object.keys(args)).not.toContain("volumeDb");
+    expect(Object.keys(args)).toContain("volumeDb");
+    expect(Object.keys(args)).not.toContain("volume_db");
   });
 
-  it("produces exactly two keys: channel and volume_db", () => {
+  it("produces exactly two keys: channel and volumeDb", () => {
     const args = buildSetChannelVolumeArgs("media", 6.0);
-    expect(Object.keys(args).sort()).toEqual(["channel", "volume_db"]);
+    expect(Object.keys(args).sort()).toEqual(["channel", "volumeDb"]);
   });
 
   it("accepts min boundary -60 dB", () => {
     const args = buildSetChannelVolumeArgs("game", -60.0);
-    expect(args.volume_db).toBe(-60.0);
+    expect(args.volumeDb).toBe(-60.0);
   });
 
   it("accepts max boundary +6 dB", () => {
     const args = buildSetChannelVolumeArgs("game", 6.0);
-    expect(args.volume_db).toBe(6.0);
+    expect(args.volumeDb).toBe(6.0);
   });
 
   it("accepts fractional dB values", () => {
     const args = buildSetChannelVolumeArgs("chat", -3.5);
-    expect(args.volume_db).toBeCloseTo(-3.5);
+    expect(args.volumeDb).toBeCloseTo(-3.5);
   });
 });
 
