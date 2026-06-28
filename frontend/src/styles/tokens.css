@@ -208,6 +208,7 @@
                     0 6px 8px rgba(0, 0, 0, 0.50);
   --ss-glow-accent: 0 0 0 1px var(--ss-accent-border),
                     0 0 12px rgba(255, 82, 0, 0.35);
+  --ss-scrim:       rgba(0, 0, 0, 0.6);  /* modal/dialog overlay backdrop */
 
   /* =========================================================================
    * SHAPES

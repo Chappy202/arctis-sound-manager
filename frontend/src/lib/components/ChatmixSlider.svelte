@@ -159,7 +159,6 @@
   }
 
   :global(.chatmix-slider-root[data-disabled]) {
-    opacity: 0.5;
     cursor: not-allowed;
     pointer-events: none;
   }

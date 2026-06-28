@@ -52,7 +52,7 @@
     height: 20px;
     background: var(--ss-surface-input);
     border-radius: var(--ss-radius-pill);
-    border: 1px solid var(--ss-border);
+    border: var(--ss-border-width) solid var(--ss-border);
     position: relative;
     cursor: pointer;
     padding: 0;

@@ -75,7 +75,7 @@
         >
           {busy ? "Creating…" : "Create"}
         </button>
-        <Dialog.Close class="btn-cancel">Cancel</Dialog.Close>
+        <Dialog.Close class="new-profile-cancel">Cancel</Dialog.Close>
       </div>
     </Dialog.Content>
   </Dialog.Portal>
@@ -122,7 +122,7 @@
     position: fixed;
     inset: 0;
     z-index: 400;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--ss-scrim);
   }
 
   /* ===== Dialog Content ===== */
@@ -231,7 +231,7 @@
     outline-offset: 2px;
   }
 
-  :global(.btn-cancel) {
+  :global(.new-profile-cancel) {
     height: var(--ss-control-h-sm);
     padding: 0 var(--ss-space-3);
     background: transparent;
@@ -247,12 +247,12 @@
       color var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  :global(.btn-cancel:hover) {
+  :global(.new-profile-cancel:hover) {
     background: var(--ss-surface-1);
     color: var(--ss-text-secondary);
   }
 
-  :global(.btn-cancel:focus-visible) {
+  :global(.new-profile-cancel:focus-visible) {
     outline: 2px solid var(--ss-accent);
     outline-offset: 2px;
   }

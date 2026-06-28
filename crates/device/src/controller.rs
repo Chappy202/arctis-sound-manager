@@ -39,6 +39,7 @@ impl<T: Transport> DeviceController<T> {
     /// Return a reference to the underlying transport.
     /// Available to integration tests in dependent crates (e.g. arctis-engine) so they
     /// can inspect `MockTransport::written` without a dedicated channel.
+    #[cfg(any(test, feature = "testing-utils"))]
     pub fn transport(&self) -> &T {
         &self.transport
     }
