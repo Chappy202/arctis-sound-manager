@@ -20,6 +20,7 @@
     micEqBand,
     micHwMic,
     micSuppressionBackend,
+    micPresetApply,
     type MicStageSnapshot,
   } from "../ipc.js";
   import {
@@ -31,6 +32,7 @@
     backendAvailable,
     backendTooltip,
   } from "../mic.js";
+  import { findMicPresetDescription } from "./micPresetUtils.js";
   import EqGraph from "./EqGraph.svelte";
   import BandList from "./BandList.svelte";
   import LevelMeter from "./LevelMeter.svelte";
@@ -63,10 +65,22 @@
   // Pinned hardware mic source (null = auto)
   const hwMic = $derived(mic?.hw_mic ?? null);
 
+  // Mic presets
+  const micPresets = $derived($engineState?.mic_presets ?? []);
+
   // hw_mic picker local state
   let hwMicInput = $state("");
   let settingHwMic = $state(false);
   let hwMicError = $state<string | null>(null);
+
+  // Preset picker local state
+  let selectedPreset = $state("");
+  let applyingPreset = $state(false);
+  let presetError = $state<string | null>(null);
+
+  const selectedPresetDescription = $derived(
+    findMicPresetDescription(selectedPreset, micPresets),
+  );
 
   $effect(() => {
     // Keep local input in sync when state arrives (only if not currently editing)
@@ -171,6 +185,20 @@
     if (e.key === "Enter") {
       e.preventDefault();
       onHwMicSet();
+    }
+  }
+
+  async function onPresetApply() {
+    if (!selectedPreset || applyingPreset) return;
+    applyingPreset = true;
+    presetError = null;
+    try {
+      const next = await micPresetApply(selectedPreset);
+      applyState(next);
+    } catch (e) {
+      presetError = e instanceof Error ? e.message : "Failed to apply mic preset";
+    } finally {
+      applyingPreset = false;
     }
   }
 
@@ -313,6 +341,56 @@
         </div>
       </div>
     </div>
+
+    <!-- ===== Mic preset picker ===== -->
+    {#if micPresets.length > 0}
+      <div class="device-card device-card--live">
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">◈</span>
+          <h2 class="card-title">PRESETS</h2>
+          {#if selectedPreset}
+            <span class="pill pill--live">PRESET SELECTED</span>
+          {:else}
+            <span class="pill pill--coming">NONE</span>
+          {/if}
+        </div>
+        <div class="card-body">
+          <div class="control-row">
+            <span class="field-label">PRESET</span>
+            <div class="select-group">
+              <select
+                class="ss-select preset-select"
+                value={selectedPreset}
+                onchange={(e) => { selectedPreset = (e.target as HTMLSelectElement).value; }}
+                disabled={applyingPreset}
+                aria-label="Select mic preset"
+              >
+                <option value="">— choose a preset —</option>
+                {#each micPresets as p (p.name)}
+                  <option value={p.name}>{p.name}</option>
+                {/each}
+              </select>
+              <button
+                class="preset-apply-btn"
+                disabled={!selectedPreset || applyingPreset}
+                onclick={onPresetApply}
+                aria-label="Apply selected mic preset"
+              >
+                {applyingPreset ? "…" : "Apply"}
+              </button>
+            </div>
+          </div>
+          {#if selectedPresetDescription}
+            <div class="field-row preset-desc-row">
+              <span class="field-label--hint">{selectedPresetDescription}</span>
+            </div>
+          {/if}
+          {#if presetError}
+            <div class="preset-error" role="alert">{presetError}</div>
+          {/if}
+        </div>
+      </div>
+    {/if}
 
     <!-- Stage cards — dimmed when master is off -->
     <div class="controls-layout" class:controls-layout--dimmed={!masterEnabled} inert={!masterEnabled || undefined}>
@@ -1294,5 +1372,57 @@
 
   .band-list-wrap {
     padding: var(--ss-space-2) 0;
+  }
+
+  /* ===== Preset picker ===== */
+  .preset-select {
+    flex: 1;
+    min-width: 160px;
+  }
+
+  .preset-apply-btn {
+    height: var(--ss-field-h);
+    padding: 0 var(--ss-space-4);
+    background: var(--ss-gradient-primary);
+    border: none;
+    border-radius: var(--ss-radius-sm);
+    color: var(--ss-text-bright);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-button-size);
+    font-weight: var(--ss-type-button-weight);
+    letter-spacing: var(--ss-type-button-letter-spacing);
+    text-transform: uppercase;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .preset-apply-btn:hover:not(:disabled) {
+    filter: brightness(1.1);
+  }
+
+  .preset-apply-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .preset-apply-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  .preset-desc-row {
+    border-top: var(--ss-border-width) solid var(--ss-border);
+  }
+
+  .preset-error {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-danger);
+    margin: 0;
+    padding: var(--ss-space-2) var(--ss-space-4);
+    background: var(--ss-danger-soft);
+    border-top: var(--ss-border-width) solid rgba(229, 72, 77, 0.3);
   }
 </style>
