@@ -1,7 +1,7 @@
 use crate::error::CommandError;
 use crate::state::DaemonState;
 use arctis_client::{send_request_to, Request};
-use arctis_engine::{AppStream, EngineState};
+use arctis_engine::{AppStream, EngineState, OutputDeviceSnapshot};
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -60,6 +60,24 @@ async fn call_streams(
         .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
     if resp.ok {
         Ok(resp.streams.unwrap_or_default())
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
+}
+
+/// Variant of `call` for ListOutputs (returns the `output_devices` payload).
+async fn call_outputs(
+    state: &State<'_, Mutex<DaemonState>>,
+    req: Request,
+) -> Result<Vec<OutputDeviceSnapshot>, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || send_request_to(&socket, &req))
+        .await
+        .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        Ok(resp.output_devices.unwrap_or_default())
     } else {
         Err(CommandError::Daemon(
             resp.error.unwrap_or_else(|| "unknown daemon error".into()),
@@ -376,6 +394,13 @@ pub async fn list_streams(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<Vec<AppStream>, CommandError> {
     call_streams(&state, Request::ListStreams).await
+}
+
+#[tauri::command]
+pub async fn list_outputs(
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<Vec<OutputDeviceSnapshot>, CommandError> {
+    call_outputs(&state, Request::ListOutputs).await
 }
 
 #[tauri::command]

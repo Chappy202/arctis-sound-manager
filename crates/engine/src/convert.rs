@@ -498,6 +498,16 @@ pub fn surround_spec(cfg: &SurroundConfig) -> SurroundSpec {
     }
 }
 
+/// For each channel whose output_device is None, set it to `default_device`.
+/// Channels with an explicit output_device are left untouched.
+pub fn overlay_default_output(channels: &mut [arctis_config::ChannelConfig], default_device: &str) {
+    for ch in channels.iter_mut() {
+        if ch.output_device.is_none() {
+            ch.output_device = Some(default_device.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1013,43 @@ mod tests {
         assert_eq!(spec.capture_node_name, "arctis_clean_mic.capture");
         assert_eq!(spec.capture_target, Some("alsa_input.hw_mic".to_string()));
         assert_eq!(spec.playback_node_name, "arctis_clean_mic");
+    }
+
+    #[test]
+    fn overlay_default_output_sets_none_leaves_explicit() {
+        let mut channels = vec![
+            arctis_config::ChannelConfig {
+                id: "game".to_string(),
+                node_name: "Arctis_Game".to_string(),
+                description: "Game".to_string(),
+                output_device: None,
+                eq: vec![],
+                volume_db: 0.0,
+                muted: false,
+            },
+            arctis_config::ChannelConfig {
+                id: "chat".to_string(),
+                node_name: "Arctis_Chat".to_string(),
+                description: "Chat".to_string(),
+                output_device: Some("speakers".to_string()),
+                eq: vec![],
+                volume_db: 0.0,
+                muted: false,
+            },
+        ];
+        overlay_default_output(
+            &mut channels,
+            "alsa_output.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.analog-stereo",
+        );
+        assert_eq!(
+            channels[0].output_device.as_deref(),
+            Some("alsa_output.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.analog-stereo"),
+            "None channel should be set to headset"
+        );
+        assert_eq!(
+            channels[1].output_device.as_deref(),
+            Some("speakers"),
+            "explicit channel must remain unchanged"
+        );
     }
 }

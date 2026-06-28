@@ -25,6 +25,18 @@
     "info": { "props": {
       "media.class": "Stream/Input/Audio",
       "application.name": "OBS", "application.process.binary": "obs" } } },
+  { "id": 73, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Stream/Output/Audio",
+      "node.link-group": "filter-chain-99-8",
+      "node.group": "filter-chain-99-8",
+      "node.name": "Arctis_Game.output" } } },
+  { "id": 74, "type": "PipeWire:Interface:Node",
+    "info": { "props": {
+      "media.class": "Stream/Output/Audio",
+      "node.link-group": "filter-chain-99-9",
+      "node.group": "filter-chain-99-9",
+      "node.name": "Arctis_Chat.output" } } },
   { "id": 900, "type": "PipeWire:Interface:Link",
     "info": { "output-node-id": 70, "input-node-id": 40 } },
   { "id": 901, "type": "PipeWire:Interface:Link",

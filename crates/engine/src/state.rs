@@ -189,6 +189,14 @@ pub struct ChannelSnapshot {
     pub muted: bool,
 }
 
+/// One real audio output device discovered via `pw-dump`, for the per-channel output selector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutputDeviceSnapshot {
+    pub node_name: String,
+    pub description: String,
+    pub is_default: bool,
+}
+
 /// One running application audio stream, resolved to a channel id, for the UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppStream {

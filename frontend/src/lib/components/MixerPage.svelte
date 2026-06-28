@@ -4,6 +4,7 @@
   import ChannelStrip from "./ChannelStrip.svelte";
   import RouteList from "./RouteList.svelte";
   import { streamsStore, initStreams, destroyStreams } from "../stores/streams.js";
+  import { outputsStore, initOutputs, destroyOutputs } from "../stores/outputs.js";
   import { groupStreamsByChannel } from "../streams.js";
   import MasterStrip from "./MasterStrip.svelte";
   import MicStrip from "./MicStrip.svelte";
@@ -15,7 +16,14 @@
     init();
   });
 
-  $effect(() => { initStreams(); return () => destroyStreams(); });
+  $effect(() => {
+    initStreams();
+    initOutputs();
+    return () => {
+      destroyStreams();
+      destroyOutputs();
+    };
+  });
 
   let grouped = $derived(
     groupStreamsByChannel(
@@ -170,6 +178,7 @@
               <ChannelStrip
                 {channel}
                 streams={grouped.byChannel[channel.id] ?? []}
+                outputDevices={$outputsStore}
                 onDropStream={handleDropStream}
                 onOutputChanged={() => {
                   // State will be refreshed via state-changed event.
@@ -178,6 +187,7 @@
                 onRemove={$engineState.channels.length > 1 && !removeBusy
                   ? () => handleRemoveChannel(channel.id)
                   : undefined}
+                onError={(m) => (dropError = m)}
               />
             </div>
           {/each}

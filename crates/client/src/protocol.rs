@@ -192,6 +192,8 @@ pub enum Request {
     },
     /// List running application output streams resolved to channel ids.
     ListStreams,
+    /// List real output devices (physical sinks) for the per-channel output selector.
+    ListOutputs,
     /// Move a running stream to a channel (live + persistent). `stream` is a
     /// node id or a binary; `channel` is a channel id.
     MoveStream {
@@ -221,6 +223,9 @@ pub struct Response {
     /// Stream list payload. Populated only for ListStreams responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streams: Option<Vec<arctis_engine::AppStream>>,
+    /// Output device list payload. Populated only for ListOutputs responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_devices: Option<Vec<arctis_engine::OutputDeviceSnapshot>>,
     /// Coexistence status report. Populated only for CoexistStatus responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coexist_report: Option<CoexistReport>,
@@ -237,6 +242,7 @@ impl Response {
             error: None,
             text: None,
             streams: None,
+            output_devices: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -249,6 +255,7 @@ impl Response {
             error: None,
             text: Some(text),
             streams: None,
+            output_devices: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -261,6 +268,7 @@ impl Response {
             error: Some(msg),
             text: None,
             streams: None,
+            output_devices: None,
             coexist_report: None,
             coexist_result: None,
         }
@@ -273,6 +281,7 @@ impl Response {
             error: None,
             text: None,
             streams: None,
+            output_devices: None,
             coexist_report: Some(report),
             coexist_result: None,
         }
@@ -285,6 +294,7 @@ impl Response {
             error: None,
             text: None,
             streams: None,
+            output_devices: None,
             coexist_report: None,
             coexist_result: Some(result),
         }
@@ -297,6 +307,20 @@ impl Response {
             error: None,
             text: None,
             streams: Some(streams),
+            output_devices: None,
+            coexist_report: None,
+            coexist_result: None,
+        }
+    }
+
+    pub fn ok_with_outputs(devices: Vec<arctis_engine::OutputDeviceSnapshot>) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: None,
+            streams: None,
+            output_devices: Some(devices),
             coexist_report: None,
             coexist_result: None,
         }
@@ -374,6 +398,7 @@ mod tests {
             error: None,
             text: None,
             streams: None,
+            output_devices: None,
             coexist_report: None,
             coexist_result: None,
         };
@@ -1299,6 +1324,23 @@ mod tests {
         let back: Response = serde_json::from_str(&json).unwrap();
         assert!(back.ok);
         assert!(back.streams.is_some());
+    }
+
+    // ── Task 3: ListOutputs wire-tag + round-trip tests ────────────────────────
+
+    #[test]
+    fn parse_list_outputs_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"list-outputs"}"#).unwrap();
+        assert_eq!(req, Request::ListOutputs);
+    }
+
+    #[test]
+    fn response_ok_with_outputs_round_trips() {
+        let resp = Response::ok_with_outputs(vec![]);
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert!(back.output_devices.is_some());
     }
 
     #[test]

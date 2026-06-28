@@ -24,6 +24,13 @@ export interface AppStream {
   routed: boolean;
 }
 
+/** Mirror of crates/engine/src/commands.rs OutputDeviceSnapshot. */
+export interface OutputDeviceSnapshot {
+  node_name: string;
+  description: string;
+  is_default: boolean;
+}
+
 export interface EqBandSnapshot {
   kind: string;
   freq_hz: number;
@@ -360,6 +367,9 @@ export const channelRemove = (id: string): Promise<EngineState> =>
 
 /** List all active PipeWire app streams. */
 export const listStreams = (): Promise<AppStream[]> => invoke<AppStream[]>("list_streams");
+
+/** List all available PipeWire output devices (sinks). */
+export const listOutputs = (): Promise<OutputDeviceSnapshot[]> => invoke<OutputDeviceSnapshot[]>("list_outputs");
 
 /** Move an app stream to a channel (or null to unroute). */
 export const moveStream = (stream: string, channel: string): Promise<EngineState> =>

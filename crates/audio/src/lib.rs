@@ -11,6 +11,7 @@ pub mod props;
 pub mod pw_version;
 pub mod routing;
 pub mod runner;
+pub mod sinks;
 pub mod streams;
 pub mod surround;
 
@@ -40,5 +41,6 @@ pub use routing::{
     wireplumber_fragment_path, AppMatch, RouteRule, Router,
 };
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
+pub use sinks::{parse_default_sink_name, parse_output_sinks, OutputSink};
 pub use streams::{parse_app_streams, ParsedStream};
 pub use surround::{render_surround_conf, SurroundBackend, SurroundSpec};

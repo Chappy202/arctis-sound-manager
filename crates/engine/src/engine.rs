@@ -683,6 +683,54 @@ impl<R: CommandRunner> Engine<R> {
             .collect())
     }
 
+    /// Discover real output devices (physical sinks) via `pw-metadata 0` + `pw-dump`.
+    ///
+    /// Returns a best-effort `Vec` for the UI output selector: on any subprocess
+    /// failure an empty `Vec` is returned.  Never panics; never returns `Err`.
+    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+        // Step 1: get default sink name from pw-metadata 0.
+        let default_sink = match self.runner.run("pw-metadata", &["0"]) {
+            Ok(out) if out.status == 0 => arctis_audio::parse_default_sink_name(&out.stdout),
+            _ => None,
+        };
+
+        // Step 2: run pw-dump to enumerate all nodes.
+        let out = match self.runner.run("pw-dump", &[]) {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+        if out.status != 0 {
+            return Vec::new();
+        }
+
+        // Step 3: parse and map OutputSink → OutputDeviceSnapshot.
+        match arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref()) {
+            Ok(sinks) => sinks
+                .into_iter()
+                .map(|s| crate::state::OutputDeviceSnapshot {
+                    node_name: s.node_name,
+                    description: s.description,
+                    is_default: s.is_default,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Detect the headset hardware sink by scanning `list_output_devices()` for a
+    /// node_name that contains "steelseries" or "arctis" (case-insensitive).
+    /// Returns `None` if no hardware headset sink is found or on any subprocess
+    /// failure. Never panics.
+    pub fn detect_headset_sink(&mut self) -> Option<String> {
+        self.list_output_devices()
+            .into_iter()
+            .find(|d| {
+                let lower = d.node_name.to_lowercase();
+                lower.contains("steelseries") || lower.contains("arctis")
+            })
+            .map(|d| d.node_name)
+    }
+
     /// Route a running stream to a channel: resolve channel id → sink node.name,
     /// live-move the specific stream (by node id) via pw-metadata, and persist a
     /// binary→sink rule so it sticks next launch. `stream` may be a node id or a
@@ -1333,7 +1381,10 @@ impl<R: CommandRunner> Engine<R> {
     ///
     /// Reuses ChannelManager/Router/AudioBackend — does NOT reimplement.
     pub fn reconcile(&mut self) -> Result<(), EngineError> {
-        let profile = self.config.active()?.clone();
+        let mut profile = self.config.active()?.clone();
+        if let Some(headset) = self.detect_headset_sink() {
+            convert::overlay_default_output(&mut profile.channels, &headset);
+        }
         let channel_set = convert::channel_set_from_profile(&profile);
         let route_rules = convert::route_rules_from_profile(&profile);
 
@@ -2351,21 +2402,23 @@ mod tests {
         let ls = ls_all_present(); // includes Arctis_Game/Chat/Media/Aux
 
         // Queue outputs (interleaved per channel):
+        // detect_headset_sink: 2 calls (pw-metadata 0 + pw-dump)
         // Phase 1 (channels up): 4 × 1 ls-Node
         // Per channel (4 channels): (1 ls + 10 bands) + (1 ls + 1 Props) = 13 × 4 = 52
         // Phase 5: 1 ls (mic disabled)
         // Phase 6: 1 ls (surround disabled)
-        // Total: 4 + 52 + 1 + 1 = 58
+        // Total: 2 + 4 + 52 + 1 + 1 = 60
         let runner = MockRunner::new()
-            // Phase 1: channel up — game[0], chat[1], media[2], aux[3] (all present)
-            .with_output(0, &ls, "") // [0] game
-            .with_output(0, &ls, "") // [1] chat
-            .with_output(0, &ls, "") // [2] media
-            .with_output(0, &ls, "") // [3] aux
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            .with_output(0, "", "")  // [0] detect: pw-metadata 0
+            .with_output(0, "[]", "") // [1] detect: pw-dump []
+            // Phase 1: channel up — game[2], chat[3], media[4], aux[5] (all present)
+            .with_output(0, &ls, "") // [2] game
+            .with_output(0, &ls, "") // [3] chat
+            .with_output(0, &ls, "") // [4] media
+            .with_output(0, &ls, "") // [5] aux
             // game: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [4] game EQ ls
-            .with_output(0, "", "") // [5]
-            .with_output(0, "", "") // [6]
+            .with_output(0, &ls, "") // [6] game EQ ls
             .with_output(0, "", "") // [7]
             .with_output(0, "", "") // [8]
             .with_output(0, "", "") // [9]
@@ -2373,13 +2426,13 @@ mod tests {
             .with_output(0, "", "") // [11]
             .with_output(0, "", "") // [12]
             .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14] game 10 band sets
-            .with_output(0, &ls, "") // [15] game vol find_node_id
-            .with_output(0, "", "") // [16] game vol Props set
+            .with_output(0, "", "") // [14]
+            .with_output(0, "", "") // [15]
+            .with_output(0, "", "") // [16] game 10 band sets
+            .with_output(0, &ls, "") // [17] game vol find_node_id
+            .with_output(0, "", "") // [18] game vol Props set
             // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [17] chat EQ ls
-            .with_output(0, "", "") // [18]
-            .with_output(0, "", "") // [19]
+            .with_output(0, &ls, "") // [19] chat EQ ls
             .with_output(0, "", "") // [20]
             .with_output(0, "", "") // [21]
             .with_output(0, "", "") // [22]
@@ -2387,13 +2440,13 @@ mod tests {
             .with_output(0, "", "") // [24]
             .with_output(0, "", "") // [25]
             .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27] chat 10 band sets
-            .with_output(0, &ls, "") // [28] chat vol find_node_id
-            .with_output(0, "", "") // [29] chat vol Props set
+            .with_output(0, "", "") // [27]
+            .with_output(0, "", "") // [28]
+            .with_output(0, "", "") // [29] chat 10 band sets
+            .with_output(0, &ls, "") // [30] chat vol find_node_id
+            .with_output(0, "", "") // [31] chat vol Props set
             // media: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [30] media EQ ls
-            .with_output(0, "", "") // [31]
-            .with_output(0, "", "") // [32]
+            .with_output(0, &ls, "") // [32] media EQ ls
             .with_output(0, "", "") // [33]
             .with_output(0, "", "") // [34]
             .with_output(0, "", "") // [35]
@@ -2401,13 +2454,13 @@ mod tests {
             .with_output(0, "", "") // [37]
             .with_output(0, "", "") // [38]
             .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40] media 10 band sets
-            .with_output(0, &ls, "") // [41] media vol find_node_id
-            .with_output(0, "", "") // [42] media vol Props set
+            .with_output(0, "", "") // [40]
+            .with_output(0, "", "") // [41]
+            .with_output(0, "", "") // [42] media 10 band sets
+            .with_output(0, &ls, "") // [43] media vol find_node_id
+            .with_output(0, "", "") // [44] media vol Props set
             // aux: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [43] aux EQ ls
-            .with_output(0, "", "") // [44]
-            .with_output(0, "", "") // [45]
+            .with_output(0, &ls, "") // [45] aux EQ ls
             .with_output(0, "", "") // [46]
             .with_output(0, "", "") // [47]
             .with_output(0, "", "") // [48]
@@ -2415,13 +2468,15 @@ mod tests {
             .with_output(0, "", "") // [50]
             .with_output(0, "", "") // [51]
             .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53] aux 10 band sets
-            .with_output(0, &ls, "") // [54] aux vol find_node_id
-            .with_output(0, "", "") // [55] aux vol Props set
+            .with_output(0, "", "") // [53]
+            .with_output(0, "", "") // [54]
+            .with_output(0, "", "") // [55] aux 10 band sets
+            .with_output(0, &ls, "") // [56] aux vol find_node_id
+            .with_output(0, "", "") // [57] aux vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "") // [56]
+            .with_output(0, &ls, "") // [58]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls, ""); // [57]
+            .with_output(0, &ls, ""); // [59]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -2432,72 +2487,72 @@ mod tests {
         let calls = &engine.runner.calls;
 
         // Phase 1: 4 ls-Node calls for channel creation (all present, no spawns)
-        assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"], "game up ls");
-        assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
-        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
-        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "aux up ls");
+        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "game up ls");
+        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "chat up ls");
+        assert_eq!(calls[4], vec!["pw-cli", "ls", "Node"], "media up ls");
+        assert_eq!(calls[5], vec!["pw-cli", "ls", "Node"], "aux up ls");
 
         // Phase 2: apply_all game — ls Node then 10 pw-cli s Props calls
         assert_eq!(
-            calls[4],
+            calls[6],
             vec!["pw-cli", "ls", "Node"],
             "game eq find_node_id"
         );
-        assert_eq!(calls[5][0], "pw-cli", "game band 0 set");
-        assert_eq!(calls[5][1], "s");
-        assert_eq!(calls[5][3], "Props");
+        assert_eq!(calls[7][0], "pw-cli", "game band 0 set");
+        assert_eq!(calls[7][1], "s");
+        assert_eq!(calls[7][3], "Props");
 
-        // Phase 2b: apply_volume_mute game — index 15
+        // Phase 2b: apply_volume_mute game — index 17
         assert_eq!(
-            calls[15],
+            calls[17],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat: EQ starts at index 17
+        // Phase 2 chat: EQ starts at index 19
         assert_eq!(
-            calls[17],
+            calls[19],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat: volume starts at index 28
+        // Phase 2b chat: volume starts at index 30
         assert_eq!(
-            calls[28],
+            calls[30],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media: EQ starts at index 30
+        // Phase 2 media: EQ starts at index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media: volume starts at index 41
+        // Phase 2b media: volume starts at index 43
         assert_eq!(
-            calls[41],
+            calls[43],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux: EQ starts at index 43
+        // Phase 2 aux: EQ starts at index 45
         assert_eq!(
-            calls[43],
+            calls[45],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux: volume starts at index 54
+        // Phase 2b aux: volume starts at index 56
         assert_eq!(
-            calls[54],
+            calls[56],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 4 (up) + 4*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 58
-        assert_eq!(calls.len(), 58, "expected 58 total pw-cli calls");
+        // Total: 2 (detect) + 4 (up) + 4*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 60
+        assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
 
         // No spawned processes (sinks already present, including aux)
         assert!(
@@ -2517,15 +2572,16 @@ mod tests {
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            .with_output(0, "", "")  // [0] detect: pw-metadata 0
+            .with_output(0, "[]", "") // [1] detect: pw-dump []
             // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
-            .with_output(0, &ls_absent, "") // [0] game ls (absent)
-            .with_output(0, &ls_absent, "") // [1] chat ls (absent)
-            .with_output(0, &ls_absent, "") // [2] media ls (absent)
-            .with_output(0, &ls_absent, "") // [3] aux ls (absent, seeded by Engine::new)
+            .with_output(0, &ls_absent, "") // [2] game ls (absent)
+            .with_output(0, &ls_absent, "") // [3] chat ls (absent)
+            .with_output(0, &ls_absent, "") // [4] media ls (absent)
+            .with_output(0, &ls_absent, "") // [5] aux ls (absent, seeded by Engine::new)
             // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [4] game EQ find_node_id
-            .with_output(0, "", "") // [5]
-            .with_output(0, "", "") // [6]
+            .with_output(0, &ls_present, "") // [6] game EQ find_node_id
             .with_output(0, "", "") // [7]
             .with_output(0, "", "") // [8]
             .with_output(0, "", "") // [9]
@@ -2533,13 +2589,13 @@ mod tests {
             .with_output(0, "", "") // [11]
             .with_output(0, "", "") // [12]
             .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14] game 10 band sets
-            .with_output(0, &ls_present, "") // [15] game vol find_node_id
-            .with_output(0, "", "") // [16] game vol Props set
+            .with_output(0, "", "") // [14]
+            .with_output(0, "", "") // [15]
+            .with_output(0, "", "") // [16] game 10 band sets
+            .with_output(0, &ls_present, "") // [17] game vol find_node_id
+            .with_output(0, "", "") // [18] game vol Props set
             // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [17] chat EQ find_node_id
-            .with_output(0, "", "") // [18]
-            .with_output(0, "", "") // [19]
+            .with_output(0, &ls_present, "") // [19] chat EQ find_node_id
             .with_output(0, "", "") // [20]
             .with_output(0, "", "") // [21]
             .with_output(0, "", "") // [22]
@@ -2547,13 +2603,13 @@ mod tests {
             .with_output(0, "", "") // [24]
             .with_output(0, "", "") // [25]
             .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27] chat 10 band sets
-            .with_output(0, &ls_present, "") // [28] chat vol find_node_id
-            .with_output(0, "", "") // [29] chat vol Props set
+            .with_output(0, "", "") // [27]
+            .with_output(0, "", "") // [28]
+            .with_output(0, "", "") // [29] chat 10 band sets
+            .with_output(0, &ls_present, "") // [30] chat vol find_node_id
+            .with_output(0, "", "") // [31] chat vol Props set
             // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [30] media EQ find_node_id
-            .with_output(0, "", "") // [31]
-            .with_output(0, "", "") // [32]
+            .with_output(0, &ls_present, "") // [32] media EQ find_node_id
             .with_output(0, "", "") // [33]
             .with_output(0, "", "") // [34]
             .with_output(0, "", "") // [35]
@@ -2561,13 +2617,13 @@ mod tests {
             .with_output(0, "", "") // [37]
             .with_output(0, "", "") // [38]
             .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40] media 10 band sets
-            .with_output(0, &ls_present, "") // [41] media vol find_node_id
-            .with_output(0, "", "") // [42] media vol Props set
+            .with_output(0, "", "") // [40]
+            .with_output(0, "", "") // [41]
+            .with_output(0, "", "") // [42] media 10 band sets
+            .with_output(0, &ls_present, "") // [43] media vol find_node_id
+            .with_output(0, "", "") // [44] media vol Props set
             // aux: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [43] aux EQ find_node_id
-            .with_output(0, "", "") // [44]
-            .with_output(0, "", "") // [45]
+            .with_output(0, &ls_present, "") // [45] aux EQ find_node_id
             .with_output(0, "", "") // [46]
             .with_output(0, "", "") // [47]
             .with_output(0, "", "") // [48]
@@ -2575,13 +2631,15 @@ mod tests {
             .with_output(0, "", "") // [50]
             .with_output(0, "", "") // [51]
             .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53] aux 10 band sets
-            .with_output(0, &ls_present, "") // [54] aux vol find_node_id
-            .with_output(0, "", "") // [55] aux vol Props set
+            .with_output(0, "", "") // [53]
+            .with_output(0, "", "") // [54]
+            .with_output(0, "", "") // [55] aux 10 band sets
+            .with_output(0, &ls_present, "") // [56] aux vol find_node_id
+            .with_output(0, "", "") // [57] aux vol Props set
             // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "") // [56]
+            .with_output(0, &ls_absent, "") // [58]
             // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls_absent, ""); // [57]
+            .with_output(0, &ls_absent, ""); // [59]
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -2592,75 +2650,75 @@ mod tests {
         let calls = &engine.runner.calls;
 
         // Phase 1: only the 4 ls-Node existence checks (spawn_owned goes to `spawned`)
-        assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"], "game up ls");
-        assert_eq!(calls[1], vec!["pw-cli", "ls", "Node"], "chat up ls");
-        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "media up ls");
-        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "aux up ls");
+        assert_eq!(calls[2], vec!["pw-cli", "ls", "Node"], "game up ls");
+        assert_eq!(calls[3], vec!["pw-cli", "ls", "Node"], "chat up ls");
+        assert_eq!(calls[4], vec!["pw-cli", "ls", "Node"], "media up ls");
+        assert_eq!(calls[5], vec!["pw-cli", "ls", "Node"], "aux up ls");
 
-        // Phase 2: apply game EQ starts at index 4 (right after phase1 ls calls)
+        // Phase 2: apply game EQ starts at index 6 (right after detect[0,1] + phase1 ls calls[2-5])
         assert_eq!(
-            calls[4],
+            calls[6],
             vec!["pw-cli", "ls", "Node"],
             "game eq find_node_id"
         );
-        assert_eq!(calls[5][0], "pw-cli", "game band 0 program");
-        assert_eq!(calls[5][1], "s", "game band 0 sub-cmd");
-        assert_eq!(calls[5][3], "Props", "game band 0 Props");
+        assert_eq!(calls[7][0], "pw-cli", "game band 0 program");
+        assert_eq!(calls[7][1], "s", "game band 0 sub-cmd");
+        assert_eq!(calls[7][3], "Props", "game band 0 Props");
 
-        // Phase 2b: apply game vol at index 15
+        // Phase 2b: apply game vol at index 17
         assert_eq!(
-            calls[15],
+            calls[17],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat EQ: index 17
+        // Phase 2 chat EQ: index 19
         assert_eq!(
-            calls[17],
+            calls[19],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat vol: index 28
+        // Phase 2b chat vol: index 30
         assert_eq!(
-            calls[28],
+            calls[30],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media EQ: index 30
+        // Phase 2 media EQ: index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media vol: index 41
+        // Phase 2b media vol: index 43
         assert_eq!(
-            calls[41],
+            calls[43],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux EQ: index 43
+        // Phase 2 aux EQ: index 45
         assert_eq!(
-            calls[43],
+            calls[45],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux vol: index 54
+        // Phase 2b aux vol: index 56
         assert_eq!(
-            calls[54],
+            calls[56],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 4 (phase1 ls) + 4*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 58
+        // Total: 2 (detect) + 4 (phase1 ls) + 4*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 60
         assert_eq!(
             calls.len(),
-            58,
-            "expected 58 total run calls (no spawns in calls)"
+            60,
+            "expected 60 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 4 pipewire -c invocations (channels only)
@@ -2694,6 +2752,9 @@ mod tests {
         // fragment should exist on disk.
         let ls = ls_all_present();
         let runner = MockRunner::new()
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            .with_output(0, "", "") // pw-metadata 0
+            .with_output(0, "[]", "") // pw-dump []
             // Phase 1: 3 ls (all present)
             .with_output(0, &ls, "")
             .with_output(0, &ls, "")
@@ -2832,6 +2893,9 @@ mod tests {
         let ls_present = ls_all_present();
 
         let runner = MockRunner::new()
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            .with_output(0, "", "") // pw-metadata 0
+            .with_output(0, "[]", "") // pw-dump []
             // Phase 1: 4 ls checks (sinks absent, spawn_owned called per channel)
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
@@ -2933,6 +2997,9 @@ mod tests {
         // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
         // Phase 6: surround disabled → remove() → source_exists() → 1 ls
         let runner = MockRunner::new()
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            .with_output(0, "", "") // pw-metadata 0
+            .with_output(0, "[]", "") // pw-dump []
             // Phase 1 ls checks (absent → spawns)
             .with_output(0, &ls_absent, "")
             .with_output(0, &ls_absent, "")
@@ -2974,11 +3041,11 @@ mod tests {
         // 4 tracked tokens
         assert_eq!(engine.children.len(), 4, "4 child tokens tracked");
 
-        // 14 run calls total: 4 (phase1 ls) + 4 (phase2 find_node_id) + 4 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
+        // 16 run calls total: 2 (detect) + 4 (phase1 ls) + 4 (phase2 find_node_id) + 4 (phase2b find_node_id) + 1 (mic step5) + 1 (surround step6)
         assert_eq!(
             engine.runner.calls.len(),
-            14,
-            "expected 14 run calls: 4 ls-up + 4 ls-find-node + 4 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
+            16,
+            "expected 16 run calls: 2 detect + 4 ls-up + 4 ls-find-node + 4 ls-vol-find-node + 1 mic source_exists + 1 surround source_exists"
         );
     }
 
@@ -2991,6 +3058,9 @@ mod tests {
         // Queue enough outputs for two full reconcile passes.
         let mut runner = MockRunner::new();
         for _ in 0..2 {
+            // detect_headset_sink: pw-metadata 0 + pw-dump []
+            runner = runner.with_output(0, "", ""); // pw-metadata 0
+            runner = runner.with_output(0, "[]", ""); // pw-dump []
             // Phase 1: 4 ls (all present, no spawn — Engine::new seeds aux)
             for _ in 0..4 {
                 runner = runner.with_output(0, &ls, "");
@@ -3053,6 +3123,9 @@ mod tests {
         let ls = ls_all_present();
         let ls_no_mic = ls_all_present(); // "present" for channels but no mic node
         let mut r = runner;
+        // detect_headset_sink: pw-metadata 0 + pw-dump (no SteelSeries → detect returns None)
+        r = r.with_output(0, "", ""); // pw-metadata 0 (empty → default_sink = None)
+        r = r.with_output(0, "[]", ""); // pw-dump [] → no sinks → detect = None
         // Phase 1: 4 ls (all present, including aux seeded by Engine::new)
         for _ in 0..4 {
             r = r.with_output(0, &ls, "");
@@ -4156,6 +4229,9 @@ mod tests {
         let ls = ls_all_present();
         let ls_mic_absent = ls_without_mic();
         let mut r = runner;
+        // detect_headset_sink: pw-metadata 0 + pw-dump (no SteelSeries → detect returns None)
+        r = r.with_output(0, "", ""); // pw-metadata 0
+        r = r.with_output(0, "[]", ""); // pw-dump []
         // Phase 1: 4 ls (all present, including aux seeded by Engine::new)
         for _ in 0..4 {
             r = r.with_output(0, &ls, "");
@@ -5130,8 +5206,8 @@ mod tests {
                 .unwrap_or(false)),
             "no surround spawn when disabled"
         );
-        // Total 58 calls: 4 (phase1) + 4*(1+10+1+1) (EQ+vol per channel) + 1 (mic) + 1 (surround)
-        assert_eq!(calls.len(), 58, "expected 58 total pw-cli calls");
+        // Total 60 calls: 2 (detect) + 4 (phase1) + 4*(1+10+1+1) (EQ+vol per channel) + 1 (mic) + 1 (surround)
+        assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
     }
 
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
@@ -5146,6 +5222,9 @@ mod tests {
         let ls_channels = ls_all_present();
         let ls_surround_absent = ls_all_absent(); // no surround node
         let mut r = runner;
+        // detect_headset_sink: pw-metadata 0 + pw-dump (no SteelSeries → detect returns None)
+        r = r.with_output(0, "", ""); // pw-metadata 0
+        r = r.with_output(0, "[]", ""); // pw-dump []
         // Phase 1: 4 ls (all channels present, including aux seeded by Engine::new)
         for _ in 0..4 {
             r = r.with_output(0, &ls_channels, "");
@@ -5876,6 +5955,98 @@ mod tests {
         let sp = streams.iter().find(|s| s.binary == "spotify").unwrap();
         assert_eq!(sp.current_channel, None, "unlinked spotify is unrouted");
         assert!(!sp.routed);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 3 (engine output): list_output_devices
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const PW_METADATA_SINK: &str = concat!(
+        "update: id:0 key:'default.audio.sink' ",
+        r#"value:'{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}' type:Spa:String"#
+    );
+
+    #[test]
+    fn list_output_devices_returns_real_sinks_and_marks_default() {
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        // Runner queue: [0] pw-metadata 0, [1] pw-dump
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(0, dump, ""); // pw-dump
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let devices = engine.list_output_devices();
+
+        // Headset sink present
+        assert!(
+            devices.iter().any(|d| d.node_name.contains("SteelSeries_Arctis")),
+            "headset sink missing: {devices:?}"
+        );
+        // Virtual sinks excluded
+        assert!(
+            !devices.iter().any(|d| d.node_name.starts_with("Arctis_")),
+            "virtual sinks must be excluded: {devices:?}"
+        );
+        // Onboard marked default
+        let onboard = devices
+            .iter()
+            .find(|d| d.node_name.contains("analog-stereo"))
+            .expect("onboard sink missing");
+        assert!(onboard.is_default, "onboard must be is_default=true");
+    }
+
+    #[test]
+    fn list_output_devices_returns_empty_on_pw_dump_error() {
+        // Queue [0] pw-metadata (ok), [1] pw-dump with non-zero exit
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(1, "", "pw-dump: error"); // pw-dump fails
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let devices = engine.list_output_devices();
+        assert!(
+            devices.is_empty(),
+            "must return empty Vec on pw-dump failure, got: {devices:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Task 5 TDD: detect_headset_sink + overlay_default_output wired into reconcile
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_headset_sink_returns_steelseries_sink() {
+        // Queue: [0] pw-metadata 0, [1] pw-dump (contains SteelSeries sink)
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(0, dump, "");             // pw-dump
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let result = engine.detect_headset_sink();
+        assert_eq!(
+            result.as_deref(),
+            Some("alsa_output.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.analog-stereo"),
+            "must return the SteelSeries hardware sink node_name"
+        );
+    }
+
+    #[test]
+    fn detect_headset_sink_returns_none_when_no_steelseries_sink() {
+        // pw-dump with only the onboard sink (no SteelSeries/Arctis hardware sink)
+        let dump_no_headset = r#"[
+          { "id": 11, "type": "PipeWire:Interface:Node",
+            "info": { "props": {
+              "media.class": "Audio/Sink",
+              "node.name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+              "node.description": "Speakers" } } }
+        ]"#;
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
+            .with_output(0, dump_no_headset, ""); // pw-dump (no SteelSeries)
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let result = engine.detect_headset_sink();
+        assert!(
+            result.is_none(),
+            "must return None when no SteelSeries/Arctis hardware sink present"
+        );
     }
 
     // ─────────────────────────────────────────────
