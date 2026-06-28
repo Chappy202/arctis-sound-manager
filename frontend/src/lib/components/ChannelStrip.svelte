@@ -1,15 +1,20 @@
 <script lang="ts">
+  import { Popover } from "bits-ui";
   import type { ChannelSnapshot, AppStream, OutputDeviceSnapshot } from "../ipc.js";
   import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
-  import { buildDeviceOptions, toErrorMsg } from "./channelStripUtils.js";
+  import {
+    buildDeviceOptions,
+    toSelectOptions,
+    outputToSelectValue,
+    selectValueToOutput,
+    toErrorMsg,
+  } from "./channelStripUtils.js";
   import { engineState } from "../stores.js";
   import { currentPage } from "../stores/page.js";
   import LevelMeter from "./LevelMeter.svelte";
   import AppPill from "./AppPill.svelte";
-
-  // Domain bounds — 0–100 percent volume (100 = unity / 0 dB).
-  const VOLUME_MIN_PCT = 0;
-  const VOLUME_MAX_PCT = 100;
+  import VolumeSlider from "./VolumeSlider.svelte";
+  import Select from "../ui/Select.svelte";
 
   interface Props {
     channel: ChannelSnapshot;
@@ -52,23 +57,29 @@
     return CHANNEL_ICONS[id.toLowerCase()] ?? "◈";
   }
 
+  function accentFor(id: string): string {
+    const map: Record<string, string> = {
+      game:  "var(--ss-accent-game)",
+      chat:  "var(--ss-accent-chat)",
+      media: "var(--ss-accent-media)",
+      aux:   "var(--ss-accent-aux)",
+    };
+    return map[id] ?? "var(--ss-accent)";
+  }
+
   // -----------------------------------------------------------------------
-  // Output device selector state
+  // Output device popover state
   // -----------------------------------------------------------------------
   let deviceOptions = $derived(buildDeviceOptions(channel, outputDevices));
-  let selectedDevice = $derived(channel.output_device);
+  let selectOptions = $derived(toSelectOptions(deviceOptions));
   let changing = $state(false);
+  let popoverOpen = $state(false);
 
-  async function handleDeviceChange(e: Event) {
-    const select = e.target as HTMLSelectElement;
-    const value = select.value === "__default__" ? null : select.value;
+  async function handleDeviceChange(value: string | null) {
     if (changing) return;
     changing = true;
     try {
       const newState = await setChannelOutput(channel.id, value);
-      // Apply the fresh state immediately for snappy feedback; the
-      // state-changed event from the daemon will arrive shortly and
-      // corroborate (or correct) this optimistic update.
       if (newState) {
         engineState.set(newState);
       }
@@ -77,49 +88,23 @@
       const msg = toErrorMsg(err);
       console.error("[ChannelStrip] setChannelOutput failed:", err);
       onError(msg);
-      // Revert the select back to reflect actual state
-      select.value = selectedDevice ?? "__default__";
     } finally {
       changing = false;
     }
   }
 
   // -----------------------------------------------------------------------
-  // Volume / mute handlers
+  // Volume — commit via VolumeSlider (rejections propagate to its onError)
   // -----------------------------------------------------------------------
-  let volumeBusy = $state(false);
+  async function handleVolumeCommit(pct: number) {
+    const s = await setChannelVolume(channel.id, pct);
+    if (s) engineState.set(s);
+  }
+
+  // -----------------------------------------------------------------------
+  // Mute handler
+  // -----------------------------------------------------------------------
   let muteBusy = $state(false);
-
-  /** Format a percent volume for the readout: "100%", "75%", "0%". */
-  function formatPct(pct: number): string {
-    return `${Math.round(pct)}%`;
-  }
-
-  /** Translate slider value (0–100 percent) → slider position % for the fader fill. */
-  function sliderPercent(pct: number): number {
-    return Math.max(0, Math.min(100, pct));
-  }
-
-  async function handleVolumeChange(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const pct = parseInt(input.value, 10);
-    if (volumeBusy || isNaN(pct)) return;
-    volumeBusy = true;
-    try {
-      const newState = await setChannelVolume(channel.id, pct);
-      if (newState) {
-        engineState.set(newState);
-      }
-    } catch (err) {
-      const msg = toErrorMsg(err);
-      console.error("[ChannelStrip] setChannelVolume failed:", err);
-      onError(msg);
-      // Revert input to reflect actual state
-      input.value = String(channel.volume_pct);
-    } finally {
-      volumeBusy = false;
-    }
-  }
 
   async function handleMuteToggle() {
     if (muteBusy) return;
@@ -138,12 +123,17 @@
     }
   }
 
+  // -----------------------------------------------------------------------
+  // EQ navigation
+  // -----------------------------------------------------------------------
   function openEq() {
-    // Store the target channel id in sessionStorage so the EQ page can read it.
     sessionStorage.setItem("eq:channel", channel.id);
     currentPage.set("eq");
   }
 
+  // -----------------------------------------------------------------------
+  // Derived labels / IDs
+  // -----------------------------------------------------------------------
   const eqBandCount = $derived(channel.eq_bands.length);
   const displayName = $derived(channel.node_name || channel.id.toUpperCase());
   const labelId = $derived(`channel-label-${channel.id}`);
@@ -162,7 +152,6 @@
     }
   }
   function handleDragLeave(e: DragEvent) {
-    // Ignore dragleave fired when moving onto a child element of the drop area.
     const related = e.relatedTarget as Node | null;
     if (related && e.currentTarget instanceof Node && e.currentTarget.contains(related)) {
       return;
@@ -175,30 +164,61 @@
     const id = e.dataTransfer?.getData("text/asm-stream-id");
     if (id) onDropStream(id, channel.id);
   }
-
-  function accentFor(id: string): string {
-    const map: Record<string, string> = {
-      game:  "var(--ss-accent-game)",
-      chat:  "var(--ss-accent-chat)",
-      media: "var(--ss-accent-media)",
-      aux:   "var(--ss-accent-aux)",
-    };
-    return map[id] ?? "var(--ss-accent)";
-  }
 </script>
 
 <article
   class="channel-strip"
   aria-labelledby={labelId}
   data-channel-id={channel.id}
+  style="--accent: {accentFor(channel.id)}"
 >
   <!-- ===== Channel header ===== -->
   <div class="strip-header">
     <span class="channel-icon" aria-hidden="true">{getIcon(channel.id)}</span>
     <h3 class="channel-label" id={labelId}>{channel.id.toUpperCase()}</h3>
+  </div>
+
+  <p class="channel-node-name" title={displayName}>{displayName}</p>
+
+  <!-- ===== Action row: gear (output popover trigger) + EQ + remove ===== -->
+  <div class="strip-actions">
+    <!-- Gear / output-device popover -->
+    <Popover.Root bind:open={popoverOpen}>
+      <Popover.Trigger
+        class="action-btn gear-btn"
+        aria-label="Output device for {channel.id.toUpperCase()}"
+        aria-haspopup="true"
+        aria-expanded={popoverOpen}
+      >⚙</Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content class="output-popover-content" sideOffset={8}>
+          <div class="popover-inner" class:changing>
+            <label class="popover-label" for={selectId}>Playback device</label>
+            <Select
+              options={selectOptions}
+              value={outputToSelectValue(channel.output_device)}
+              onValueChange={(v) => handleDeviceChange(selectValueToOutput(v))}
+              disabled={changing}
+              ariaLabel="Output device for {channel.id.toUpperCase()}"
+              id={selectId}
+            />
+          </div>
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+
+    <!-- EQ button -->
+    <button
+      class="action-btn eq-btn"
+      onclick={openEq}
+      aria-label="Open EQ for {channel.id.toUpperCase()}"
+      title="{eqBandCount === 0 ? 'flat' : `${eqBandCount} band${eqBandCount !== 1 ? 's' : ''}`}"
+    >EQ</button>
+
+    <!-- Remove button — only when caller allows removal -->
     {#if onRemove}
       <button
-        class="remove-btn"
+        class="action-btn remove-btn"
         title="Remove channel {channel.id.toUpperCase()}"
         aria-label="Remove channel {channel.id.toUpperCase()}"
         onclick={onRemove}
@@ -206,91 +226,34 @@
     {/if}
   </div>
 
-  <p class="channel-node-name" title={displayName}>{displayName}</p>
-
-  <!-- ===== Volume slot ===== -->
-  <div class="volume-slot" class:volume-busy={volumeBusy}>
-    <!-- Custom fader visual (decorative — mirrors the range input value) -->
-    <div class="fader-track" aria-hidden="true">
-      <div class="fader-fill" style="height: {sliderPercent(channel.volume_pct)}%"></div>
-      <div class="fader-thumb" style="bottom: calc({sliderPercent(channel.volume_pct)}% - 8px)"></div>
-    </div>
-
-    <!-- Accessible range input (the real interactive element) -->
-    <input
-      class="fader-input"
-      type="range"
-      min={VOLUME_MIN_PCT}
-      max={VOLUME_MAX_PCT}
-      step="1"
-      value={channel.volume_pct}
-      disabled={volumeBusy}
-      aria-label="Volume for {channel.id.toUpperCase()} ({formatPct(channel.volume_pct)})"
-      aria-valuemin={VOLUME_MIN_PCT}
-      aria-valuemax={VOLUME_MAX_PCT}
-      aria-valuenow={channel.volume_pct}
-      onchange={handleVolumeChange}
+  <!-- ===== Volume area: slider + level meter ===== -->
+  <div class="volume-area">
+    <VolumeSlider
+      volume={channel.volume_pct}
+      accent={accentFor(channel.id)}
+      label="Volume for {channel.id.toUpperCase()}"
+      oncommit={handleVolumeCommit}
+      onError={onError}
     />
-
-    <div class="fader-readout">{formatPct(channel.volume_pct)}</div>
-
-    <!-- R3b: Level meter — shows real-time signal peak via levels event.
-         Note: reflects real-time signal peak (from pw-record). See meter.ts. -->
     <LevelMeter
       nodeName={channel.node_name}
       orientation="vertical"
       ariaLabel="Volume level for {channel.id.toUpperCase()}"
     />
-
-    <button
-      class="mute-btn"
-      class:muted={channel.muted}
-      disabled={muteBusy}
-      title={channel.muted ? "Unmute" : "Mute"}
-      aria-label="{channel.muted ? 'Unmute' : 'Mute'} {channel.id.toUpperCase()}"
-      aria-pressed={channel.muted}
-      onclick={handleMuteToggle}
-    >
-      <span aria-hidden="true">{channel.muted ? "🔇" : "🔊"}</span>
-    </button>
   </div>
 
-  <!-- ===== Output device selector ===== -->
-  <div class="output-section">
-    <label class="output-label" for={selectId}>OUTPUT</label>
-    <div class="select-wrapper" class:changing>
-      <select
-        id={selectId}
-        class="output-select"
-        value={selectedDevice ?? "__default__"}
-        disabled={changing}
-        aria-label="Output device for {channel.id.toUpperCase()}"
-        onchange={handleDeviceChange}
-      >
-        {#each deviceOptions as opt}
-          <option value={opt.value ?? "__default__"}>{opt.label}</option>
-        {/each}
-      </select>
-      <span class="select-caret" aria-hidden="true">▾</span>
-    </div>
-  </div>
-
-  <!-- ===== EQ summary + button ===== -->
-  <div class="eq-section">
-    <div class="eq-meta">
-      <span class="eq-label">EQ</span>
-      <span class="eq-count" aria-label="{eqBandCount} EQ bands configured">
-        {eqBandCount === 0 ? "flat" : `${eqBandCount} band${eqBandCount !== 1 ? "s" : ""}`}
-      </span>
-    </div>
-    <button
-      class="eq-btn"
-      onclick={openEq}
-      aria-label="Open EQ for {channel.id.toUpperCase()}"
-    >
-      EQ
-    </button>
-  </div>
+  <!-- ===== Mute toggle ===== -->
+  <button
+    class="mute-btn"
+    class:muted={channel.muted}
+    disabled={muteBusy}
+    title={channel.muted ? "Unmute" : "Mute"}
+    aria-label="{channel.muted ? 'Unmute' : 'Mute'} {channel.id.toUpperCase()}"
+    aria-pressed={channel.muted}
+    onclick={handleMuteToggle}
+  >
+    <span aria-hidden="true">{channel.muted ? "🔇" : "🔊"}</span>
+  </button>
 
   <!-- ===== App stream drop area ===== -->
   <div
@@ -309,6 +272,7 @@
 </article>
 
 <style>
+  /* ===== Channel strip container ===== */
   .channel-strip {
     display: flex;
     flex-direction: column;
@@ -316,6 +280,7 @@
     min-width: var(--ss-channel-strip-w-min);
     background: var(--ss-surface-1);
     border: var(--ss-border-width) solid var(--ss-border);
+    border-top: 2px solid var(--accent, var(--ss-accent));
     border-radius: var(--ss-radius-md);
     padding: var(--ss-space-3);
     gap: var(--ss-space-3);
@@ -328,35 +293,6 @@
     display: flex;
     align-items: center;
     gap: var(--ss-space-2);
-  }
-
-  .remove-btn {
-    margin-left: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    background: transparent;
-    border: none;
-    border-radius: var(--ss-radius-xs);
-    color: var(--ss-text-tertiary);
-    font-size: 14px;
-    line-height: 1;
-    cursor: pointer;
-    padding: 0;
-    transition: color var(--ss-dur-fast) var(--ss-ease-standard),
-      background var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .remove-btn:hover {
-    color: var(--ss-danger);
-    background: var(--ss-danger-soft);
-  }
-
-  .remove-btn:focus-visible {
-    outline: 2px solid var(--ss-danger);
-    outline-offset: 2px;
   }
 
   .channel-icon {
@@ -385,82 +321,116 @@
     text-overflow: ellipsis;
   }
 
-  /* ===== Volume slot ===== */
-  .volume-slot {
+  /* ===== Action row ===== */
+  .strip-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-1);
+  }
+
+  /* Shared icon-button base for gear / eq / remove */
+  :global(.action-btn) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: var(--ss-control-h-sm);
+    min-width: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-secondary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    font-weight: var(--ss-type-button-weight);
+    letter-spacing: var(--ss-type-button-letter-spacing);
+    text-transform: uppercase;
+    cursor: pointer;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  :global(.action-btn:hover) {
+    border-color: var(--ss-border-strong);
+    background: var(--ss-surface-2);
+    color: var(--ss-text-primary);
+  }
+
+  :global(.action-btn:focus-visible) {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  :global(.action-btn:disabled) {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  /* Gear button: accent on open state */
+  :global(.gear-btn[aria-expanded="true"]) {
+    border-color: var(--ss-accent-border);
+    color: var(--ss-accent);
+    background: var(--ss-accent-soft);
+  }
+
+  /* Remove button: danger tint on hover */
+  .remove-btn {
+    margin-left: auto;
+  }
+
+  .remove-btn:hover {
+    color: var(--ss-danger) !important;
+    background: var(--ss-danger-soft) !important;
+    border-color: var(--ss-danger) !important;
+  }
+
+  /* ===== Output device popover content (portalled — :global required) ===== */
+  :global(.output-popover-content) {
+    background: var(--ss-surface-3);
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
+    box-shadow: var(--ss-e2);
+    z-index: 50;
+    min-width: 200px;
+    max-width: 280px;
+  }
+
+  .popover-inner {
     display: flex;
     flex-direction: column;
-    align-items: center;
     gap: var(--ss-space-2);
-    flex: 1;
-    min-height: 100px;
-    position: relative;
+    padding: var(--ss-space-3);
     transition: opacity var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  .volume-slot.volume-busy {
+  .popover-inner.changing {
     opacity: 0.6;
     pointer-events: none;
   }
 
-  /* Decorative vertical track — overlaid behind the invisible range input */
-  .fader-track {
-    position: relative;
-    width: 4px;
-    height: 80px;
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-pill);
-    flex-shrink: 0;
-    pointer-events: none;
+  .popover-label {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-micro-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-tertiary);
   }
 
-  .fader-fill {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    width: 100%;
-    background: var(--ss-accent);
-    border-radius: var(--ss-radius-pill);
-    transition: height var(--ss-dur-fast) var(--ss-ease-standard);
+  /* ===== Volume area ===== */
+  .volume-area {
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    justify-content: center;
+    gap: var(--ss-space-2);
+    flex: 1;
+    min-height: 120px;
   }
 
-  .fader-thumb {
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 16px;
-    height: 16px;
-    background: var(--ss-accent);
-    border-radius: var(--ss-radius-pill);
-    box-shadow: var(--ss-e1);
-    transition: bottom var(--ss-dur-fast) var(--ss-ease-standard);
-    pointer-events: none;
-  }
-
-  /* Transparent range input positioned over the decorative track */
-  .fader-input {
-    position: absolute;
-    /* Rotate so the range runs bottom-to-top along the fader track. */
-    writing-mode: vertical-lr;
-    direction: rtl;
-    width: 80px;
-    height: 24px;
-    opacity: 0;
-    cursor: pointer;
-    margin-top: 0;
-    z-index: 1;
-  }
-
-  .fader-input:disabled {
-    cursor: not-allowed;
-  }
-
-  .fader-readout {
-    font-family: var(--ss-font-mono);
-    font-size: var(--ss-type-readout-size);
-    font-variant-numeric: tabular-nums;
-    color: var(--ss-text-secondary);
-  }
-
+  /* ===== Mute button ===== */
   .mute-btn {
     display: flex;
     align-items: center;
@@ -472,6 +442,7 @@
     border: var(--ss-border-width) solid var(--ss-border);
     cursor: pointer;
     font-size: 13px;
+    align-self: center;
     transition:
       background var(--ss-dur-fast) var(--ss-ease-standard),
       border-color var(--ss-dur-fast) var(--ss-ease-standard);
@@ -497,148 +468,6 @@
     outline-offset: 2px;
   }
 
-  /* ===== Output device selector ===== */
-  .output-section {
-    display: flex;
-    flex-direction: column;
-    gap: var(--ss-space-1);
-  }
-
-  .output-label {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-micro-size);
-    font-weight: var(--ss-type-micro-weight);
-    letter-spacing: var(--ss-type-micro-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-tertiary);
-  }
-
-  .select-wrapper {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-
-  .select-wrapper.changing {
-    opacity: 0.6;
-    pointer-events: none;
-  }
-
-  .output-select {
-    width: 100%;
-    height: var(--ss-control-h-sm);
-    padding: 0 var(--ss-space-5) 0 var(--ss-space-2);
-    background: var(--ss-surface-input);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-xs);
-    color: var(--ss-text-primary);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-caption-size);
-    cursor: pointer;
-    appearance: none;
-    -webkit-appearance: none;
-    transition:
-      border-color var(--ss-dur-fast) var(--ss-ease-standard),
-      background var(--ss-dur-fast) var(--ss-ease-standard);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .output-select:hover {
-    border-color: var(--ss-border-strong);
-    background: var(--ss-surface-2);
-  }
-
-  .output-select:focus {
-    outline: none;
-    border-color: var(--ss-accent-border);
-  }
-
-  .output-select:disabled {
-    cursor: not-allowed;
-    color: var(--ss-text-disabled);
-  }
-
-  /* Style the native option elements for dark theme */
-  .output-select option {
-    background: var(--ss-surface-3);
-    color: var(--ss-text-primary);
-  }
-
-  .select-caret {
-    position: absolute;
-    right: var(--ss-space-2);
-    color: var(--ss-text-tertiary);
-    font-size: 9px;
-    pointer-events: none;
-  }
-
-  /* ===== EQ section ===== */
-  .eq-section {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    border-top: var(--ss-border-width) solid var(--ss-border);
-    padding-top: var(--ss-space-2);
-  }
-
-  .eq-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .eq-label {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-micro-size);
-    font-weight: var(--ss-type-micro-weight);
-    letter-spacing: var(--ss-type-micro-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-tertiary);
-  }
-
-  .eq-count {
-    font-family: var(--ss-font-mono);
-    font-size: var(--ss-type-caption-size);
-    color: var(--ss-text-secondary);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .eq-btn {
-    height: var(--ss-control-h-sm);
-    padding: 0 var(--ss-space-3);
-    background: var(--ss-gradient-secondary);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-xs);
-    color: var(--ss-text-primary);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-button-size);
-    font-weight: var(--ss-type-button-weight);
-    letter-spacing: var(--ss-type-button-letter-spacing);
-    text-transform: uppercase;
-    cursor: pointer;
-    transition:
-      background var(--ss-dur-fast) var(--ss-ease-standard),
-      border-color var(--ss-dur-fast) var(--ss-ease-standard),
-      color var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .eq-btn:hover {
-    background: var(--ss-surface-2);
-    border-color: var(--ss-accent-border);
-    color: var(--ss-accent);
-  }
-
-  .eq-btn:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .eq-btn:active {
-    background: var(--ss-surface-input);
-  }
-
   /* ===== App stream drop area ===== */
   .strip-apps {
     display: flex;
@@ -646,7 +475,6 @@
     gap: var(--ss-space-1);
     min-height: 48px;
     padding: var(--ss-space-2);
-    margin-top: var(--ss-space-2);
     border: var(--ss-border-width) dashed var(--ss-border);
     border-radius: var(--ss-radius-sm);
     transition: background var(--ss-dur-fast) var(--ss-ease-standard);

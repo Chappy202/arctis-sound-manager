@@ -5,6 +5,43 @@
  */
 import type { ChannelSnapshot, OutputDeviceSnapshot } from "../ipc.js";
 
+// ---------------------------------------------------------------------------
+// Output-device Select adapter
+//
+// The device-options model uses `value: string | null` (null = "Default").
+// The C0a Select component requires `value: string`. These helpers bridge the
+// two via a sentinel constant.
+// ---------------------------------------------------------------------------
+
+/** Sentinel value representing the "Default (follow system)" output device. */
+export const DEFAULT_OUTPUT_VALUE = "__default__";
+
+/** Map DeviceOption[] (value: string|null) → SelectOption[] (value: string). */
+export function toSelectOptions(
+  opts: DeviceOption[],
+): { value: string; label: string }[] {
+  return opts.map((o) => ({
+    value: o.value === null ? DEFAULT_OUTPUT_VALUE : o.value,
+    label: o.label,
+  }));
+}
+
+/**
+ * The Select's current string value for a channel's output_device.
+ * Maps null (= "follow system") → the sentinel.
+ */
+export function outputToSelectValue(output_device: string | null): string {
+  return output_device === null ? DEFAULT_OUTPUT_VALUE : output_device;
+}
+
+/**
+ * Inverse: a Select string value back to the IPC value.
+ * Maps the sentinel → null; all other values pass through unchanged.
+ */
+export function selectValueToOutput(value: string): string | null {
+  return value === DEFAULT_OUTPUT_VALUE ? null : value;
+}
+
 /**
  * Extract a human-readable message from an unknown catch value.
  * Used in the channel strip's write-failure catch blocks so the same

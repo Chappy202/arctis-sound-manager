@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { buildDeviceOptions, toErrorMsg } from "./channelStripUtils.js";
+import {
+  buildDeviceOptions,
+  toErrorMsg,
+  toSelectOptions,
+  outputToSelectValue,
+  selectValueToOutput,
+  DEFAULT_OUTPUT_VALUE,
+} from "./channelStripUtils.js";
 import type { ChannelSnapshot, OutputDeviceSnapshot } from "../ipc.js";
 
 // Minimal ChannelSnapshot fixture
@@ -97,5 +104,81 @@ describe("buildDeviceOptions", () => {
     const opts2 = buildDeviceOptions(mkChannel("missing_device"), []);
     expect(opts2).toHaveLength(2);
     expect(opts2[1]).toEqual({ value: "missing_device", label: "missing_device (unavailable)" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Output-device Select adapter helpers
+// ---------------------------------------------------------------------------
+describe("output-device select adapter", () => {
+  it("DEFAULT_OUTPUT_VALUE sentinel is a non-empty string", () => {
+    expect(typeof DEFAULT_OUTPUT_VALUE).toBe("string");
+    expect(DEFAULT_OUTPUT_VALUE.length).toBeGreaterThan(0);
+  });
+
+  it("outputToSelectValue(null) returns the sentinel", () => {
+    expect(outputToSelectValue(null)).toBe(DEFAULT_OUTPUT_VALUE);
+  });
+
+  it("outputToSelectValue(string) passes through unchanged", () => {
+    expect(outputToSelectValue("alsa_output.pci.analog")).toBe("alsa_output.pci.analog");
+  });
+
+  it("selectValueToOutput(sentinel) returns null", () => {
+    expect(selectValueToOutput(DEFAULT_OUTPUT_VALUE)).toBeNull();
+  });
+
+  it("selectValueToOutput(non-sentinel string) passes through unchanged", () => {
+    expect(selectValueToOutput("alsa_output.pci.analog")).toBe("alsa_output.pci.analog");
+  });
+
+  it("round-trip: null → sentinel → null", () => {
+    expect(selectValueToOutput(outputToSelectValue(null))).toBeNull();
+  });
+
+  it("round-trip: real device value is unchanged through both transforms", () => {
+    const device = "alsa_output.pci.surround71.analog-surround-71";
+    expect(selectValueToOutput(outputToSelectValue(device))).toBe(device);
+  });
+
+  it("toSelectOptions maps null DeviceOption values to the sentinel string", () => {
+    const raw = [
+      { value: null, label: "Default (follow system)" },
+      { value: "alsa_output.pci.analog", label: "Built-in Audio" },
+    ];
+    const result = toSelectOptions(raw);
+    expect(result[0]).toEqual({ value: DEFAULT_OUTPUT_VALUE, label: "Default (follow system)" });
+    expect(result[1]).toEqual({ value: "alsa_output.pci.analog", label: "Built-in Audio" });
+  });
+
+  it("toSelectOptions yields no null values in any option.value", () => {
+    const devices: OutputDeviceSnapshot[] = [
+      mkDevice("alsa_output.pci.analog", "Built-in Audio", false),
+      mkDevice("arctis_output", "Arctis Nova Pro", true),
+    ];
+    const result = toSelectOptions(buildDeviceOptions(mkChannel(null), devices));
+    for (const opt of result) {
+      expect(opt.value).not.toBeNull();
+      expect(typeof opt.value).toBe("string");
+    }
+  });
+
+  it("toSelectOptions preserves labels exactly", () => {
+    const raw = [
+      { value: null, label: "Default (follow system)" },
+      { value: "some_device", label: "Some Device (system default)" },
+    ];
+    const result = toSelectOptions(raw);
+    expect(result[0].label).toBe("Default (follow system)");
+    expect(result[1].label).toBe("Some Device (system default)");
+  });
+
+  it("toSelectOptions result has same length as input", () => {
+    const devices: OutputDeviceSnapshot[] = [
+      mkDevice("dev_a", "Device A", false),
+      mkDevice("dev_b", "Device B", false),
+    ];
+    const deviceOpts = buildDeviceOptions(mkChannel(null), devices);
+    expect(toSelectOptions(deviceOpts)).toHaveLength(deviceOpts.length);
   });
 });
