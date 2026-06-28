@@ -1,6 +1,8 @@
 <script lang="ts">
   import { clampBand, FREQ_MIN, FREQ_MAX, GAIN_MIN, GAIN_MAX, Q_MIN, Q_MAX, type Band } from "../eq.js";
   import { beginEditing, endEditing, pulseEditing } from "../stores/eqEditing.js";
+  import Select from "../ui/Select.svelte";
+  import type { SelectOption } from "../ui/selectUtils.js";
 
   interface Props {
     band: Band | null;
@@ -14,6 +16,7 @@
   const KIND_LABELS: Record<Band["kind"], string> = {
     peaking: "Peaking", lowshelf: "Low shelf", highshelf: "High shelf",
   };
+  const KIND_OPTIONS: SelectOption[] = KINDS.map((k) => ({ value: k, label: KIND_LABELS[k] }));
 
   function commit(patch: Partial<Band>) {
     if (!band) return;
@@ -38,9 +41,8 @@
     <div class="panel-head">SELECTED BAND <span class="b-num">{index + 1}</span></div>
     <label class="field">
       <span>Type</span>
-      <select value={band.kind} onchange={(e) => commit({ kind: (e.target as HTMLSelectElement).value as Band["kind"] })}>
-        {#each KINDS as k}<option value={k}>{KIND_LABELS[k]}</option>{/each}
-      </select>
+      <Select options={KIND_OPTIONS} value={band.kind} ariaLabel="Band filter type"
+        onValueChange={(v) => commit({ kind: v as Band["kind"] })} />
     </label>
     <label class="field">
       <span>Freq (Hz)</span>
@@ -68,8 +70,8 @@
   .panel-head { font-family: var(--ss-font-display); text-transform: uppercase; font-size: var(--ss-type-h2-size); color: var(--ss-text-primary); }
   .b-num { color: var(--ss-accent); }
   .field { display: grid; grid-template-columns: 84px 1fr; align-items: center; gap: var(--ss-space-2); font-size: var(--ss-type-caption-size); color: var(--ss-text-secondary); }
-  .field select, .field input { height: var(--ss-control-h-sm); background: var(--ss-surface-input); border: 1px solid var(--ss-border-strong); border-radius: var(--ss-radius-xs); color: var(--ss-text-primary); padding: 0 var(--ss-space-2); font-family: var(--ss-font-mono); }
-  .field input:focus, .field select:focus { outline: none; border-color: var(--ss-accent-border); }
+  .field input { height: var(--ss-control-h-sm); background: var(--ss-surface-input); border: 1px solid var(--ss-border-strong); border-radius: var(--ss-radius-xs); color: var(--ss-text-primary); padding: 0 var(--ss-space-2); font-family: var(--ss-font-mono); }
+  .field input:focus { outline: none; border-color: var(--ss-accent-border); }
   .reset-btn { align-self: flex-start; height: 24px; padding: 0 var(--ss-space-3); background: transparent; border: 1px solid var(--ss-border-strong); border-radius: var(--ss-radius-xs); color: var(--ss-text-tertiary); cursor: pointer; }
   .reset-btn:hover { color: var(--ss-accent); border-color: var(--ss-accent-border); background: var(--ss-accent-soft); }
   .empty { color: var(--ss-text-tertiary); font-style: italic; font-size: var(--ss-type-caption-size); }

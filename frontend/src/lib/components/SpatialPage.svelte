@@ -22,6 +22,9 @@
     surroundSetHwSink,
   } from "../ipc.js";
   import { hrirDisplayName, channelChecked, toggleChannel } from "../surround.js";
+  import Switch from "../ui/Switch.svelte";
+  import Select from "../ui/Select.svelte";
+  import type { SelectOption } from "../ui/selectUtils.js";
 
   // ---------------------------------------------------------------------------
   // Derived surround state
@@ -38,6 +41,15 @@
 
   // No HRIR profiles → honest unavailable state
   const noHrirs = $derived(availableHrirs.length === 0);
+
+  // HRIR picker options. When nothing is selected yet we prepend a placeholder
+  // entry so the trigger reads "(none selected)" instead of a blank label.
+  const hrirOptions = $derived<SelectOption[]>([
+    ...(currentHrir === null && availableHrirs.length > 0
+      ? [{ value: "", label: "(none selected)" }]
+      : []),
+    ...availableHrirs.map((stem) => ({ value: stem, label: hrirDisplayName(stem) })),
+  ]);
 
   // Local mutable copy of hw_sink for the text field
   let hwSinkDraft = $state("");
@@ -58,15 +70,14 @@
   // Handlers
   // ---------------------------------------------------------------------------
 
-  function onMasterToggle(e: Event) {
-    const on = (e.target as HTMLInputElement).checked;
+  function onMasterToggle(on: boolean) {
     surroundEnable(on).then(applyState).catch((err) => {
       console.warn("[SpatialPage] surroundEnable failed:", err);
     });
   }
 
-  function onHrirChange(e: Event) {
-    const name = (e.target as HTMLSelectElement).value;
+  function onHrirChange(name: string) {
+    if (!name) return; // ignore the placeholder "(none selected)" entry
     surroundSetHrir(name).then(applyState).catch((err) => {
       console.warn("[SpatialPage] surroundSetHrir failed:", err);
     });
@@ -139,22 +150,16 @@
       <div class="card-body">
         <div class="control-row">
           <span class="field-label">ENABLE VIRTUAL SURROUND</span>
-          <label
-            class="toggle"
+          <span
             title={noHrirs ? "No HRIR profiles found — add profiles to enable surround" : "Enable or disable virtual surround"}
           >
-            <input
-              type="checkbox"
-              class="toggle-input"
+            <Switch
               checked={masterEnabled}
               disabled={noHrirs}
-              onchange={onMasterToggle}
-              aria-label="Enable virtual surround"
+              onCheckedChange={onMasterToggle}
+              ariaLabel="Enable virtual surround"
             />
-            <span class="toggle-track">
-              <span class="toggle-thumb"></span>
-            </span>
-          </label>
+          </span>
         </div>
       </div>
     </div>
@@ -172,20 +177,15 @@
           <div class="control-row">
             <span class="field-label">PROFILE</span>
             <div class="select-group">
-              <select
-                class="ss-select"
-                value={currentHrir ?? ""}
-                disabled={noHrirs || !masterEnabled}
-                onchange={onHrirChange}
-                aria-label="Select HRIR profile"
-              >
-                {#if currentHrir === null && availableHrirs.length > 0}
-                  <option value="" disabled>(none selected)</option>
-                {/if}
-                {#each availableHrirs as stem (stem)}
-                  <option value={stem}>{hrirDisplayName(stem)}</option>
-                {/each}
-              </select>
+              <div class="select-control">
+                <Select
+                  options={hrirOptions}
+                  value={currentHrir ?? ""}
+                  disabled={noHrirs || !masterEnabled}
+                  ariaLabel="Select HRIR profile"
+                  onValueChange={onHrirChange}
+                />
+              </div>
             </div>
           </div>
           <div class="field-row">
@@ -212,17 +212,15 @@
             {#each allChannelIds as id (id)}
               <div class="control-row">
                 <span class="field-label">{id.toUpperCase()}</span>
-                <label class="toggle toggle--sm" title="Route {id} through virtual surround">
-                  <input
-                    type="checkbox"
-                    class="toggle-input"
+                <span title="Route {id} through virtual surround">
+                  <Switch
+                    size="sm"
                     checked={channelChecked(id, activeChannels)}
                     disabled={!masterEnabled}
-                    onchange={() => onChannelToggle(id)}
-                    aria-label="Route {id} through surround"
+                    onCheckedChange={() => onChannelToggle(id)}
+                    ariaLabel="Route {id} through surround"
                   />
-                  <span class="toggle-track"><span class="toggle-thumb"></span></span>
-                </label>
+                </span>
               </div>
             {/each}
             <div class="field-row">
@@ -539,82 +537,6 @@
     border-bottom: none;
   }
 
-  /* ===== Toggle ===== */
-  .toggle {
-    display: inline-flex;
-    align-items: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    gap: var(--ss-space-2);
-  }
-
-  .toggle-input {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-  }
-
-  .toggle-track {
-    display: inline-flex;
-    align-items: center;
-    width: 36px;
-    height: 20px;
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-pill);
-    border: 1px solid var(--ss-border);
-    transition: background var(--ss-dur-fast) var(--ss-ease-standard),
-                border-color var(--ss-dur-fast) var(--ss-ease-standard);
-    position: relative;
-  }
-
-  .toggle-thumb {
-    position: absolute;
-    left: 2px;
-    width: 14px;
-    height: 14px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-tertiary);
-    transition: transform var(--ss-dur-fast) var(--ss-ease-standard),
-                background var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .toggle-input:checked + .toggle-track {
-    background: var(--ss-accent);
-    border-color: var(--ss-accent);
-  }
-
-  .toggle-input:checked + .toggle-track .toggle-thumb {
-    transform: translateX(16px);
-    background: white;
-  }
-
-  .toggle-input:disabled + .toggle-track {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .toggle-input:focus-visible + .toggle-track {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .toggle--sm .toggle-track {
-    width: 32px;
-    height: 18px;
-  }
-
-  .toggle--sm .toggle-thumb {
-    width: 12px;
-    height: 12px;
-  }
-
-  .toggle--sm .toggle-input:checked + .toggle-track .toggle-thumb {
-    transform: translateX(14px);
-  }
-
   /* ===== Select (HRIR picker) ===== */
   .select-group {
     display: flex;
@@ -624,27 +546,10 @@
     justify-content: flex-end;
   }
 
-  .ss-select {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-primary);
-    background: var(--ss-surface-input);
-    border: 1px solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    padding: var(--ss-space-1) var(--ss-space-2);
-    cursor: pointer;
-    outline: none;
-    min-width: 180px;
-  }
-
-  .ss-select:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .ss-select:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  /* Constrains the bits-ui Select wrapper (which is width:100%). */
+  .select-control {
+    width: 200px;
+    flex-shrink: 0;
   }
 
   /* ===== Text input (hw sink) ===== */

@@ -17,6 +17,10 @@
     isGateError,
     type AncMode,
   } from "../deviceControls.js";
+  import Select from "../ui/Select.svelte";
+  import Slider from "../ui/Slider.svelte";
+  import ToggleGroup from "../ui/ToggleGroup.svelte";
+  import type { SelectOption } from "../ui/selectUtils.js";
 
   // ---------------------------------------------------------------------------
   // View-model: map raw EngineState → typed display rows
@@ -178,6 +182,48 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Select / segmented options (string-typed for the bits-ui wrappers)
+  // ---------------------------------------------------------------------------
+
+  const ancOptions: SelectOption[] = ANC_MODES.map((m) => ({ value: m, label: ANC_MODE_LABELS[m] }));
+  const sidetoneOptions: SelectOption[] = SIDETONE_OPTIONS.map((o) => ({
+    value: String(o.value),
+    label: o.label,
+  }));
+  const autoOffOptions: SelectOption[] = AUTO_OFF_OPTIONS.map((o) => ({
+    value: String(o.value),
+    label: o.label,
+  }));
+
+  // ---------------------------------------------------------------------------
+  // Slider draft state — local mirror so the thumb/readout track during a drag
+  // (the device value only updates after a successful commit round-trips). Each
+  // draft resyncs from the device value ONLY when that value actually changes,
+  // so the 250 ms state poll never clobbers a value the user is mid-drag on.
+  // ---------------------------------------------------------------------------
+
+  let transparencyDraft = $state(5);
+  let micLedDraft = $state(5);
+  let micVolumeDraft = $state(5);
+
+  let lastTransparency = NaN;
+  let lastMicLed = NaN;
+  let lastMicVolume = NaN;
+
+  $effect(() => {
+    const v = currentTransparencyLevel;
+    if (v !== lastTransparency) { lastTransparency = v; transparencyDraft = v; }
+  });
+  $effect(() => {
+    const v = currentMicLed;
+    if (v !== lastMicLed) { lastMicLed = v; micLedDraft = v; }
+  });
+  $effect(() => {
+    const v = currentMicVolume;
+    if (v !== lastMicVolume) { lastMicVolume = v; micVolumeDraft = v; }
+  });
+
+  // ---------------------------------------------------------------------------
   // Control event handlers
   // ---------------------------------------------------------------------------
 
@@ -187,22 +233,6 @@
 
   function onSidetoneChange(value: number) {
     sendControl("sidetone", value);
-  }
-
-  function onMicLedChange(e: Event) {
-    sendControl("mic_led", Number((e.target as HTMLInputElement).value));
-  }
-
-  function onAutoOffChange(e: Event) {
-    sendControl("inactive_time", Number((e.target as HTMLSelectElement).value));
-  }
-
-  function onTransparencyLevelChange(e: Event) {
-    sendControl("transparency_level", Number((e.target as HTMLInputElement).value));
-  }
-
-  function onMicVolumeChange(e: Event) {
-    sendControl("mic_volume", Number((e.target as HTMLInputElement).value));
   }
 </script>
 
@@ -350,20 +380,13 @@
             <!-- ANC mode segmented control -->
             <div class="control-row">
               <span class="field-label">MODE</span>
-              <div class="segmented" role="group" aria-label="ANC Mode">
-                {#each ANC_MODES as mode}
-                  <button
-                    class="seg-btn"
-                    class:seg-btn--active={currentAncMode === mode}
-                    disabled={pending.anc || !devicePresent}
-                    onclick={() => onAncChange(mode)}
-                    aria-pressed={currentAncMode === mode}
-                    aria-label="ANC {ANC_MODE_LABELS[mode]}"
-                  >
-                    {ANC_MODE_LABELS[mode]}
-                  </button>
-                {/each}
-              </div>
+              <ToggleGroup
+                options={ancOptions}
+                value={currentAncMode}
+                disabled={pending.anc || !devicePresent}
+                ariaLabel="ANC Mode"
+                onValueChange={(v) => onAncChange(v as AncMode)}
+              />
             </div>
             {#if controlErrors.anc}
               <div class="control-error" role="alert">
@@ -377,18 +400,19 @@
               <div class="control-row control-row--sub">
                 <span class="field-label">TRANSPARENCY LEVEL</span>
                 <div class="slider-group">
-                  <input
-                    type="range"
-                    class="ss-slider"
-                    min="1"
-                    max="10"
-                    step="1"
-                    value={currentTransparencyLevel}
-                    disabled={pending.transparency_level || !devicePresent || currentAncMode !== "transparency"}
-                    onchange={onTransparencyLevelChange}
-                    aria-label="Transparency level {currentTransparencyLevel} of 10"
-                  />
-                  <span class="slider-readout">{currentTransparencyLevel}</span>
+                  <div class="slider-control">
+                    <Slider
+                      min={1}
+                      max={10}
+                      step={1}
+                      value={transparencyDraft}
+                      disabled={pending.transparency_level || !devicePresent || currentAncMode !== "transparency"}
+                      onValueChange={(v) => (transparencyDraft = v)}
+                      onValueCommit={(v) => sendControl("transparency_level", v)}
+                      ariaLabel="Transparency level {transparencyDraft} of 10"
+                    />
+                  </div>
+                  <span class="slider-readout">{transparencyDraft}</span>
                 </div>
               </div>
               {#if controlErrors.transparency_level}
@@ -415,20 +439,13 @@
           <div class="card-body">
             <div class="control-row">
               <span class="field-label">LEVEL</span>
-              <div class="segmented" role="group" aria-label="Sidetone level">
-                {#each SIDETONE_OPTIONS as opt}
-                  <button
-                    class="seg-btn"
-                    class:seg-btn--active={currentSidetone === opt.value}
-                    disabled={pending.sidetone || !devicePresent}
-                    onclick={() => onSidetoneChange(opt.value)}
-                    aria-pressed={currentSidetone === opt.value}
-                    aria-label="Sidetone {opt.label}"
-                  >
-                    {opt.label}
-                  </button>
-                {/each}
-              </div>
+              <ToggleGroup
+                options={sidetoneOptions}
+                value={String(currentSidetone)}
+                disabled={pending.sidetone || !devicePresent}
+                ariaLabel="Sidetone level"
+                onValueChange={(v) => onSidetoneChange(Number(v))}
+              />
             </div>
             {#if controlErrors.sidetone}
               <div class="control-error" role="alert">
@@ -456,18 +473,19 @@
             <div class="control-row">
               <span class="field-label">MIC LED</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="1"
-                  max="10"
-                  step="1"
-                  value={currentMicLed}
-                  disabled={pending.mic_led || !devicePresent}
-                  onchange={onMicLedChange}
-                  aria-label="Mic LED brightness {currentMicLed} of 10"
-                />
-                <span class="slider-readout">{currentMicLed}</span>
+                <div class="slider-control">
+                  <Slider
+                    min={1}
+                    max={10}
+                    step={1}
+                    value={micLedDraft}
+                    disabled={pending.mic_led || !devicePresent}
+                    onValueChange={(v) => (micLedDraft = v)}
+                    onValueCommit={(v) => sendControl("mic_led", v)}
+                    ariaLabel="Mic LED brightness {micLedDraft} of 10"
+                  />
+                </div>
+                <span class="slider-readout">{micLedDraft}</span>
               </div>
             </div>
             {#if controlErrors.mic_led}
@@ -482,18 +500,19 @@
             <div class="control-row">
               <span class="field-label">MIC VOLUME</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="1"
-                  max="10"
-                  step="1"
-                  value={currentMicVolume}
-                  disabled={pending.mic_volume || !devicePresent}
-                  onchange={onMicVolumeChange}
-                  aria-label="Mic volume {currentMicVolume} of 10"
-                />
-                <span class="slider-readout">{currentMicVolume}</span>
+                <div class="slider-control">
+                  <Slider
+                    min={1}
+                    max={10}
+                    step={1}
+                    value={micVolumeDraft}
+                    disabled={pending.mic_volume || !devicePresent}
+                    onValueChange={(v) => (micVolumeDraft = v)}
+                    onValueCommit={(v) => sendControl("mic_volume", v)}
+                    ariaLabel="Mic volume {micVolumeDraft} of 10"
+                  />
+                </div>
+                <span class="slider-readout">{micVolumeDraft}</span>
               </div>
             </div>
             {#if controlErrors.mic_volume}
@@ -534,17 +553,15 @@
           <div class="card-body">
             <div class="control-row">
               <span class="field-label">AUTO-OFF</span>
-              <select
-                class="ss-select"
-                value={currentAutoOff}
-                disabled={pending.inactive_time || !devicePresent}
-                onchange={onAutoOffChange}
-                aria-label="Auto-off timeout"
-              >
-                {#each AUTO_OFF_OPTIONS as opt}
-                  <option value={opt.value}>{opt.label}</option>
-                {/each}
-              </select>
+              <div class="select-control">
+                <Select
+                  options={autoOffOptions}
+                  value={String(currentAutoOff)}
+                  disabled={pending.inactive_time || !devicePresent}
+                  ariaLabel="Auto-off timeout"
+                  onValueChange={(v) => sendControl("inactive_time", Number(v))}
+                />
+              </div>
             </div>
             {#if controlErrors.inactive_time}
               <div class="control-error" role="alert">
@@ -1015,56 +1032,6 @@
   }
 
   /* =========================================================================
-   * Segmented control
-   * ========================================================================= */
-  .segmented {
-    display: flex;
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-sm);
-    padding: 2px;
-    gap: 2px;
-  }
-
-  .seg-btn {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-micro-size);
-    font-weight: var(--ss-type-micro-weight);
-    letter-spacing: var(--ss-type-micro-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-secondary);
-    background: transparent;
-    border: none;
-    border-radius: calc(var(--ss-radius-sm) - 1px);
-    padding: 4px var(--ss-space-3);
-    cursor: pointer;
-    transition:
-      background var(--ss-dur-base) var(--ss-ease-standard),
-      color var(--ss-dur-fast) var(--ss-ease-standard);
-    min-height: var(--ss-control-h-sm);
-    white-space: nowrap;
-  }
-
-  .seg-btn:hover:not(:disabled) {
-    color: var(--ss-text-primary);
-    background: color-mix(in srgb, var(--ss-surface-input-alt) 60%, transparent);
-  }
-
-  .seg-btn--active {
-    background: var(--ss-accent) !important;
-    color: var(--ss-text-bright) !important;
-  }
-
-  .seg-btn:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
-
-  .seg-btn:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 1px;
-  }
-
-  /* =========================================================================
    * Slider
    * ========================================================================= */
   .slider-group {
@@ -1075,64 +1042,10 @@
     justify-content: flex-end;
   }
 
-  .ss-slider {
-    -webkit-appearance: none;
-    appearance: none;
-    height: 4px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-surface-input);
-    cursor: pointer;
+  /* Constrains the bits-ui Slider wrapper (which is width:100%). */
+  .slider-control {
     width: 120px;
     flex-shrink: 0;
-    outline: none;
-    transition: background var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .ss-slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-bright);
-    box-shadow: var(--ss-e1);
-    cursor: pointer;
-    transition:
-      box-shadow var(--ss-dur-fast) var(--ss-ease-standard),
-      transform var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .ss-slider::-moz-range-thumb {
-    width: 16px;
-    height: 16px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-bright);
-    box-shadow: var(--ss-e1);
-    cursor: pointer;
-    border: none;
-    transition:
-      box-shadow var(--ss-dur-fast) var(--ss-ease-standard),
-      transform var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .ss-slider:hover:not(:disabled)::-webkit-slider-thumb {
-    box-shadow: 0 0 0 3px var(--ss-accent-border), var(--ss-e1);
-    transform: scale(1.1);
-  }
-
-  .ss-slider:hover:not(:disabled)::-moz-range-thumb {
-    box-shadow: 0 0 0 3px var(--ss-accent-border), var(--ss-e1);
-    transform: scale(1.1);
-  }
-
-  .ss-slider:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .ss-slider:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
   }
 
   .slider-readout {
@@ -1148,43 +1061,10 @@
   /* =========================================================================
    * Select / dropdown
    * ========================================================================= */
-  .ss-select {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-primary);
-    background: var(--ss-surface-input);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    height: var(--ss-field-h);
-    padding: 0 var(--ss-space-4) 0 var(--ss-space-3);
-    cursor: pointer;
-    outline: none;
-    appearance: none;
-    -webkit-appearance: none;
-    min-width: 120px;
-    /* Custom caret */
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%237A7C80'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 10px center;
-    transition:
-      border-color var(--ss-dur-fast) var(--ss-ease-standard),
-      background-color var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .ss-select:hover:not(:disabled) {
-    border-color: var(--ss-border-strong);
-    background-color: var(--ss-surface-input-alt);
-  }
-
-  .ss-select:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 1px;
-    border-color: var(--ss-accent-border);
-  }
-
-  .ss-select:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  /* Constrains the bits-ui Select wrapper (which is width:100%). */
+  .select-control {
+    width: 160px;
+    flex-shrink: 0;
   }
 
   /* =========================================================================

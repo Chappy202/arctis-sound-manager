@@ -11,6 +11,7 @@
    */
 
   import { get } from "svelte/store";
+  import { untrack } from "svelte";
   import { engineState } from "../stores.js";
   import { eqEditing } from "../stores/eqEditing.js";
   import {
@@ -30,13 +31,16 @@
     micBandToArgs,
     backendLabel,
     backendAvailable,
-    backendTooltip,
   } from "../mic.js";
   import { findMicPresetDescription } from "./micPresetUtils.js";
   import EqGraph from "./EqGraph.svelte";
   import BandList from "./BandList.svelte";
   import LevelMeter from "./LevelMeter.svelte";
   import { type Band } from "../eq.js";
+  import Switch from "../ui/Switch.svelte";
+  import Slider from "../ui/Slider.svelte";
+  import Select from "../ui/Select.svelte";
+  import type { SelectOption } from "../ui/selectUtils.js";
 
   // ---------------------------------------------------------------------------
   // Derived mic state
@@ -82,6 +86,21 @@
     findMicPresetDescription(selectedPreset, micPresets),
   );
 
+  // Suppression-backend options. Unavailable backends keep an "(not installed)"
+  // suffix (onBackendChange refuses to switch to them — see guard above).
+  const backendOptions = $derived<SelectOption[]>(
+    ["deep_filter", "rnnoise"].map((b) => ({
+      value: b,
+      label: backendLabel(b) + (backendAvailable(b, availableBackends) ? "" : " (not installed)"),
+    })),
+  );
+
+  // Preset picker options, with a leading placeholder for the empty selection.
+  const presetOptions = $derived<SelectOption[]>([
+    { value: "", label: "— choose a preset —" },
+    ...micPresets.map((p) => ({ value: p.name, label: p.name })),
+  ]);
+
   $effect(() => {
     // Keep local input in sync when state arrives (only if not currently editing)
     if (!settingHwMic) {
@@ -121,33 +140,89 @@
   // Handlers
   // ---------------------------------------------------------------------------
 
-  function onMasterToggle(e: Event) {
-    const on = (e.target as HTMLInputElement).checked;
+  function onMasterToggle(on: boolean) {
     micEnable(on).then(applyState).catch((err) => {
       console.warn("[MicPage] micEnable failed:", err);
     });
   }
 
-  function onStageToggle(kind: string, e: Event) {
-    const on = (e.target as HTMLInputElement).checked;
+  function onStageToggle(kind: string, on: boolean) {
     const wireName = stageWireName(kind);
     micStage(wireName, on).then(applyState).catch((err) => {
       console.warn(`[MicPage] micStage(${wireName}) failed:`, err);
     });
   }
 
-  function onParamChange(param: string, e: Event) {
-    const value = parseFloat((e.target as HTMLInputElement).value);
-    if (isNaN(value)) return;
-    micSet(param, value).then(applyState).catch((err) => {
-      console.warn(`[MicPage] micSet(${param}) failed:`, err);
+  function onBackendChange(backend: string) {
+    if (!backendAvailable(backend, availableBackends)) return; // never switch to an uninstalled backend
+    micSuppressionBackend(backend).then(applyState).catch((err) => {
+      console.warn(`[MicPage] micSuppressionBackend(${backend}) failed:`, err);
     });
   }
 
-  function onBackendChange(e: Event) {
-    const backend = (e.target as HTMLSelectElement).value;
-    micSuppressionBackend(backend).then(applyState).catch((err) => {
-      console.warn(`[MicPage] micSuppressionBackend(${backend}) failed:`, err);
+  // ---------------------------------------------------------------------------
+  // Slider param drafts — local mirror so each slider thumb + readout track
+  // during a drag (engine values only update after a successful commit). The
+  // draft is keyed by the backend param name. We resync a key from the snapshot
+  // ONLY when its engine value actually changes (i.e. a real state update lands),
+  // so polling never clobbers a value the user is mid-drag on, and there's no
+  // flicker between release and the commit round-trip.
+  // ---------------------------------------------------------------------------
+
+  let draft = $state<Record<string, number>>({
+    gain_db: 0,
+    highpass_freq: 0,
+    attenuation_limit_db: 0,
+    vad_threshold: 0,
+    vad_grace_ms: 0,
+    vad_retro_grace_ms: 0,
+    comp_threshold_db: 0,
+    comp_ratio: 0,
+    comp_makeup_db: 0,
+    gate_threshold: 0,
+  });
+
+  // Last engine value we synced per key (plain, non-reactive mirror).
+  const lastSynced: Record<string, number> = {};
+
+  $effect(() => {
+    const next: Record<string, number> = {
+      gain_db: paramVal(gainStage, "gain_db"),
+      highpass_freq: paramVal(highpassStage, "freq_hz"),
+      attenuation_limit_db: paramVal(suppressionStage, "attenuation_limit_db"),
+      vad_threshold: paramVal(suppressionStage, "vad_threshold"),
+      vad_grace_ms: paramVal(suppressionStage, "vad_grace_ms"),
+      vad_retro_grace_ms: paramVal(suppressionStage, "vad_retro_grace_ms"),
+      comp_threshold_db: paramVal(compStage, "threshold_db"),
+      comp_ratio: paramVal(compStage, "ratio"),
+      comp_makeup_db: paramVal(compStage, "makeup_db"),
+      gate_threshold: paramVal(gateStage, "threshold"),
+    };
+    untrack(() => {
+      const merged = { ...draft };
+      let changed = false;
+      for (const key of Object.keys(next)) {
+        if (next[key] !== lastSynced[key]) {
+          lastSynced[key] = next[key];
+          merged[key] = next[key];
+          changed = true;
+        }
+      }
+      if (changed) draft = merged;
+    });
+  });
+
+  /** Update the draft for a param during a drag (drives thumb + readout). */
+  function setParamDraft(param: string, value: number) {
+    draft = { ...draft, [param]: value };
+  }
+
+  /** Commit a param to the backend on pointer-up / keyboard commit. */
+  function commitParam(param: string, value: number) {
+    draft = { ...draft, [param]: value };
+    if (isNaN(value)) return;
+    micSet(param, value).then(applyState).catch((err) => {
+      console.warn(`[MicPage] micSet(${param}) failed:`, err);
     });
   }
 
@@ -254,18 +329,13 @@
       <div class="card-body">
         <div class="control-row">
           <span class="field-label">ENABLE MIC DSP CHAIN</span>
-          <label class="toggle" title="Enable or disable the entire mic DSP chain">
-            <input
-              type="checkbox"
-              class="toggle-input"
+          <span title="Enable or disable the entire mic DSP chain">
+            <Switch
               checked={masterEnabled}
-              onchange={onMasterToggle}
-              aria-label="Enable mic DSP chain"
+              onCheckedChange={onMasterToggle}
+              ariaLabel="Enable mic DSP chain"
             />
-            <span class="toggle-track">
-              <span class="toggle-thumb"></span>
-            </span>
-          </label>
+          </span>
         </div>
         <!-- R3b: Live signal-peak meter via pw-record PCM capture.
              Shows real PCM peak (0 = silence, 1 = full scale).
@@ -284,6 +354,8 @@
       </div>
     </div>
 
+    <!-- ===== Config row: hardware source + presets (side-by-side on wide) ===== -->
+    <div class="mic-config-row">
     <!-- ===== Hardware mic source picker ===== -->
     <div class="device-card device-card--live">
       <div class="card-header">
@@ -358,18 +430,15 @@
           <div class="control-row">
             <span class="field-label">PRESET</span>
             <div class="select-group">
-              <select
-                class="ss-select preset-select"
-                value={selectedPreset}
-                onchange={(e) => { selectedPreset = (e.target as HTMLSelectElement).value; }}
-                disabled={applyingPreset}
-                aria-label="Select mic preset"
-              >
-                <option value="">— choose a preset —</option>
-                {#each micPresets as p (p.name)}
-                  <option value={p.name}>{p.name}</option>
-                {/each}
-              </select>
+              <div class="preset-select">
+                <Select
+                  options={presetOptions}
+                  value={selectedPreset}
+                  onValueChange={(v) => { selectedPreset = v; }}
+                  disabled={applyingPreset}
+                  ariaLabel="Select mic preset"
+                />
+              </div>
               <button
                 class="preset-apply-btn"
                 disabled={!selectedPreset || applyingPreset}
@@ -391,6 +460,10 @@
         </div>
       </div>
     {/if}
+    </div><!-- /mic-config-row -->
+
+    <!-- ===== Processing chain ===== -->
+    <h2 class="section-label">Processing chain</h2>
 
     <!-- Stage cards — dimmed when master is off -->
     <div class="controls-layout" class:controls-layout--dimmed={!masterEnabled} inert={!masterEnabled || undefined}>
@@ -405,17 +478,15 @@
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">◈</span>
             <h2 class="card-title">GAIN</h2>
-            <label class="toggle toggle--sm" title={stageUnavailableTooltip(gainStage)}>
-              <input
-                type="checkbox"
-                class="toggle-input"
+            <span title={stageUnavailableTooltip(gainStage)}>
+              <Switch
+                size="sm"
                 checked={gainStage.enabled}
                 disabled={isStageDisabled(gainStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("gain", e)}
-                aria-label="Enable gain stage"
+                onCheckedChange={(on) => onStageToggle("gain", on)}
+                ariaLabel="Enable gain stage"
               />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
+            </span>
           </div>
           <div
             class="card-body"
@@ -424,18 +495,19 @@
             <div class="control-row">
               <span class="field-label">GAIN (dB)</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="-20"
-                  max="30"
-                  step="0.5"
-                  value={paramVal(gainStage, "gain_db")}
-                  disabled={!gainStage.enabled || isStageDisabled(gainStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("gain_db", e)}
-                  aria-label="Gain dB"
-                />
-                <span class="slider-readout">{paramVal(gainStage, "gain_db").toFixed(1)} dB</span>
+                <div class="slider-control">
+                  <Slider
+                    min={-20}
+                    max={30}
+                    step={0.5}
+                    value={draft.gain_db}
+                    disabled={!gainStage.enabled || isStageDisabled(gainStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("gain_db", v)}
+                    onValueCommit={(v) => commitParam("gain_db", v)}
+                    ariaLabel="Gain dB"
+                  />
+                </div>
+                <span class="slider-readout">{draft.gain_db.toFixed(1)} dB</span>
               </div>
             </div>
           </div>
@@ -452,17 +524,15 @@
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">〰</span>
             <h2 class="card-title">HIGH-PASS</h2>
-            <label class="toggle toggle--sm">
-              <input
-                type="checkbox"
-                class="toggle-input"
+            <span>
+              <Switch
+                size="sm"
                 checked={highpassStage.enabled}
                 disabled={isStageDisabled(highpassStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("highpass", e)}
-                aria-label="Enable high-pass filter"
+                onCheckedChange={(on) => onStageToggle("highpass", on)}
+                ariaLabel="Enable high-pass filter"
               />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
+            </span>
           </div>
           <div
             class="card-body"
@@ -471,18 +541,19 @@
             <div class="control-row">
               <span class="field-label">CUTOFF (Hz)</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="20"
-                  max="300"
-                  step="5"
-                  value={paramVal(highpassStage, "freq_hz")}
-                  disabled={!highpassStage.enabled || isStageDisabled(highpassStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("highpass_freq", e)}
-                  aria-label="High-pass cutoff Hz"
-                />
-                <span class="slider-readout">{Math.round(paramVal(highpassStage, "freq_hz"))} Hz</span>
+                <div class="slider-control">
+                  <Slider
+                    min={20}
+                    max={300}
+                    step={5}
+                    value={draft.highpass_freq}
+                    disabled={!highpassStage.enabled || isStageDisabled(highpassStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("highpass_freq", v)}
+                    onValueCommit={(v) => commitParam("highpass_freq", v)}
+                    ariaLabel="High-pass cutoff Hz"
+                  />
+                </div>
+                <span class="slider-readout">{Math.round(draft.highpass_freq)} Hz</span>
               </div>
             </div>
           </div>
@@ -499,17 +570,15 @@
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">◉</span>
             <h2 class="card-title">NOISE SUPPRESSION</h2>
-            <label class="toggle toggle--sm" title={stageUnavailableTooltip(suppressionStage)}>
-              <input
-                type="checkbox"
-                class="toggle-input"
+            <span title={stageUnavailableTooltip(suppressionStage)}>
+              <Switch
+                size="sm"
                 checked={suppressionStage.enabled}
                 disabled={isStageDisabled(suppressionStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("suppression", e)}
-                aria-label="Enable noise suppression"
+                onCheckedChange={(on) => onStageToggle("suppression", on)}
+                ariaLabel="Enable noise suppression"
               />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
+            </span>
           </div>
           <div
             class="card-body"
@@ -519,23 +588,15 @@
             <div class="control-row">
               <span class="field-label">BACKEND</span>
               <div class="select-group">
-                <select
-                  class="ss-select"
-                  value={suppressionBackend}
-                  disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
-                  onchange={onBackendChange}
-                  aria-label="Noise suppression backend"
-                >
-                  {#each ["deep_filter", "rnnoise"] as b (b)}
-                    <option
-                      value={b}
-                      disabled={!backendAvailable(b, availableBackends)}
-                      title={backendTooltip(b, availableBackends)}
-                    >
-                      {backendLabel(b)}{!backendAvailable(b, availableBackends) ? " (not installed)" : ""}
-                    </option>
-                  {/each}
-                </select>
+                <div class="select-control">
+                  <Select
+                    options={backendOptions}
+                    value={suppressionBackend}
+                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                    onValueChange={onBackendChange}
+                    ariaLabel="Noise suppression backend"
+                  />
+                </div>
               </div>
             </div>
 
@@ -544,18 +605,19 @@
               <div class="control-row">
                 <span class="field-label">ATTENUATION LIMIT (dB)</span>
                 <div class="slider-group">
-                  <input
-                    type="range"
-                    class="ss-slider"
-                    min="0"
-                    max="100"
-                    step="1"
-                    value={paramVal(suppressionStage, "attenuation_limit_db")}
-                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
-                    onchange={(e) => onParamChange("attenuation_limit_db", e)}
-                    aria-label="DeepFilterNet attenuation limit dB"
-                  />
-                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "attenuation_limit_db"))} dB</span>
+                  <div class="slider-control">
+                    <Slider
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={draft.attenuation_limit_db}
+                      disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                      onValueChange={(v) => setParamDraft("attenuation_limit_db", v)}
+                      onValueCommit={(v) => commitParam("attenuation_limit_db", v)}
+                      ariaLabel="DeepFilterNet attenuation limit dB"
+                    />
+                  </div>
+                  <span class="slider-readout">{Math.round(draft.attenuation_limit_db)} dB</span>
                 </div>
               </div>
               <div class="field-row">
@@ -570,52 +632,55 @@
               <div class="control-row">
                 <span class="field-label">VAD THRESHOLD (%)</span>
                 <div class="slider-group">
-                  <input
-                    type="range"
-                    class="ss-slider"
-                    min="0"
-                    max="99"
-                    step="1"
-                    value={paramVal(suppressionStage, "vad_threshold")}
-                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
-                    onchange={(e) => onParamChange("vad_threshold", e)}
-                    aria-label="VAD threshold percent"
-                  />
-                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_threshold"))}%</span>
+                  <div class="slider-control">
+                    <Slider
+                      min={0}
+                      max={99}
+                      step={1}
+                      value={draft.vad_threshold}
+                      disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                      onValueChange={(v) => setParamDraft("vad_threshold", v)}
+                      onValueCommit={(v) => commitParam("vad_threshold", v)}
+                      ariaLabel="VAD threshold percent"
+                    />
+                  </div>
+                  <span class="slider-readout">{Math.round(draft.vad_threshold)}%</span>
                 </div>
               </div>
               <div class="control-row">
                 <span class="field-label">VAD GRACE (ms)</span>
                 <div class="slider-group">
-                  <input
-                    type="range"
-                    class="ss-slider"
-                    min="0"
-                    max="1000"
-                    step="50"
-                    value={paramVal(suppressionStage, "vad_grace_ms")}
-                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
-                    onchange={(e) => onParamChange("vad_grace_ms", e)}
-                    aria-label="VAD grace period ms"
-                  />
-                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_grace_ms"))} ms</span>
+                  <div class="slider-control">
+                    <Slider
+                      min={0}
+                      max={1000}
+                      step={50}
+                      value={draft.vad_grace_ms}
+                      disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                      onValueChange={(v) => setParamDraft("vad_grace_ms", v)}
+                      onValueCommit={(v) => commitParam("vad_grace_ms", v)}
+                      ariaLabel="VAD grace period ms"
+                    />
+                  </div>
+                  <span class="slider-readout">{Math.round(draft.vad_grace_ms)} ms</span>
                 </div>
               </div>
               <div class="control-row">
                 <span class="field-label">VAD RETRO GRACE (ms)</span>
                 <div class="slider-group">
-                  <input
-                    type="range"
-                    class="ss-slider"
-                    min="0"
-                    max="200"
-                    step="10"
-                    value={paramVal(suppressionStage, "vad_retro_grace_ms")}
-                    disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
-                    onchange={(e) => onParamChange("vad_retro_grace_ms", e)}
-                    aria-label="VAD retro grace period ms"
-                  />
-                  <span class="slider-readout">{Math.round(paramVal(suppressionStage, "vad_retro_grace_ms"))} ms</span>
+                  <div class="slider-control">
+                    <Slider
+                      min={0}
+                      max={200}
+                      step={10}
+                      value={draft.vad_retro_grace_ms}
+                      disabled={!suppressionStage.enabled || isStageDisabled(suppressionStage) || !masterEnabled}
+                      onValueChange={(v) => setParamDraft("vad_retro_grace_ms", v)}
+                      onValueCommit={(v) => commitParam("vad_retro_grace_ms", v)}
+                      ariaLabel="VAD retro grace period ms"
+                    />
+                  </div>
+                  <span class="slider-readout">{Math.round(draft.vad_retro_grace_ms)} ms</span>
                 </div>
               </div>
               <div class="field-row">
@@ -639,17 +704,15 @@
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">◎</span>
             <h2 class="card-title">COMPRESSOR</h2>
-            <label class="toggle toggle--sm" title={stageUnavailableTooltip(compStage)}>
-              <input
-                type="checkbox"
-                class="toggle-input"
+            <span title={stageUnavailableTooltip(compStage)}>
+              <Switch
+                size="sm"
                 checked={compStage.enabled}
                 disabled={isStageDisabled(compStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("compressor", e)}
-                aria-label="Enable compressor"
+                onCheckedChange={(on) => onStageToggle("compressor", on)}
+                ariaLabel="Enable compressor"
               />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
+            </span>
           </div>
           <div
             class="card-body"
@@ -658,52 +721,55 @@
             <div class="control-row">
               <span class="field-label">THRESHOLD (dB)</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="-30"
-                  max="0"
-                  step="1"
-                  value={paramVal(compStage, "threshold_db")}
-                  disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("comp_threshold_db", e)}
-                  aria-label="Compressor threshold dB"
-                />
-                <span class="slider-readout">{paramVal(compStage, "threshold_db").toFixed(1)} dB</span>
+                <div class="slider-control">
+                  <Slider
+                    min={-30}
+                    max={0}
+                    step={1}
+                    value={draft.comp_threshold_db}
+                    disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("comp_threshold_db", v)}
+                    onValueCommit={(v) => commitParam("comp_threshold_db", v)}
+                    ariaLabel="Compressor threshold dB"
+                  />
+                </div>
+                <span class="slider-readout">{draft.comp_threshold_db.toFixed(1)} dB</span>
               </div>
             </div>
             <div class="control-row">
               <span class="field-label">RATIO</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="1"
-                  max="20"
-                  step="0.5"
-                  value={paramVal(compStage, "ratio")}
-                  disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("comp_ratio", e)}
-                  aria-label="Compressor ratio"
-                />
-                <span class="slider-readout">{paramVal(compStage, "ratio").toFixed(1)}:1</span>
+                <div class="slider-control">
+                  <Slider
+                    min={1}
+                    max={20}
+                    step={0.5}
+                    value={draft.comp_ratio}
+                    disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("comp_ratio", v)}
+                    onValueCommit={(v) => commitParam("comp_ratio", v)}
+                    ariaLabel="Compressor ratio"
+                  />
+                </div>
+                <span class="slider-readout">{draft.comp_ratio.toFixed(1)}:1</span>
               </div>
             </div>
             <div class="control-row">
               <span class="field-label">MAKEUP (dB)</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="0"
-                  max="24"
-                  step="0.5"
-                  value={paramVal(compStage, "makeup_db")}
-                  disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("comp_makeup_db", e)}
-                  aria-label="Compressor makeup gain dB"
-                />
-                <span class="slider-readout">{paramVal(compStage, "makeup_db").toFixed(1)} dB</span>
+                <div class="slider-control">
+                  <Slider
+                    min={0}
+                    max={24}
+                    step={0.5}
+                    value={draft.comp_makeup_db}
+                    disabled={!compStage.enabled || isStageDisabled(compStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("comp_makeup_db", v)}
+                    onValueCommit={(v) => commitParam("comp_makeup_db", v)}
+                    ariaLabel="Compressor makeup gain dB"
+                  />
+                </div>
+                <span class="slider-readout">{draft.comp_makeup_db.toFixed(1)} dB</span>
               </div>
             </div>
           </div>
@@ -720,17 +786,15 @@
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">▮</span>
             <h2 class="card-title">NOISE GATE</h2>
-            <label class="toggle toggle--sm" title={stageUnavailableTooltip(gateStage)}>
-              <input
-                type="checkbox"
-                class="toggle-input"
+            <span title={stageUnavailableTooltip(gateStage)}>
+              <Switch
+                size="sm"
                 checked={gateStage.enabled}
                 disabled={isStageDisabled(gateStage) || !masterEnabled}
-                onchange={(e) => onStageToggle("gate", e)}
-                aria-label="Enable noise gate"
+                onCheckedChange={(on) => onStageToggle("gate", on)}
+                ariaLabel="Enable noise gate"
               />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
+            </span>
           </div>
           <div
             class="card-body"
@@ -739,18 +803,19 @@
             <div class="control-row">
               <span class="field-label">THRESHOLD</span>
               <div class="slider-group">
-                <input
-                  type="range"
-                  class="ss-slider"
-                  min="0"
-                  max="0.5"
-                  step="0.01"
-                  value={paramVal(gateStage, "threshold")}
-                  disabled={!gateStage.enabled || isStageDisabled(gateStage) || !masterEnabled}
-                  onchange={(e) => onParamChange("gate_threshold", e)}
-                  aria-label="Noise gate threshold"
-                />
-                <span class="slider-readout">{paramVal(gateStage, "threshold").toFixed(2)}</span>
+                <div class="slider-control">
+                  <Slider
+                    min={0}
+                    max={0.5}
+                    step={0.01}
+                    value={draft.gate_threshold}
+                    disabled={!gateStage.enabled || isStageDisabled(gateStage) || !masterEnabled}
+                    onValueChange={(v) => setParamDraft("gate_threshold", v)}
+                    onValueCommit={(v) => commitParam("gate_threshold", v)}
+                    ariaLabel="Noise gate threshold"
+                  />
+                </div>
+                <span class="slider-readout">{draft.gate_threshold.toFixed(2)}</span>
               </div>
             </div>
           </div>
@@ -771,21 +836,19 @@
         <div class="card-header">
           <span class="card-icon" aria-hidden="true">〰</span>
           <h2 class="card-title">MIC EQ</h2>
-          <label class="toggle toggle--sm" title={stageUnavailableTooltip(micEqStage)}>
-            <input
-              type="checkbox"
-              class="toggle-input"
+          <span title={stageUnavailableTooltip(micEqStage)}>
+            <Switch
+              size="sm"
               checked={micEqStage.enabled}
               disabled={isStageDisabled(micEqStage) || !masterEnabled}
-              onchange={(e) => onStageToggle("mic_eq", e)}
-              aria-label="Enable mic EQ"
+              onCheckedChange={(on) => onStageToggle("mic_eq", on)}
+              ariaLabel="Enable mic EQ"
             />
-            <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          </label>
+          </span>
         </div>
         {#if micEqBands.length > 0}
           <div class="card-body mic-eq-body">
-            <div class="canvas-area">
+            <div class="mic-eq-graph">
               <EqGraph
                 bands={micEqBands}
                 selectedIndex={selectedBandIndex}
@@ -794,7 +857,7 @@
                 onFlush={handleMicEqFlush}
               />
             </div>
-            <div class="band-list-wrap">
+            <div class="mic-eq-bands">
               <BandList
                 bands={micEqBands}
                 selectedIndex={selectedBandIndex}
@@ -820,7 +883,31 @@
   .mic-page {
     display: flex;
     flex-direction: column;
-    gap: var(--ss-space-4);
+    gap: var(--ss-space-5);
+  }
+
+  /* ===== Section label ===== */
+  .section-label {
+    font-family: var(--ss-font-display);
+    font-size: var(--ss-type-h3-size);
+    font-weight: var(--ss-type-h3-weight);
+    letter-spacing: var(--ss-type-h3-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-tertiary);
+    margin: var(--ss-space-1) 0 calc(-1 * var(--ss-space-2));
+  }
+
+  /* ===== Config row: hardware source + presets ===== */
+  .mic-config-row {
+    display: flex;
+    gap: var(--ss-space-5);
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .mic-config-row > .device-card {
+    flex: 1 1 340px;
+    min-width: 0;
   }
 
   /* ===== Page header ===== */
@@ -908,8 +995,11 @@
   /* ===== Controls layout (stage cards grid) ===== */
   .controls-layout {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-    gap: var(--ss-space-4);
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: var(--ss-space-5);
+    /* Each card keeps its natural height instead of stretching to the tallest
+       in its row (which left short cards like GAIN with big empty gaps). */
+    align-items: start;
   }
 
   .controls-layout--dimmed {
@@ -1044,82 +1134,6 @@
     border-bottom: none;
   }
 
-  /* ===== Toggle ===== */
-  .toggle {
-    display: inline-flex;
-    align-items: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    gap: var(--ss-space-2);
-  }
-
-  .toggle-input {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0, 0, 0, 0);
-    white-space: nowrap;
-  }
-
-  .toggle-track {
-    display: inline-flex;
-    align-items: center;
-    width: 36px;
-    height: 20px;
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-pill);
-    border: 1px solid var(--ss-border);
-    transition: background var(--ss-dur-fast) var(--ss-ease-standard),
-                border-color var(--ss-dur-fast) var(--ss-ease-standard);
-    position: relative;
-  }
-
-  .toggle-thumb {
-    position: absolute;
-    left: 2px;
-    width: 14px;
-    height: 14px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-tertiary);
-    transition: transform var(--ss-dur-fast) var(--ss-ease-standard),
-                background var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .toggle-input:checked + .toggle-track {
-    background: var(--ss-accent);
-    border-color: var(--ss-accent);
-  }
-
-  .toggle-input:checked + .toggle-track .toggle-thumb {
-    transform: translateX(16px);
-    background: white;
-  }
-
-  .toggle-input:disabled + .toggle-track {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .toggle-input:focus-visible + .toggle-track {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .toggle--sm .toggle-track {
-    width: 32px;
-    height: 18px;
-  }
-
-  .toggle--sm .toggle-thumb {
-    width: 12px;
-    height: 12px;
-  }
-
-  .toggle--sm .toggle-input:checked + .toggle-track .toggle-thumb {
-    transform: translateX(14px);
-  }
-
   /* ===== Slider ===== */
   .slider-group {
     display: flex;
@@ -1129,47 +1143,10 @@
     justify-content: flex-end;
   }
 
-  .ss-slider {
-    -webkit-appearance: none;
-    appearance: none;
-    height: 4px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-surface-input);
-    cursor: pointer;
+  /* Constrains the bits-ui Slider wrapper (which is width:100%). */
+  .slider-control {
     width: 120px;
     flex-shrink: 0;
-    outline: none;
-  }
-
-  .ss-slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 16px;
-    height: 16px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-bright);
-    box-shadow: var(--ss-e1);
-    cursor: pointer;
-  }
-
-  .ss-slider::-moz-range-thumb {
-    width: 16px;
-    height: 16px;
-    border-radius: var(--ss-radius-pill);
-    background: var(--ss-text-bright);
-    box-shadow: var(--ss-e1);
-    cursor: pointer;
-    border: none;
-  }
-
-  .ss-slider:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .ss-slider:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
   }
 
   .slider-readout {
@@ -1191,27 +1168,10 @@
     justify-content: flex-end;
   }
 
-  .ss-select {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-primary);
-    background: var(--ss-surface-input);
-    border: 1px solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    padding: var(--ss-space-1) var(--ss-space-2);
-    cursor: pointer;
-    outline: none;
-    min-width: 140px;
-  }
-
-  .ss-select:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .ss-select:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
+  /* Constrains the bits-ui Select wrapper (which is width:100%). */
+  .select-control {
+    width: 160px;
+    flex-shrink: 0;
   }
 
   /* ===== Input level meter (R3) ===== */
@@ -1360,18 +1320,28 @@
 
   .mic-eq-body {
     display: flex;
-    flex-direction: column;
-    gap: 0;
+    flex-wrap: wrap;
+    gap: var(--ss-space-5);
+    padding: var(--ss-space-4);
+    align-items: flex-start;
   }
 
-  .canvas-area {
-    height: 240px;
-    border-bottom: var(--ss-border-width) solid var(--ss-border);
+  /* Graph: capped so it keeps a sane aspect ratio (the SVG stretches to fill,
+     so an uncapped full-width box flattens the curve). Shares the row with the
+     band list on wide screens; stacks on narrow. */
+  .mic-eq-graph {
+    flex: 1 1 440px;
+    min-width: 0;
+    max-width: 820px;
+    height: 300px;
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-sm);
     overflow: hidden;
   }
 
-  .band-list-wrap {
-    padding: var(--ss-space-2) 0;
+  .mic-eq-bands {
+    flex: 1 1 240px;
+    min-width: 0;
   }
 
   /* ===== Preset picker ===== */
