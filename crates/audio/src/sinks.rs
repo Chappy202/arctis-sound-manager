@@ -119,6 +119,47 @@ pub fn parse_output_sinks(
     Ok(sinks)
 }
 
+/// Parse the live volume (0–100 percent) for a named node from `pw-dump` JSON.
+///
+/// Looks for a `PipeWire:Interface:Node` whose `info.props.node.name` matches
+/// `node_name`, then reads the first entry of `info.params.Props[0].channelVolumes`
+/// (falling back to `info.params.Props[0].volume`) and converts the linear value
+/// to a 0–100 percent integer.
+///
+/// Returns `None` if the node is absent, the JSON is malformed, or no volume
+/// field is present. Callers should fall back to the config's `volume_pct`.
+pub fn parse_node_volume(pw_dump_json: &str, node_name: &str) -> Option<u8> {
+    let array: serde_json::Value = serde_json::from_str(pw_dump_json).ok()?;
+    let objects = array.as_array()?;
+    for obj in objects {
+        let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty != "PipeWire:Interface:Node" {
+            continue;
+        }
+        let info = obj.get("info")?;
+        let props = info.get("props")?;
+        let name = props
+            .get("node.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if name != node_name {
+            continue;
+        }
+        let params = info.get("params")?;
+        let props_arr = params.get("Props")?.as_array()?;
+        let first = props_arr.first()?;
+        let linear = first
+            .get("channelVolumes")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_f64())
+            .or_else(|| first.get("volume").and_then(|v| v.as_f64()))?;
+        let pct = (linear * 100.0).round().clamp(0.0, 100.0) as u8;
+        return Some(pct);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +210,21 @@ mod tests {
                 .is_default,
             "onboard analog-stereo should be marked default"
         );
+    }
+
+    // ── TDD: parse_node_volume ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_node_volume_extracts_from_channel_volumes() {
+        let dump = include_str!("../tests/fixtures/pw_dump_volumes.json");
+        assert_eq!(parse_node_volume(dump, "Arctis_Game"), Some(50));
+        assert_eq!(parse_node_volume(dump, "Arctis_Chat"), Some(100));
+        assert_eq!(parse_node_volume(dump, "Arctis_Missing"), None);
+    }
+
+    #[test]
+    fn parse_node_volume_returns_none_on_invalid_json() {
+        assert_eq!(parse_node_volume("not json", "any"), None);
+        assert_eq!(parse_node_volume("", "any"), None);
     }
 }

@@ -1,12 +1,13 @@
 use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
-    move_stream_argv, query_pw_version, supports_builtin_noisegate, AppMatch, AudioBackend,
-    ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule,
-    Router, StageKind, SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
+    move_stream_argv, parse_node_volume, query_pw_version, supports_builtin_noisegate, AppMatch,
+    AudioBackend, ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe,
+    RouteRule, Router, StageKind, SurroundBackend, DEEPFILTER_PLUGIN_BASENAME,
+    RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig};
 use arctis_domain::{
-    CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    db_to_volume_pct, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
     MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
     MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
     MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
@@ -232,31 +233,46 @@ impl<R: CommandRunner> Engine<R> {
     }
 
     /// Return a flat UI-agnostic snapshot of the current engine state.
-    pub fn state(&self) -> crate::state::EngineState {
+    pub fn state(&mut self) -> crate::state::EngineState {
         use crate::state::{
             ChannelSnapshot, EngineState, EqBandSnapshot, EqPresetSnapshot, MicSnapshot,
             MicStageSnapshot, StageName, SuppressionBackend,
         };
+        // Best-effort live volume read from pw-dump (completes before any config borrow).
+        // On failure or empty output, falls back to persisted config values per channel.
+        let pw_dump_json: String = self
+            .runner
+            .run("pw-dump", &[])
+            .ok()
+            .filter(|o| o.status == 0)
+            .map(|o| o.stdout.clone())
+            .unwrap_or_default();
+
         let active = self.config.active().ok();
         let channels = active
             .map(|p| {
                 p.channels
                     .iter()
-                    .map(|ch| ChannelSnapshot {
-                        id: ch.id.clone(),
-                        node_name: ch.node_name.clone(),
-                        output_device: ch.output_device.clone(),
-                        eq_bands: convert::dense_eq_bands(ch)
-                            .iter()
-                            .map(|b| EqBandSnapshot {
-                                kind: b.kind.clone(),
-                                freq_hz: b.freq_hz,
-                                q: b.q,
-                                gain_db: b.gain_db,
-                            })
-                            .collect(),
-                        volume_db: ch.volume_db,
-                        muted: ch.muted,
+                    .map(|ch| {
+                        // Use live sink volume when pw-dump succeeds; fallback to config.
+                        let volume_pct = parse_node_volume(&pw_dump_json, &ch.node_name)
+                            .unwrap_or(ch.volume_pct);
+                        ChannelSnapshot {
+                            id: ch.id.clone(),
+                            node_name: ch.node_name.clone(),
+                            output_device: ch.output_device.clone(),
+                            eq_bands: convert::dense_eq_bands(ch)
+                                .iter()
+                                .map(|b| EqBandSnapshot {
+                                    kind: b.kind.clone(),
+                                    freq_hz: b.freq_hz,
+                                    q: b.q,
+                                    gain_db: b.gain_db,
+                                })
+                                .collect(),
+                            volume_pct,
+                            muted: ch.muted,
+                        }
                     })
                     .collect()
             })
@@ -419,6 +435,7 @@ impl<R: CommandRunner> Engine<R> {
                 suppression_backend,
                 available_suppression_backends,
                 hw_mic: mc.hw_mic.clone(),
+                volume_pct: mc.volume_pct,
             }
         } else {
             MicSnapshot::default()
@@ -459,7 +476,7 @@ impl<R: CommandRunner> Engine<R> {
             mic,
             surround,
             eq_presets,
-            master_volume_db: active.as_ref().map(|p| p.master_volume_db).unwrap_or(0.0),
+            master_volume_pct: active.as_ref().map(|p| p.master_volume_pct).unwrap_or(100),
             master_mute: active.as_ref().map(|p| p.master_mute).unwrap_or(false),
             chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
             default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
@@ -836,11 +853,11 @@ impl<R: CommandRunner> Engine<R> {
     pub fn set_channel_volume(
         &mut self,
         channel_id: &str,
-        volume_db: f32,
+        pct: u8,
     ) -> Result<(), EngineError> {
-        if !(CHANNEL_VOLUME_MIN_DB..=CHANNEL_VOLUME_MAX_DB).contains(&volume_db) {
+        if pct > 100 {
             return Err(EngineError::BadRequest(format!(
-                "volume_db {volume_db} out of range {CHANNEL_VOLUME_MIN_DB}..={CHANNEL_VOLUME_MAX_DB}"
+                "volume_pct {pct} out of range 0..=100"
             )));
         }
         // Mutate config
@@ -858,10 +875,10 @@ impl<R: CommandRunner> Engine<R> {
                 .ok_or_else(|| {
                     EngineError::BadRequest(format!("channel not found: {channel_id}"))
                 })?;
-            channel.volume_db = volume_db;
+            channel.volume_pct = pct;
         }
         self.save_config()?;
-        // Apply live
+        // Apply live: find node id, then wpctl set-volume <id> <factor>
         {
             let profile = self.config.active()?.clone();
             let channel = profile
@@ -873,12 +890,23 @@ impl<R: CommandRunner> Engine<R> {
                 })?;
             let def = convert::channel_def_from_cfg(channel);
             let spec = def.sink_spec();
-            let mut be = AudioBackend::new(&mut self.runner, spec);
-            be.apply_volume_mute(volume_db, channel.muted)?;
+            let id = {
+                let mut be = AudioBackend::new(&mut self.runner, spec);
+                be.find_node_id()?
+            };
+            let factor = format!("{:.4}", pct as f32 / 100.0);
+            let out = self.runner.run("wpctl", &["set-volume", &id, &factor])?;
+            if out.status != 0 {
+                return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                    program: "wpctl".into(),
+                    status: out.status,
+                    stderr: out.stderr,
+                }));
+            }
         }
         self.emit(Event::ChannelVolumeSet {
             channel_id: channel_id.to_string(),
-            volume_db,
+            volume_pct: pct,
         });
         Ok(())
     }
@@ -903,7 +931,7 @@ impl<R: CommandRunner> Engine<R> {
             channel.muted = muted;
         }
         self.save_config()?;
-        // Apply live
+        // Apply live: find node id, then wpctl set-mute <id> <1|0>
         {
             let profile = self.config.active()?.clone();
             let channel = profile
@@ -915,8 +943,19 @@ impl<R: CommandRunner> Engine<R> {
                 })?;
             let def = convert::channel_def_from_cfg(channel);
             let spec = def.sink_spec();
-            let mut be = AudioBackend::new(&mut self.runner, spec);
-            be.apply_volume_mute(channel.volume_db, muted)?;
+            let id = {
+                let mut be = AudioBackend::new(&mut self.runner, spec);
+                be.find_node_id()?
+            };
+            let mute_arg = if muted { "1" } else { "0" };
+            let out = self.runner.run("wpctl", &["set-mute", &id, mute_arg])?;
+            if out.status != 0 {
+                return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                    program: "wpctl".into(),
+                    status: out.status,
+                    stderr: out.stderr,
+                }));
+            }
         }
         self.emit(Event::ChannelMuteSet {
             channel_id: channel_id.to_string(),
@@ -1252,17 +1291,17 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Set the master output gain (dB) on the headset output via wpctl, persist,
     /// and emit MasterVolumeSet.
-    pub fn set_master_volume(&mut self, db: f32) -> Result<(), EngineError> {
+    pub fn set_master_volume(&mut self, pct: u8) -> Result<(), EngineError> {
         {
             let name = self.config.active_profile.clone();
             let p = self.config.profile_mut(&name).ok_or_else(|| {
                 EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
             })?;
-            p.master_volume_db = db;
+            p.master_volume_pct = pct;
         }
         self.save_config()?;
         // wpctl set-volume on @DEFAULT_AUDIO_SINK@ using a linear factor.
-        let linear = 10f32.powf(db / 20.0);
+        let linear = pct as f32 / 100.0;
         let factor = format!("{linear:.4}");
         let out = self
             .runner
@@ -1274,7 +1313,7 @@ impl<R: CommandRunner> Engine<R> {
                 stderr: out.stderr,
             }));
         }
-        self.emit(Event::MasterVolumeSet { volume_db: db });
+        self.emit(Event::MasterVolumeSet { volume_pct: pct });
         Ok(())
     }
 
@@ -1303,6 +1342,41 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Set the microphone chain volume (0–100%) via wpctl, persist, emit MicVolumeSet.
+    pub fn set_mic_volume(&mut self, pct: u8) -> Result<(), EngineError> {
+        if pct > 100 {
+            return Err(EngineError::BadRequest(format!(
+                "mic volume_pct {pct} out of range 0..=100"
+            )));
+        }
+        // Persist
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(name.clone()))
+            })?;
+            profile.mic.volume_pct = pct;
+        }
+        self.save_config()?;
+        // Apply live: find mic node id, then wpctl set-volume <id> <factor>
+        let id = {
+            let spec = convert::mic_chain_spec(&self.config.active()?.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
+            mic_be.find_node_id()?
+        };
+        let factor = format!("{:.4}", pct as f32 / 100.0);
+        let out = self.runner.run("wpctl", &["set-volume", &id, &factor])?;
+        if out.status != 0 {
+            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                program: "wpctl".into(),
+                status: out.status,
+                stderr: out.stderr,
+            }));
+        }
+        self.emit(Event::MicVolumeSet { volume_pct: pct });
+        Ok(())
+    }
+
     /// Set ChatMix position (Game<->Chat balance); applies derived volumes to the
     /// game and chat channels, persists position, emits ChatmixSet.
     pub fn set_chatmix(&mut self, position: i64) -> Result<(), EngineError> {
@@ -1317,8 +1391,8 @@ impl<R: CommandRunner> Engine<R> {
         let (game_db, chat_db) = chatmix_to_volumes(pos);
         // Reuse set_channel_volume (live + persist) for each side; ignore "channel
         // not found" so profiles lacking game/chat don't hard-fail.
-        let _ = self.set_channel_volume("game", game_db);
-        let _ = self.set_channel_volume("chat", chat_db);
+        let _ = self.set_channel_volume("game", db_to_volume_pct(game_db));
+        let _ = self.set_channel_volume("chat", db_to_volume_pct(chat_db));
         self.save_config()?;
         self.emit(Event::ChatmixSet { position: pos });
         Ok(())
@@ -1438,9 +1512,9 @@ impl<R: CommandRunner> Engine<R> {
             // Volume/mute apply
             {
                 let mut be2 = arctis_audio::AudioBackend::new(&mut self.runner, spec);
-                if let Err(e) = be2.apply_volume_mute(ch.volume_db, ch.muted) {
+                if let Err(e) = be2.apply_volume_mute_pct(ch.volume_pct, ch.muted) {
                     eprintln!(
-                        "warning: reconcile apply_volume_mute for channel '{}' failed (ignoring): {e}",
+                        "warning: reconcile apply_volume_mute_pct for channel '{}' failed (ignoring): {e}",
                         ch.id
                     );
                 }
@@ -2221,6 +2295,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2230,6 +2305,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2239,6 +2315,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -2246,6 +2323,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -2270,6 +2348,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2279,6 +2358,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2288,6 +2368,7 @@ mod tests {
                         output_device: Some("alsa_output.speakers".into()),
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -2298,6 +2379,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -2829,6 +2911,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2838,6 +2921,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -2847,6 +2931,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -2857,6 +2942,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -3151,7 +3237,7 @@ mod tests {
     #[test]
     fn state_reflects_active_profile() {
         let cfg = make_config_no_eq_no_routes();
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
         assert_eq!(s.active_profile, "default");
         // Engine::new calls ensure_standard_channels() which adds "aux" to the 3-channel config.
@@ -3173,6 +3259,7 @@ mod tests {
                     output_device: None,
                     eq: vec![],
                     volume_db: 0.0,
+                    volume_pct: 100,
                     muted: false,
                 },
                 ChannelConfig {
@@ -3182,6 +3269,7 @@ mod tests {
                     output_device: None,
                     eq: vec![],
                     volume_db: 0.0,
+                    volume_pct: 100,
                     muted: false,
                 },
                 ChannelConfig {
@@ -3191,6 +3279,7 @@ mod tests {
                     output_device: None,
                     eq: vec![],
                     volume_db: 0.0,
+                    volume_pct: 100,
                     muted: false,
                 },
             ],
@@ -3198,6 +3287,7 @@ mod tests {
             mic: MicChainConfig::default(),
             surround: arctis_config::SurroundConfig::default(),
             master_volume_db: 0.0,
+            master_volume_pct: 100,
             master_mute: false,
             chatmix_position: 4,
             default_sink_channel: None,
@@ -3367,6 +3457,7 @@ mod tests {
                             },
                         ],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -3376,6 +3467,7 @@ mod tests {
                         output_device: Some("alsa_output.headphones".into()),
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -3385,6 +3477,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -3392,6 +3485,7 @@ mod tests {
                 mic: MicChainConfig::default(),
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -3404,7 +3498,7 @@ mod tests {
     #[test]
     fn state_includes_full_eq_band_values_from_config() {
         let cfg = make_config_with_eq_bands();
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
 
         // Find game channel
@@ -3446,7 +3540,7 @@ mod tests {
     #[test]
     fn state_channel_snapshot_has_output_device() {
         let cfg = make_config_with_eq_bands();
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
         let chat = s.channels.iter().find(|c| c.id == "chat").unwrap();
         assert_eq!(chat.output_device, Some("alsa_output.headphones".into()));
@@ -3584,7 +3678,7 @@ mod tests {
         engine.set_event_sink(tx);
 
         engine
-            .set_channel_volume("game", -6.0)
+            .set_channel_volume("game", 50)
             .expect("set_channel_volume should succeed");
 
         // Persisted
@@ -3592,17 +3686,14 @@ mod tests {
         assert!(saved_path.exists(), "config must be persisted");
         let saved_str = std::fs::read_to_string(&saved_path).unwrap();
         assert!(
-            saved_str.contains("volume_db = -6"),
-            "config.toml must contain volume_db = -6, got: {saved_str}"
+            saved_str.contains("volume_pct = 50"),
+            "config.toml must contain volume_pct = 50, got: {saved_str}"
         );
 
         // In-memory state updated
         let state = engine.state();
         let ch = state.channels.iter().find(|c| c.id == "game").unwrap();
-        assert!(
-            (ch.volume_db - (-6.0)).abs() < f32::EPSILON,
-            "volume_db must be -6.0"
-        );
+        assert_eq!(ch.volume_pct, 50, "volume_pct must be 50");
 
         // Event emitted
         let event = rx
@@ -3613,10 +3704,10 @@ mod tests {
                 event,
                 crate::state::Event::ChannelVolumeSet {
                     ref channel_id,
-                    volume_db,
-                } if channel_id == "game" && (volume_db - (-6.0)).abs() < f32::EPSILON
+                    volume_pct,
+                } if channel_id == "game" && volume_pct == 50
             ),
-            "event must be ChannelVolumeSet{{channel_id: game, volume_db: -6.0}}"
+            "event must be ChannelVolumeSet{{channel_id: game, volume_pct: 50}}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3628,8 +3719,8 @@ mod tests {
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(MockRunner::new(), cfg);
         let err = engine
-            .set_channel_volume("game", 100.0)
-            .expect_err("100 dB should be rejected");
+            .set_channel_volume("game", 101)
+            .expect_err("101 pct should be rejected");
         assert!(
             matches!(err, EngineError::BadRequest(_)),
             "expected BadRequest"
@@ -3691,7 +3782,7 @@ mod tests {
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(MockRunner::new(), cfg);
         let err = engine
-            .set_channel_volume("nonexistent", 0.0)
+            .set_channel_volume("nonexistent", 50)
             .expect_err("unknown channel should fail");
         assert!(matches!(err, EngineError::BadRequest(_)));
     }
@@ -3704,6 +3795,109 @@ mod tests {
             .set_channel_mute("nonexistent", true)
             .expect_err("unknown channel should fail");
         assert!(matches!(err, EngineError::BadRequest(_)));
+    }
+
+    // ── A2 TDD: wpctl argv assertions + pw-dump live read ──────────────────
+
+    #[test]
+    fn set_channel_volume_pct_emits_correct_wpctl_argv() {
+        // TDD A2: set_channel_volume must call wpctl set-volume <node_id> <pct/100>
+        // ls_all_present() maps Arctis_Game → id "10"
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // [0] pw-cli ls Node → id "10" for Arctis_Game
+            .with_output(0, "", ""); // [1] wpctl set-volume (success)
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .set_channel_volume("game", 50)
+            .expect("set_channel_volume should succeed");
+        let calls = &engine.runner.calls;
+        assert_eq!(
+            calls[0],
+            vec!["pw-cli", "ls", "Node"],
+            "first call must be pw-cli ls Node (find_node_id)"
+        );
+        assert_eq!(
+            calls[1],
+            vec!["wpctl", "set-volume", "10", "0.5000"],
+            "second call must be wpctl set-volume <id> 0.5000"
+        );
+    }
+
+    #[test]
+    fn state_channel_volume_pct_from_pw_dump() {
+        // TDD A2: state() must report live volume_pct from pw-dump, falling back to config
+        let mut cfg = make_config_no_eq_no_routes();
+        // Config has game at 80%, but pw-dump reports 50% — live read should win
+        cfg.profiles[0].channels[0].volume_pct = 80;
+        let pw_dump = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+        );
+        let runner = MockRunner::new().with_output(0, pw_dump, ""); // [0] pw-dump
+        let mut engine = Engine::new(runner, cfg);
+        let state = engine.state();
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game.volume_pct, 50,
+            "state() must report live volume_pct 50 from pw-dump, not config value 80"
+        );
+    }
+
+    #[test]
+    fn set_mic_volume_pct_wpctl_argv() {
+        // TDD A2: set_mic_volume must call wpctl set-volume <mic_node_id> <pct/100>
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_vol");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled();
+        // arctis_clean_mic → id "20"
+        let ls_with_mic = "id 20\n    node.name = \"arctis_clean_mic\"\n";
+        let runner = MockRunner::new()
+            .with_output(0, ls_with_mic, "") // [0] pw-cli ls Node (find_node_id for mic)
+            .with_output(0, "", ""); // [1] wpctl set-volume (success)
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .set_mic_volume(75)
+            .expect("set_mic_volume should succeed");
+        let calls = &engine.runner.calls;
+        assert_eq!(
+            calls[0],
+            vec!["pw-cli", "ls", "Node"],
+            "first call must be pw-cli ls Node (mic find_node_id)"
+        );
+        assert_eq!(
+            calls[1],
+            vec!["wpctl", "set-volume", "20", "0.7500"],
+            "second call must be wpctl set-volume <mic_id> 0.7500"
+        );
+        // Config persisted
+        let saved_path = tmp.join("config.toml");
+        assert!(saved_path.exists(), "config must be persisted");
+        let saved = std::fs::read_to_string(&saved_path).unwrap();
+        assert!(
+            saved.contains("volume_pct = 75"),
+            "config.toml must contain volume_pct = 75, got: {saved}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_mic_volume_out_of_range_bad_request() {
+        // TDD A2: pct > 100 must return BadRequest
+        let cfg = make_config_mic_enabled();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_mic_volume(101)
+            .expect_err("101 pct should be rejected");
+        assert!(
+            matches!(err, EngineError::BadRequest(_)),
+            "expected BadRequest, got: {err:?}"
+        );
     }
 
     #[test]
@@ -4012,7 +4206,7 @@ mod tests {
     #[test]
     fn device_set_errors_when_worker_not_wired() {
         let cfg = make_config_no_eq_no_routes();
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         // device_tx is None — must return BadRequest
         let result = engine.device_set("sidetone", 2);
         assert!(
@@ -4183,6 +4377,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -4192,6 +4387,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -4201,6 +4397,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -4208,6 +4405,7 @@ mod tests {
                 mic: mic_enabled_passthrough(),
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -4552,6 +4750,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -4561,6 +4760,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -4570,6 +4770,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -4581,6 +4782,7 @@ mod tests {
                 },
                 surround: arctis_config::SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -4906,7 +5108,7 @@ mod tests {
         let probe = MockPluginProbe::with([arctis_audio::DEEPFILTER_PLUGIN_BASENAME]);
         let mut cfg = make_config_mic_enabled();
         cfg.profiles[0].mic.suppression.backend = arctis_config::SuppressionBackend::DeepFilter;
-        let engine = Engine::with_probe(MockRunner::new(), cfg, Box::new(probe));
+        let mut engine = Engine::with_probe(MockRunner::new(), cfg, Box::new(probe));
         let state = engine.state();
         assert_eq!(
             state.mic.suppression_backend,
@@ -5141,6 +5343,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -5150,6 +5353,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                     ChannelConfig {
@@ -5159,6 +5363,7 @@ mod tests {
                         output_device: None,
                         eq: vec![],
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     },
                 ],
@@ -5171,6 +5376,7 @@ mod tests {
                     hw_sink: None,
                 },
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -5460,7 +5666,7 @@ mod tests {
             channels: vec!["game".into()],
             hw_sink: Some("alsa_output.pci".into()),
         };
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
 
         assert!(!s.surround.enabled);
@@ -6137,7 +6343,7 @@ mod tests {
         let mut cfg = make_config_no_eq_no_routes(); // game/chat/media
         cfg.profiles[0].channels.retain(|c| c.id != "aux");
         // Engine::new calls ensure_standard_channels() → aux is added.
-        let engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
         let st = engine.state();
         assert!(st.channels.iter().any(|c| c.id == "aux"), "aux auto-seeded on load");
     }
@@ -6152,8 +6358,8 @@ mod tests {
         // wpctl call for the gain (status 0).
         let runner = arctis_audio::MockRunner::new().with_output(0, "", "");
         let mut engine = Engine::new(runner, cfg);
-        engine.set_master_volume(-6.0).unwrap();
-        assert_eq!(engine.state().master_volume_db, -6.0);
+        engine.set_master_volume(50).unwrap();
+        assert_eq!(engine.state().master_volume_pct, 50);
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -6187,7 +6393,7 @@ mod tests {
 
     #[test]
     fn state_returns_ten_dense_bands_for_flat_channel() {
-        let engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
         let st = engine.state();
         let game = st.channels.iter().find(|c| c.id == "game").unwrap();
         assert_eq!(game.eq_bands.len(), 10, "flat channel must report 10 dense bands");
@@ -6242,7 +6448,7 @@ mod tests {
 
     #[test]
     fn state_returns_ten_dense_mic_eq_bands() {
-        let engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
+        let mut engine = Engine::new(arctis_audio::MockRunner::new(), make_config_no_eq_no_routes());
         let st = engine.state();
         assert_eq!(st.mic.eq_bands.len(), 10, "mic EQ must report 10 dense bands");
         assert_eq!(st.mic.eq_bands[0].freq_hz, 31.0);
@@ -6266,7 +6472,7 @@ mod tests {
         // dial_controls_balance defaults to true in make_config_no_eq_no_routes().
         let cfg = make_config_no_eq_no_routes();
         assert!(cfg.dial_controls_balance, "fixture must start with true");
-        let engine = Engine::new(MockRunner::new(), cfg);
+        let mut engine = Engine::new(MockRunner::new(), cfg);
         assert!(
             engine.state().dial_controls_balance,
             "state() must reflect config=true"
@@ -6275,7 +6481,7 @@ mod tests {
         // Flip the flag to false and confirm state() follows.
         let mut cfg2 = make_config_no_eq_no_routes();
         cfg2.dial_controls_balance = false;
-        let engine2 = Engine::new(MockRunner::new(), cfg2);
+        let mut engine2 = Engine::new(MockRunner::new(), cfg2);
         assert!(
             !engine2.state().dial_controls_balance,
             "state() must reflect config=false"

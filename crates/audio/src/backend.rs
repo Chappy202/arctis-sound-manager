@@ -130,6 +130,23 @@ impl<R: CommandRunner> AudioBackend<R> {
         Ok(())
     }
 
+    /// Apply volume+mute using a 0–100 percent value via `pw-cli s <id> Props …`.
+    /// Converts pct to linear (pct / 100.0) for channelVolumes.
+    /// Channel sinks are stereo → 2 identical channelVolume entries.
+    pub fn apply_volume_mute_pct(
+        &mut self,
+        volume_pct: u8,
+        muted: bool,
+    ) -> Result<(), AudioError> {
+        let id = self.find_node_id()?;
+        let linear = volume_pct as f32 / 100.0;
+        let argv = set_node_volume_props_argv(&id, &[linear, linear], muted)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-cli", &args)?;
+        Self::check(out, "pw-cli")?;
+        Ok(())
+    }
+
     /// Force a rebuild so a changed `SinkSpec` (e.g. a new playback target) is
     /// actually applied: tear down any existing instance, then create fresh.
     /// This is the enforcement the old per-channel output selector lacked.

@@ -99,6 +99,10 @@ pub struct MicStageSnapshot {
     pub params: std::collections::BTreeMap<String, f32>,
 }
 
+fn default_vol_pct_100() -> u8 {
+    100
+}
+
 /// Full mic chain snapshot returned in `EngineState`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MicSnapshot {
@@ -115,6 +119,9 @@ pub struct MicSnapshot {
     /// Populated from `profile.mic.hw_mic`; `None` is serde-default for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hw_mic: Option<String>,
+    /// Mic output volume as 0–100 percent. 100 = unity.
+    #[serde(default = "default_vol_pct_100")]
+    pub volume_pct: u8,
 }
 
 /// Full surround snapshot returned in `EngineState`.
@@ -148,9 +155,9 @@ pub struct EngineState {
     pub surround: SurroundSnapshot,
     #[serde(default)]
     pub eq_presets: Vec<EqPresetSnapshot>,
-    /// Master output gain in dB (0.0 = unity). Populated from the active profile.
-    #[serde(default)]
-    pub master_volume_db: f32,
+    /// Master output volume as 0–100 percent. 100 = unity / 0 dB.
+    #[serde(default = "default_vol_pct_100")]
+    pub master_volume_pct: u8,
     /// Whether the master output is muted.
     #[serde(default)]
     pub master_mute: bool,
@@ -183,8 +190,8 @@ pub struct ChannelSnapshot {
     pub output_device: Option<String>,
     /// Full per-band EQ state. Empty means flat / no overrides configured.
     pub eq_bands: Vec<EqBandSnapshot>,
-    /// Software volume in dB. 0.0 = unity gain.
-    pub volume_db: f32,
+    /// Software volume as 0–100 percent. 100 = unity / 0 dB.
+    pub volume_pct: u8,
     /// Whether the channel is muted.
     pub muted: bool,
 }
@@ -253,7 +260,7 @@ pub enum Event {
     },
     ChannelVolumeSet {
         channel_id: String,
-        volume_db: f32,
+        volume_pct: u8,
     },
     ChannelMuteSet {
         channel_id: String,
@@ -308,10 +315,13 @@ pub enum Event {
         id: String,
     },
     MasterVolumeSet {
-        volume_db: f32,
+        volume_pct: u8,
     },
     MasterMuteSet {
         muted: bool,
+    },
+    MicVolumeSet {
+        volume_pct: u8,
     },
     ChatmixSet {
         position: i64,

@@ -526,6 +526,7 @@ mod tests {
                     output_device: None,
                     eq: vec![],
                     volume_db: 0.0,
+                    volume_pct: 100,
                     muted: false,
                 },
                 ChannelConfig {
@@ -535,6 +536,7 @@ mod tests {
                     output_device: None,
                     eq: vec![],
                     volume_db: 0.0,
+                    volume_pct: 100,
                     muted: false,
                 },
             ],
@@ -542,6 +544,7 @@ mod tests {
             mic: MicChainConfig::default(),
             surround: SurroundConfig::default(),
             master_volume_db: 0.0,
+            master_volume_pct: 100,
             master_mute: false,
             chatmix_position: 4,
             default_sink_channel: None,
@@ -596,6 +599,7 @@ mod tests {
             output_device: None,
             eq: vec![],
             volume_db: 0.0,
+            volume_pct: 100,
             muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
@@ -617,6 +621,7 @@ mod tests {
                 gain_db: 2.0,
             }],
             volume_db: 0.0,
+            volume_pct: 100,
             muted: false,
         };
         let model = eq_model_for(&ch).unwrap();
@@ -645,7 +650,7 @@ mod tests {
     fn dense_eq_bands_overlays_overrides_on_defaults() {
         let mut ch = arctis_config::ChannelConfig {
             id: "game".into(), node_name: "Arctis_Game".into(), description: "g".into(),
-            output_device: None, eq: vec![], volume_db: 0.0, muted: false,
+            output_device: None, eq: vec![], volume_db: 0.0, volume_pct: 100, muted: false,
         };
         // Sparse override: only band index 2 set (a +3 dB highshelf at 300 Hz).
         ch.eq = vec![
@@ -667,7 +672,7 @@ mod tests {
     fn dense_eq_bands_empty_config_is_ten_defaults() {
         let ch = arctis_config::ChannelConfig {
             id: "chat".into(), node_name: "Arctis_Chat".into(), description: "c".into(),
-            output_device: None, eq: vec![], volume_db: 0.0, muted: false,
+            output_device: None, eq: vec![], volume_db: 0.0, volume_pct: 100, muted: false,
         };
         assert_eq!(dense_eq_bands(&ch), default_eq_band_configs());
     }
@@ -681,6 +686,7 @@ mod tests {
             output_device: Some("speakers".into()),
             eq: vec![],
             volume_db: 0.0,
+            volume_pct: 100,
             muted: false,
         };
         let def = channel_def_from_cfg(&ch);
@@ -1025,6 +1031,7 @@ mod tests {
                 output_device: None,
                 eq: vec![],
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             arctis_config::ChannelConfig {
@@ -1034,6 +1041,7 @@ mod tests {
                 output_device: Some("speakers".to_string()),
                 eq: vec![],
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
         ];

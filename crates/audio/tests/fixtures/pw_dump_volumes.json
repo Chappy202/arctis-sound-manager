@@ -1,0 +1,36 @@
+[
+  {
+    "type": "PipeWire:Interface:Node",
+    "id": 10,
+    "info": {
+      "props": {
+        "node.name": "Arctis_Game"
+      },
+      "params": {
+        "Props": [
+          {
+            "channelVolumes": [0.5, 0.5],
+            "mute": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "PipeWire:Interface:Node",
+    "id": 11,
+    "info": {
+      "props": {
+        "node.name": "Arctis_Chat"
+      },
+      "params": {
+        "Props": [
+          {
+            "channelVolumes": [1.0, 1.0],
+            "mute": false
+          }
+        ]
+      }
+    }
+  }
+]
