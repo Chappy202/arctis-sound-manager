@@ -236,6 +236,26 @@ impl MicChainConfig {
     pub fn passthrough() -> Self {
         Self::default()
     }
+
+    /// Recommended out-of-the-box chain for a fresh install: the chain is built
+    /// with a high-pass (rumble cut) and noise suppression on. Gain, compressor,
+    /// gate and EQ stay off. Suppression/highpass degrade gracefully when the
+    /// LADSPA plugin is absent (the stage is dropped + flagged unavailable), so
+    /// this is safe to seed even without DeepFilterNet installed.
+    pub fn recommended() -> Self {
+        Self {
+            enabled: true,
+            highpass: MicHighpassStage {
+                enabled: true,
+                ..MicHighpassStage::default()
+            },
+            suppression: MicSuppressionStage {
+                enabled: true,
+                ..MicSuppressionStage::default()
+            },
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for MicChainConfig {
@@ -322,6 +342,19 @@ impl Default for SurroundConfig {
             hrir: None,
             channels: default_surround_channels(),
             hw_sink: None,
+        }
+    }
+}
+
+impl SurroundConfig {
+    /// Recommended out-of-the-box surround for a fresh install: enabled for the
+    /// Game + Media channels (Chat stays clean stereo). `hrir: None` lets the
+    /// engine pick the first available HRIR; if none is installed the engine
+    /// reports an honest "no HRIR" state rather than spawning a broken sink.
+    pub fn recommended() -> Self {
+        Self {
+            enabled: true,
+            ..Self::default()
         }
     }
 }
@@ -473,8 +506,8 @@ impl Config {
                 name: "default".to_string(),
                 channels,
                 routes: Vec::new(),
-                mic: MicChainConfig::default(),
-                surround: SurroundConfig::default(),
+                mic: MicChainConfig::recommended(),
+                surround: SurroundConfig::recommended(),
                 master_volume_db: 0.0,
                 master_volume_pct: 100,
                 master_mute: false,
@@ -1054,17 +1087,23 @@ description = "Chat"
 
     /// 6. `Config::default_config()` validates and every profile's mic is passthrough.
     #[test]
-    fn default_config_includes_mic_passthrough() {
+    fn default_config_includes_recommended_mic() {
         let cfg = Config::default_config();
         assert!(cfg.validate().is_ok(), "default_config must be valid");
         for profile in &cfg.profiles {
-            assert_eq!(
-                profile.mic,
-                MicChainConfig::passthrough(),
-                "profile '{}' mic should be passthrough",
-                profile.name
-            );
+            // Fresh installs ship the recommended chain: enabled with high-pass +
+            // noise suppression on; gain/compressor/gate/EQ remain off.
+            assert!(profile.mic.enabled, "profile '{}' mic chain should be on", profile.name);
+            assert!(profile.mic.highpass.enabled, "profile '{}' mic high-pass should be on", profile.name);
+            assert!(profile.mic.suppression.enabled, "profile '{}' mic suppression should be on", profile.name);
+            assert!(!profile.mic.gain.enabled, "profile '{}' mic gain should be off", profile.name);
+            assert!(!profile.mic.compressor.enabled, "profile '{}' mic compressor should be off", profile.name);
+            assert!(!profile.mic.gate.enabled, "profile '{}' mic gate should be off", profile.name);
+            assert!(!profile.mic.eq_enabled, "profile '{}' mic EQ should be off", profile.name);
+            assert_eq!(profile.mic, MicChainConfig::recommended(), "profile '{}' mic should equal recommended()", profile.name);
         }
+        // passthrough()/default() semantics stay all-off and independent of the seed.
+        assert!(!MicChainConfig::passthrough().enabled, "passthrough() must remain disabled");
     }
 
     // ── Compressor validation tests ───────────────────────────────────────────
@@ -1340,17 +1379,22 @@ description = "Chat"
 
     /// 9. default_config() surround field is the default (disabled).
     #[test]
-    fn default_config_includes_surround_disabled() {
+    fn default_config_includes_recommended_surround() {
         let cfg = Config::default_config();
         assert!(cfg.validate().is_ok(), "default_config must be valid");
         for profile in &cfg.profiles {
+            // Fresh installs ship surround on for Game + Media (Chat stays stereo).
+            assert!(profile.surround.enabled, "profile '{}' surround should be on", profile.name);
             assert_eq!(
-                profile.surround,
-                SurroundConfig::default(),
-                "profile '{}' surround should be default (disabled)",
+                profile.surround.channels,
+                vec!["game".to_string(), "media".to_string()],
+                "profile '{}' surround should route game+media",
                 profile.name
             );
+            assert_eq!(profile.surround, SurroundConfig::recommended(), "profile '{}' surround should equal recommended()", profile.name);
         }
+        // default() semantics stay disabled and independent of the seed.
+        assert!(!SurroundConfig::default().enabled, "SurroundConfig::default() must remain disabled");
     }
 
     // ── F2.1: per-channel volume/mute config tests ────────────────────────────
