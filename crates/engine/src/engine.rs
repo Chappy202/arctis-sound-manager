@@ -129,6 +129,12 @@ pub struct Engine<R: CommandRunner> {
     /// Cached `pw-dump` stdout for the live volume read in `state()`, with the instant it was taken.
     /// `None` means no cache exists. Invalidated by TTL expiry only (not on volume writes).
     volume_dump_cache: Option<(std::time::Instant, String)>,
+    /// Timestamp of the most recent successful volume write (`set_channel_volume`,
+    /// `set_master_volume`, `set_mic_volume`). Used in `state()` to detect when the cached
+    /// pw-dump snapshot predates the write, so the just-written config value is reported instead
+    /// of the stale live value — prevents a post-commit thumb snap-back without re-spawning
+    /// pw-dump on every throttled drag commit (preserves A4 no-subprocess-per-drag property).
+    last_volume_write: Option<std::time::Instant>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -149,6 +155,7 @@ impl<R: CommandRunner> Engine<R> {
             pw_version: None,
             surround_routed: std::collections::HashSet::new(),
             volume_dump_cache: None,
+            last_volume_write: None,
         }
     }
 
@@ -171,6 +178,7 @@ impl<R: CommandRunner> Engine<R> {
             pw_version: None,
             surround_routed: std::collections::HashSet::new(),
             volume_dump_cache: None,
+            last_volume_write: None,
         }
     }
 
@@ -306,15 +314,31 @@ impl<R: CommandRunner> Engine<R> {
         // On failure or empty output, falls back to persisted config values per channel.
         let pw_dump_json = self.volume_dump();
 
+        // Use the live pw-dump channel volume only when the cached snapshot was taken AT/AFTER
+        // our last volume write; otherwise the cache is stale w.r.t. a just-applied value, so
+        // report the config value (avoids a post-commit thumb snap-back without re-spawning
+        // pw-dump on every throttled drag commit — preserves A4 no-subprocess-per-drag property).
+        let cache_taken = self.volume_dump_cache.as_ref().map(|(t, _)| *t);
+        let use_live = match (cache_taken, self.last_volume_write) {
+            (Some(taken), Some(written)) => taken >= written,
+            (Some(_), None) => true, // never wrote → live is authoritative
+            _ => false,              // no cache → fall back to config
+        };
+
         let active = self.config.active().ok();
         let channels = active
             .map(|p| {
                 p.channels
                     .iter()
                     .map(|ch| {
-                        // Use live sink volume when pw-dump succeeds; fallback to config.
-                        let volume_pct = parse_node_volume(&pw_dump_json, &ch.node_name)
-                            .unwrap_or(ch.volume_pct);
+                        // Use live sink volume when pw-dump is authoritative; fallback to config.
+                        // When use_live is false the cache predates our last write, so the config
+                        // value (just persisted) is more accurate than the stale snapshot.
+                        let volume_pct = if use_live {
+                            parse_node_volume(&pw_dump_json, &ch.node_name).unwrap_or(ch.volume_pct)
+                        } else {
+                            ch.volume_pct
+                        };
                         ChannelSnapshot {
                             id: ch.id.clone(),
                             node_name: ch.node_name.clone(),
@@ -936,7 +960,9 @@ impl<R: CommandRunner> Engine<R> {
             channel.volume_pct = pct;
         }
         self.save_config()?;
-        // Apply live: find node id, then wpctl set-volume <id> <factor>
+        // Apply live: raw-linear channelVolumes via pw-cli Props (same path as reconcile +
+        // parse_node_volume read). NOTE: `wpctl set-volume` applies WirePlumber's cubic curve
+        // (50% → channelVolumes 0.125), which mismatches the linear read — hardware-confirmed.
         {
             let profile = self.config.active()?.clone();
             let channel = profile
@@ -948,20 +974,10 @@ impl<R: CommandRunner> Engine<R> {
                 })?;
             let def = convert::channel_def_from_cfg(channel);
             let spec = def.sink_spec();
-            let id = {
-                let mut be = AudioBackend::new(&mut self.runner, spec);
-                be.find_node_id()?
-            };
-            let factor = format!("{:.4}", pct as f32 / 100.0);
-            let out = self.runner.run("wpctl", &["set-volume", &id, &factor])?;
-            if out.status != 0 {
-                return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
-                    program: "wpctl".into(),
-                    status: out.status,
-                    stderr: out.stderr,
-                }));
-            }
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            be.apply_volume_mute_pct(pct, channel.muted)?;
         }
+        self.last_volume_write = Some(std::time::Instant::now());
         self.emit(Event::ChannelVolumeSet {
             channel_id: channel_id.to_string(),
             volume_pct: pct,
@@ -1371,6 +1387,7 @@ impl<R: CommandRunner> Engine<R> {
                 stderr: out.stderr,
             }));
         }
+        self.last_volume_write = Some(std::time::Instant::now());
         self.emit(Event::MasterVolumeSet { volume_pct: pct });
         Ok(())
     }
@@ -1431,6 +1448,7 @@ impl<R: CommandRunner> Engine<R> {
                 stderr: out.stderr,
             }));
         }
+        self.last_volume_write = Some(std::time::Instant::now());
         self.emit(Event::MicVolumeSet { volume_pct: pct });
         Ok(())
     }
@@ -3858,8 +3876,10 @@ mod tests {
     // ── A2 TDD: wpctl argv assertions + pw-dump live read ──────────────────
 
     #[test]
-    fn set_channel_volume_pct_emits_correct_wpctl_argv() {
-        // TDD A2: set_channel_volume must call wpctl set-volume <node_id> <pct/100>
+    fn set_channel_volume_pct_emits_correct_pwcli_props_argv() {
+        // I2: set_channel_volume must call pw-cli s <node_id> Props {channelVolumes:[pct/100,…]}
+        // (raw-linear, same path as reconcile + parse_node_volume read — NOT wpctl set-volume
+        //  which applies WirePlumber's cubic curve: 50% → channelVolumes 0.125).
         // ls_all_present() maps Arctis_Game → id "10"
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm_vol_pct_{}", std::process::id()));
@@ -3869,7 +3889,7 @@ mod tests {
         let ls = ls_all_present();
         let runner = MockRunner::new()
             .with_output(0, &ls, "") // [0] pw-cli ls Node → id "10" for Arctis_Game
-            .with_output(0, "", ""); // [1] wpctl set-volume (success)
+            .with_output(0, "", ""); // [1] pw-cli s Props (success)
         let mut engine = Engine::new(runner, cfg);
         engine
             .set_channel_volume("game", 50)
@@ -3882,8 +3902,14 @@ mod tests {
         );
         assert_eq!(
             calls[1],
-            vec!["wpctl", "set-volume", "10", "0.5000"],
-            "second call must be wpctl set-volume <id> 0.5000"
+            vec![
+                "pw-cli",
+                "s",
+                "10",
+                "Props",
+                "{ channelVolumes = [ 0.5 0.5 ] mute = false }",
+            ],
+            "second call must be pw-cli s <id> Props {{channelVolumes:[0.5,0.5], mute:false}}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3969,6 +3995,111 @@ mod tests {
             pw_dump_calls, 2,
             "two pw-dump calls expected (one per state() after cache cleared); got {pw_dump_calls}"
         );
+    }
+
+    // ── I1 TDD: no snap-back after write; live read after cache refresh ──────
+
+    #[test]
+    fn set_channel_volume_state_uses_config_not_stale_cache() {
+        // I1 no-snap-back: after a volume write, state() must report the just-written config value,
+        // NOT the stale cached pw-dump value that was snapshotted before the write.
+        // Structure: seed cache with pre-write pw-dump (100%), write 50%, state() must report 50%.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_vol_snapback");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].channels[0].volume_pct = 100; // initial config value
+
+        // pw-dump fixture: Arctis_Game at 100% (channelVolumes 1.0 → parse → 100)
+        let pw_dump_old = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[1.0,1.0],"mute":false}]}}}]"#
+        );
+        let ls = ls_all_present();
+        // Queue: [0] pw-dump (seeds cache before write), [1] find_node_id, [2] Props set.
+        // Second state() hits cache (TTL not expired) → no new pw-dump queued.
+        let runner = MockRunner::new()
+            .with_output(0, pw_dump_old, "") // [0] first pw-dump (seeds cache, taken_before)
+            .with_output(0, &ls, "")         // [1] find_node_id for set_channel_volume
+            .with_output(0, "", "");         // [2] pw-cli Props set
+        let mut engine = Engine::new(runner, cfg);
+
+        // Seed the cache — taken_before is stamped BEFORE the write.
+        let state_before = engine.state();
+        let game_before = state_before.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game_before.volume_pct, 100,
+            "before write: pw-dump reports 100 (use_live=true, no prior write)"
+        );
+
+        // Write 50 → sets last_volume_write = now (after taken_before).
+        engine
+            .set_channel_volume("game", 50)
+            .expect("set_channel_volume should succeed");
+
+        // state() hits the cache (within TTL) but taken_before < written → use_live = false
+        // → falls back to config value 50, NOT the stale cached 100.
+        let state_after = engine.state();
+        let game_after = state_after.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game_after.volume_pct, 50,
+            "state() after write must report 50 from config, not 100 from stale pre-write cache"
+        );
+
+        // Verify the cache was NOT re-spawned (no additional pw-dump — A4 preserved).
+        let pw_dump_calls = engine.runner.calls.iter().filter(|c| c[0] == "pw-dump").count();
+        assert_eq!(
+            pw_dump_calls, 1,
+            "only one pw-dump must be spawned (cache still hit within TTL); got {pw_dump_calls}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn set_channel_volume_state_uses_live_after_cache_refresh() {
+        // I1 live-after-refresh: after expire_volume_cache() + state(), the fresh pw-dump is
+        // taken AFTER the write (taken >= written) → use_live = true → live value is used.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("ch_vol_live_refresh");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].channels[0].volume_pct = 100;
+
+        let pw_dump_old = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[1.0,1.0],"mute":false}]}}}]"#
+        );
+        // Fresh pw-dump after the write: reflects the updated linear 0.5 value.
+        let pw_dump_new = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+        );
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, pw_dump_old, "") // [0] first pw-dump (seeds cache)
+            .with_output(0, &ls, "")         // [1] find_node_id
+            .with_output(0, "", "")           // [2] Props set
+            .with_output(0, pw_dump_new, ""); // [3] fresh pw-dump after cache cleared
+        let mut engine = Engine::new(runner, cfg);
+
+        engine.state(); // seed cache (taken_before < written)
+        engine
+            .set_channel_volume("game", 50)
+            .expect("set_channel_volume should succeed");
+        engine.expire_volume_cache(); // force fresh dump; taken_after > written
+        let state = engine.state();   // runs pw-dump [3], taken_after >= written → use_live = true
+        let game = state.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game.volume_pct, 50,
+            "after cache refresh, state() must report live 50 from fresh pw-dump"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]
