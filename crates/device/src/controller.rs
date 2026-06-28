@@ -1,8 +1,16 @@
 use crate::codec::{read_status, write_command};
 use crate::descriptor::DeviceDescriptor;
 use crate::error::DeviceError;
-use crate::transport::Transport;
+use crate::transport::{Transport, TransportError};
 use arctis_domain::DeviceState;
+
+/// True for an Arctis dial frame: `[0x07, 0x45, …]` (media_mix @2, chat_mix @3).
+///
+/// Used by [`DeviceController::validate_chatmix`] to identify incoming dial reports
+/// after the ChatMix-enable opcode is sent.
+pub fn is_dial_frame(frame: &[u8]) -> bool {
+    frame.len() >= 2 && frame[0] == 0x07 && frame[1] == 0x45
+}
 
 /// Owns the single device transport. The ONLY thing that reads/writes the device.
 /// Writes are gated twice: by the descriptor capability AND by the runtime
@@ -38,6 +46,52 @@ impl<T: Transport> DeviceController<T> {
     /// Read a full status snapshot. Safe; best-effort merge of frames.
     pub fn read(&mut self) -> Result<DeviceState, DeviceError> {
         Ok(read_status(&mut self.transport, &self.descriptor)?)
+    }
+
+    /// OWNER-RUN ChatMix validation. Sends the single `chatmix_enable` opcode
+    /// `[0x06,0x49,0x01]` ONCE, then reads up to `max_reads` input reports
+    /// (each with `timeout_ms` timeout) and returns `Ok(true)` if any incoming
+    /// frame is a dial frame (`[0x07,0x45,…]`), or `Ok(false)` if none are seen.
+    ///
+    /// # G2 SAFETY — why the allowlist is intentionally not consulted here
+    ///
+    /// This is the ONE sanctioned path that writes `chatmix_enable` before it is
+    /// in the `enabled_writes` allowlist, because VALIDATION MUST PRECEDE ENABLING
+    /// (spec §5).  Specifically:
+    ///
+    /// - **Hardcoded to one opcode.** This method is not a generic gate bypass — it
+    ///   calls `write_command("chatmix_enable", 1)` directly and nothing else.
+    /// - **Single validated target.** The descriptor still validates the command name
+    ///   and value encoding; a typo or bad value is caught before any write.
+    /// - **Reachable only via `--validate`.** The CLI guard ensures no automated path
+    ///   ever invokes this: without the explicit flag, the opcode is never sent.
+    /// - **Recoverable.** If the headset behaves unexpectedly, a replug resets it.
+    ///
+    /// All automated tests use [`crate::mock::MockTransport`]; the real opcode is
+    /// sent only when the owner explicitly runs `device chatmix-enable --validate`
+    /// on hardware.
+    pub fn validate_chatmix(
+        &mut self,
+        max_reads: usize,
+        timeout_ms: i32,
+    ) -> Result<bool, DeviceError> {
+        // 1) Send the validation opcode.
+        //    The enabled_writes allowlist is intentionally NOT consulted — this IS
+        //    the pre-enable validation step.  `write_command` still validates the
+        //    command name and value encoding against the descriptor.
+        write_command(&mut self.transport, &self.descriptor, "chatmix_enable", 1)?;
+
+        // 2) Watch for dial frames.
+        let mut buf = vec![0u8; self.descriptor.report_length];
+        for _ in 0..max_reads {
+            match self.transport.read_report(&mut buf, timeout_ms) {
+                Ok(n) if is_dial_frame(&buf[..n]) => return Ok(true),
+                Ok(_) => continue,
+                Err(TransportError::Timeout) => continue, // not a dial frame yet — keep trying
+                Err(e) => return Err(e.into()),           // surface real IO errors
+            }
+        }
+        Ok(false)
     }
 
     /// Send a single write command. Refuses unless (a) it is in enabled_writes
@@ -110,6 +164,96 @@ mod tests {
             DeviceController::new(MockTransport::new(), d).with_enabled_writes(&["mic_led"]);
         let err = c.set("mic_led", 5).unwrap_err();
         assert!(matches!(err, DeviceError::Unsupported(_)));
+    }
+
+    // ── Task B2: is_dial_frame + validate_chatmix tests ─────────────────────
+
+    #[test]
+    fn is_dial_frame_true_for_0x07_0x45_prefix() {
+        let mut frame = vec![0u8; 64];
+        frame[0] = 0x07;
+        frame[1] = 0x45;
+        assert!(super::is_dial_frame(&frame), "[0x07,0x45,…] must be a dial frame");
+    }
+
+    #[test]
+    fn is_dial_frame_false_for_other_prefix() {
+        let mut frame = vec![0u8; 64];
+        frame[0] = 0x06;
+        frame[1] = 0xb0;
+        assert!(!super::is_dial_frame(&frame), "[0x06,0xb0,…] is not a dial frame");
+    }
+
+    #[test]
+    fn is_dial_frame_false_for_too_short() {
+        assert!(!super::is_dial_frame(&[0x07]), "single-byte slice must return false");
+    }
+
+    #[test]
+    fn is_dial_frame_false_for_empty() {
+        assert!(!super::is_dial_frame(&[]), "empty slice must return false");
+    }
+
+    /// validate_chatmix returns Ok(true) when a dial frame arrives, AND the opcode
+    /// [0x06,0x49,0x01] was written to the mock transport exactly once.
+    #[test]
+    fn validate_chatmix_detects_dial_frame_and_records_opcode() {
+        let d = nova();
+        let report_len = d.report_length;
+
+        // Two non-dial frames then a dial frame.
+        let non_dial = {
+            let mut f = vec![0u8; report_len];
+            f[0] = 0x06;
+            f[1] = 0xb0;
+            f
+        };
+        let dial = {
+            let mut f = vec![0u8; report_len];
+            f[0] = 0x07;
+            f[1] = 0x45;
+            f[2] = 5; // media_mix sample value
+            f[3] = 4; // chat_mix sample value
+            f
+        };
+
+        let transport = MockTransport::new()
+            .with_response(non_dial.clone())
+            .with_response(non_dial)
+            .with_response(dial);
+
+        let mut c = DeviceController::new(transport, d);
+        let result = c.validate_chatmix(8, 50).expect("validate_chatmix must not error");
+        assert!(result, "should detect the dial frame and return true");
+
+        // G2 core assertion: opcode [0x06,0x49,0x01] written exactly once to the mock.
+        let written = &c.transport().written;
+        assert_eq!(written.len(), 1, "exactly one write (no save frame, save=false)");
+        assert_eq!(written[0][0], 0x06, "report_id must be 0x06");
+        assert_eq!(written[0][1], 0x49, "opcode must be 0x49");
+        assert_eq!(written[0][2], 0x01, "value must be 0x01 (enabled)");
+        assert!(
+            written[0][3..].iter().all(|&b| b == 0),
+            "remainder must be zero-padded"
+        );
+    }
+
+    /// validate_chatmix returns Ok(false) when no dial frames arrive within max_reads,
+    /// and the opcode is still written once.
+    #[test]
+    fn validate_chatmix_times_out_when_no_dial_frames() {
+        let d = nova();
+        // No queued responses → every read returns Timeout.
+        let mut c = DeviceController::new(MockTransport::new(), d);
+        let result = c
+            .validate_chatmix(4, 10)
+            .expect("validate_chatmix must not error on timeout");
+        assert!(!result, "no dial frames → should return false");
+
+        // Opcode still written once.
+        assert_eq!(c.transport().written.len(), 1, "opcode must be written once");
+        assert_eq!(c.transport().written[0][1], 0x49, "opcode byte must be 0x49");
+        assert_eq!(c.transport().written[0][2], 0x01, "value must be 0x01");
     }
 
     // ── chatmix_enable gate tests (Task B1) ──────────────────────────────────

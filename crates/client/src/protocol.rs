@@ -210,6 +210,12 @@ pub enum Request {
     SetChatmix { position: i64 },
     /// Set (or clear) the system default-output channel.
     SetDefaultSinkChannel { channel: Option<String> },
+    /// OWNER-RUN ChatMix validation: send `[0x06,0x49,0x01]` once and watch for
+    /// dial frames `[0x07,0x45]` for ~6 s. Returns `ok_with_text` describing result.
+    ///
+    /// Reachable only via `asm-cli device chatmix-enable --validate`. Not a generic
+    /// gate bypass — hardcoded to the single chatmix_enable opcode (G2, spec §5).
+    ChatmixValidate,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1364,6 +1370,26 @@ mod tests {
         assert!(
             json.contains("channel-remove"),
             "cmd tag must be channel-remove, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── Task B2: ChatmixValidate wire-tag + round-trip tests ────────────────────
+
+    #[test]
+    fn parse_chatmix_validate_wire_tag() {
+        let req: Request = serde_json::from_str(r#"{"cmd":"chatmix-validate"}"#).unwrap();
+        assert_eq!(req, Request::ChatmixValidate);
+    }
+
+    #[test]
+    fn request_chatmix_validate_round_trips() {
+        let req = Request::ChatmixValidate;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("chatmix-validate"),
+            "cmd tag must be chatmix-validate (kebab-case), got: {json}"
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);

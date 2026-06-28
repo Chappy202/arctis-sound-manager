@@ -315,6 +315,15 @@ enum DeviceAction {
         #[arg(allow_negative_numbers = true)]
         value: i64,
     },
+    /// OWNER-RUN ChatMix validation. With --validate, sends [0x06,0x49,0x01] once
+    /// and watches for dial frames (~6 s) to confirm the headset responds.
+    /// Without --validate, prints a safety reminder and does NOT send anything.
+    ChatmixEnable {
+        /// Send the ChatMix-enable opcode and watch for dial frames. This is a
+        /// one-time owner validation step — do not run in production automation.
+        #[arg(long)]
+        validate: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -752,6 +761,47 @@ fn dispatch_device(action: DeviceAction) -> ExitCode {
         DeviceAction::Transparency { level } => device_set_via_daemon("transparency_level", level),
         DeviceAction::MicVolume { level } => device_set_via_daemon("mic_volume", level),
         DeviceAction::Set { control, value } => device_set_via_daemon(&control, value),
+        DeviceAction::ChatmixEnable { validate } => {
+            if !validate {
+                // Safety guard: never send the opcode without the explicit flag.
+                println!("ChatMix validation requires --validate to send the (owner-gated) opcode.");
+                println!("Run: asm-cli device chatmix-enable --validate");
+                println!(
+                    "This sends [0x06,0x49,0x01] once and watches for dial frames (~6 s)."
+                );
+                return ExitCode::SUCCESS;
+            }
+            if !daemon::socket_path().exists() {
+                eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                eprintln!(
+                    "note: chatmix-enable --validate requires the daemon \
+                     (single worker enforces HID serialisation)"
+                );
+                return ExitCode::FAILURE;
+            }
+            println!("Sending ChatMix-enable and watching for dial frames (~6s)…");
+            match daemon::send_request(&daemon::Request::ChatmixValidate) {
+                Ok(resp) if resp.ok => {
+                    if let Some(text) = resp.text {
+                        println!("{text}");
+                    } else {
+                        println!("ok");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "error: {}",
+                        resp.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("error communicating with daemon: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -2447,6 +2497,32 @@ mod tests {
                 assert_eq!(control, "mic_volume");
                 assert_eq!(value, -1);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    // ── Task B2: device chatmix-enable parse tests ───────────────────────────
+
+    #[test]
+    fn device_chatmix_enable_with_validate_parses() {
+        let cmd = parse(&["device", "chatmix-enable", "--validate"])
+            .expect("device chatmix-enable --validate should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::ChatmixEnable { validate },
+            } => assert!(validate, "validate must be true when --validate is given"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_chatmix_enable_no_validate_parses() {
+        let cmd =
+            parse(&["device", "chatmix-enable"]).expect("device chatmix-enable should parse");
+        match cmd {
+            super::Command::Device {
+                action: super::DeviceAction::ChatmixEnable { validate },
+            } => assert!(!validate, "validate must default to false without --validate"),
             other => panic!("unexpected: {other:?}"),
         }
     }

@@ -236,6 +236,29 @@ impl<R: CommandRunner> Engine<R> {
             .map_err(EngineError::Device)
     }
 
+    /// OWNER-RUN ChatMix validation: sends `[0x06,0x49,0x01]` once via the device
+    /// worker and watches for dial frames `[0x07,0x45]` for ~6 s.
+    ///
+    /// Returns `Ok(true)` if any dial frame was seen, `Ok(false)` if none arrived
+    /// within the timeout, or `Err` on a transport fault or if the worker is absent.
+    ///
+    /// Reachable only via the explicit `--validate` CLI flag — never from normal daemon
+    /// request handling.  Mirrors [`device_set`] in structure but sends
+    /// `DeviceCommand::ValidateChatmix` and receives a `bool` reply.
+    pub fn validate_chatmix(&self) -> Result<bool, EngineError> {
+        let tx = self
+            .device_tx
+            .as_ref()
+            .ok_or_else(|| EngineError::BadRequest("device worker not running".into()))?;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        tx.send(crate::device::DeviceCommand::ValidateChatmix { reply: reply_tx })
+            .map_err(|_| EngineError::BadRequest("device worker gone".into()))?;
+        reply_rx
+            .recv()
+            .map_err(|_| EngineError::BadRequest("no reply from device worker".into()))?
+            .map_err(EngineError::Device)
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }

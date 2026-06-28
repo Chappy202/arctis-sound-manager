@@ -11,15 +11,26 @@ pub trait DeviceOpener: Send + 'static {
     fn open(&self) -> OpenResult<Self::T>;
 }
 
+/// Number of read attempts during ChatMix validation (30 × 200 ms ≈ 6 s total).
+const CHATMIX_VALIDATE_MAX_READS: usize = 30;
+/// Timeout per individual read attempt (ms) during ChatMix validation.
+const CHATMIX_VALIDATE_TIMEOUT_MS: i32 = 200;
+
 /// A write command sent to the device worker thread through its command channel.
 ///
-/// The reply channel carries `Ok(())` on success or a stringified error.
+/// The reply channel carries `Ok(…)` on success or a stringified error.
 /// SAFETY: writes and reads happen on the same worker thread → serialized (Global Constraint).
 pub enum DeviceCommand {
     Set {
         name: String,
         value: i64,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// OWNER-RUN ChatMix validation: sends [0x06,0x49,0x01] once and watches for
+    /// dial frames [0x07,0x45] for ~6 s.  Reachable only via `--validate` CLI flag.
+    /// Not a generic gate bypass — hardcoded to the single chatmix_enable opcode.
+    ValidateChatmix {
+        reply: std::sync::mpsc::Sender<Result<bool, String>>,
     },
 }
 
@@ -35,6 +46,14 @@ fn drain_commands<T: Transport>(
         match cmd_rx.try_recv() {
             Ok(DeviceCommand::Set { name, value, reply }) => {
                 let result = controller.set(&name, value).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            Ok(DeviceCommand::ValidateChatmix { reply }) => {
+                // Validation briefly pauses the status read loop — acceptable for a
+                // one-shot owner action.  Uses hardcoded constants for ~6 s total.
+                let result = controller
+                    .validate_chatmix(CHATMIX_VALIDATE_MAX_READS, CHATMIX_VALIDATE_TIMEOUT_MS)
+                    .map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => break,

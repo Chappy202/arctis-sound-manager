@@ -257,6 +257,19 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::ChatmixValidate => match engine.validate_chatmix() {
+            Ok(true) => Response::ok_with_text(
+                "Dial frames detected — the ChatMix dial is now reporting. \
+                 Turn the dial to confirm, then enable it."
+                    .into(),
+            ),
+            Ok(false) => Response::ok_with_text(
+                "No dial frames detected. The headset may not support this, \
+                 or try turning the dial during validation."
+                    .into(),
+            ),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::CoexistStatus => {
             // Run pw-cli ls Node + check home dir for legacy components.
             let node_stdout = RealRunner
