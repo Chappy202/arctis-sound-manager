@@ -202,6 +202,8 @@ pub enum Request {
     },
     /// Set the master output volume (percent 0–100). 100 = unity.
     SetMasterVolume { volume_pct: u8 },
+    /// Set the microphone source volume (percent 0–100). 100 = unity.
+    SetMicVolume { volume_pct: u8 },
     /// Set the master output mute state.
     SetMasterMute { muted: bool },
     /// Set the ChatMix position (0=chat .. 9=game).
@@ -1374,6 +1376,17 @@ mod tests {
         let req = Request::SetMasterVolume { volume_pct: 80 };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("set-master-volume"), "{json}");
+        assert!(json.contains("volume_pct"), "wire field must be volume_pct, got: {json}");
+        assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
+    }
+
+    // ── A5: SetMicVolume wire-tag + round-trip test ──────────────────────────
+
+    #[test]
+    fn request_set_mic_volume_round_trips() {
+        let req = Request::SetMicVolume { volume_pct: 75 };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("set-mic-volume"), "{json}");
         assert!(json.contains("volume_pct"), "wire field must be volume_pct, got: {json}");
         assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
     }

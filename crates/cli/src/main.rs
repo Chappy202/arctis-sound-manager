@@ -371,6 +371,11 @@ enum MicAction {
         /// Backend name: deep_filter|rnnoise
         backend: String,
     },
+    /// Set the mic source volume (0-100 percent). 100 = unity.
+    Volume {
+        /// Volume percent, 0-100. 100 = unity (full volume).
+        pct: u8,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -579,6 +584,7 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
         },
         MicAction::HwMic { device } => daemon::Request::MicHwMic { device },
         MicAction::Backend { backend } => daemon::Request::MicSuppressionBackend { backend },
+        MicAction::Volume { pct } => daemon::Request::SetMicVolume { volume_pct: pct },
     };
 
     match daemon::send_request(&req) {
@@ -2612,6 +2618,19 @@ mod tests {
             } => assert_eq!(backend, "rnnoise"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ── A5: mic volume parse test ────────────────────────────────────────────
+
+    #[test]
+    fn mic_volume_parses() {
+        let cmd = parse(&["mic", "volume", "50"]).expect("mic volume 50 should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Mic {
+                action: super::MicAction::Volume { pct: 50 }
+            }
+        ));
     }
 
     #[test]

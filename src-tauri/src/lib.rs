@@ -53,6 +53,7 @@ pub fn run() {
             commands::list_outputs,
             commands::move_stream,
             commands::set_master_volume,
+            commands::set_mic_volume,
             commands::set_master_mute,
             commands::set_chatmix,
             commands::set_default_sink_channel,

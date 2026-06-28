@@ -421,6 +421,14 @@ pub async fn set_master_volume(
 }
 
 #[tauri::command]
+pub async fn set_mic_volume(
+    volume_pct: u8,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetMicVolume { volume_pct }).await
+}
+
+#[tauri::command]
 pub async fn set_master_mute(
     muted: bool,
     state: State<'_, Mutex<DaemonState>>,

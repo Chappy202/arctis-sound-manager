@@ -60,6 +60,8 @@ export interface MicStageSnapshot {
 
 export interface MicSnapshot {
   enabled: boolean;
+  /** Mic source volume, percent 0–100. 100 = unity. */
+  volume_pct: number;
   stages: MicStageSnapshot[];
   eq_bands: EqBandSnapshot[]; // reuse existing EqBandSnapshot
   /** Active suppression backend: "deep_filter" | "rnnoise" */
@@ -377,6 +379,10 @@ export const moveStream = (stream: string, channel: string): Promise<EngineState
 /** Set the master volume (percent 0–100). 100 = unity. */
 export const setMasterVolume = (volumePct: number): Promise<EngineState> =>
   invoke<EngineState>("set_master_volume", { volumePct });
+
+/** Set the mic source volume (percent 0–100). 100 = unity. */
+export const setMicVolume = (volumePct: number): Promise<EngineState> =>
+  invoke<EngineState>("set_mic_volume", { volumePct });
 
 /** Set the master mute state. */
 export const setMasterMute = (muted: boolean): Promise<EngineState> =>

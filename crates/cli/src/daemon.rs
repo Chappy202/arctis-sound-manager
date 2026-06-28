@@ -239,6 +239,10 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SetMicVolume { volume_pct } => match engine.set_mic_volume(volume_pct) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::SetMasterMute { muted } => match engine.set_master_mute(muted) {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
