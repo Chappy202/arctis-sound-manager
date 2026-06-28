@@ -59,11 +59,16 @@ pub fn run() {
             commands::set_default_sink_channel,
         ])
         .setup(|app| {
-            // ── State-poll task (every 2 s) ─────────────────────────────────
+            // ── State-poll task (every 250 ms) ──────────────────────────────
+            // Drives near-real-time GUI updates (volume, ChatMix dial position,
+            // mute). The daemon is request-response (no event push), so the UI
+            // polls; 250 ms feels live without spamming. engine.state()'s pw-dump
+            // is TTL-cached (~1 s), so faster polling does NOT add subprocesses.
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_millis(250));
                     loop {
                         ticker.tick().await;
                         let socket = {
