@@ -158,6 +158,9 @@ pub struct EngineState {
     /// Read-only factory EQ preset catalog. Always populated regardless of user presets.
     #[serde(default)]
     pub factory_eq_presets: Vec<EqPresetSnapshot>,
+    /// Read-only factory mic preset catalog.
+    #[serde(default)]
+    pub mic_presets: Vec<MicPresetSnapshot>,
     /// Master output gain in dB (0.0 = unity). Populated from the active profile.
     #[serde(default)]
     pub master_volume_db: f32,
@@ -250,6 +253,9 @@ pub enum Event {
         channel_id: String,
     },
     EqPresetDeleted {
+        name: String,
+    },
+    MicPresetApplied {
         name: String,
     },
     Reconciled,

@@ -234,8 +234,8 @@ impl<R: CommandRunner> Engine<R> {
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&self) -> crate::state::EngineState {
         use crate::state::{
-            ChannelSnapshot, EngineState, EqBandSnapshot, EqPresetSnapshot, MicSnapshot,
-            MicStageSnapshot, StageName, SuppressionBackend,
+            ChannelSnapshot, EngineState, EqBandSnapshot, EqPresetSnapshot, MicPresetSnapshot,
+            MicSnapshot, MicStageSnapshot, StageName, SuppressionBackend,
         };
         let active = self.config.active().ok();
         let channels = active
@@ -457,6 +457,14 @@ impl<R: CommandRunner> Engine<R> {
             })
             .collect();
 
+        let mic_presets = crate::presets::factory_mic_presets()
+            .into_iter()
+            .map(|p| MicPresetSnapshot {
+                name: p.name,
+                description: p.description,
+            })
+            .collect();
+
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
@@ -468,6 +476,7 @@ impl<R: CommandRunner> Engine<R> {
             surround,
             eq_presets,
             factory_eq_presets,
+            mic_presets,
             master_volume_db: active.as_ref().map(|p| p.master_volume_db).unwrap_or(0.0),
             master_mute: active.as_ref().map(|p| p.master_mute).unwrap_or(false),
             chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
@@ -1911,6 +1920,61 @@ impl<R: CommandRunner> Engine<R> {
         }
 
         self.emit(Event::MicSuppressionBackendSet { backend });
+        Ok(())
+    }
+
+    /// Apply a named factory mic preset to the active profile.
+    ///
+    /// Overlays `gain`, `highpass`, `suppression`, `compressor`, `gate`, `eq_enabled`,
+    /// and `eq` from the preset. `mic.enabled` and `mic.hw_mic` are **never** touched.
+    /// Persists the config and, when the master switch is on, rebuilds the mic chain live.
+    pub fn apply_mic_preset(&mut self, name: &str) -> Result<(), EngineError> {
+        // Find the named preset in the factory catalog.
+        let preset = crate::presets::factory_mic_presets()
+            .into_iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| EngineError::BadRequest(format!("mic preset not found: {name}")))?;
+
+        // Overlay preset fields onto the active profile's mic config.
+        // Preserve `enabled` and `hw_mic`.
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let mic = &mut profile.mic;
+            mic.gain = preset.gain;
+            mic.highpass = preset.highpass;
+            mic.suppression = preset.suppression;
+            mic.compressor = preset.compressor;
+            mic.gate = preset.gate;
+            mic.eq_enabled = preset.eq_enabled;
+            mic.eq = preset.eq;
+            // mic.enabled and mic.hw_mic are intentionally preserved.
+        }
+
+        self.save_config()?;
+
+        // Rebuild the live mic chain only when the master switch is on.
+        if self.config.active()?.mic.enabled {
+            self.ensure_pw_version();
+            let profile = self.config.active()?.clone();
+            let (nodes, availability) =
+                convert::mic_chain_nodes(&profile.mic, self.probe.as_ref(), self.builtin_noisegate);
+            self.mic_availability = availability;
+            let spec = convert::mic_chain_spec(&profile.mic);
+            let mut mic_be = MicBackend::new(&mut self.runner, spec);
+            let handle = mic_be.recreate(&nodes)?;
+            if let Some(token) = handle.child {
+                self.children.track(token);
+            }
+        }
+
+        self.emit(Event::MicPresetApplied {
+            name: name.to_string(),
+        });
         Ok(())
     }
 
@@ -6395,5 +6459,82 @@ mod tests {
             !engine2.state().dial_controls_balance,
             "state() must reflect config=false"
         );
+    }
+
+    // ─────────────────────────────────────────────
+    // Task 4 TDD: apply_mic_preset
+    // ─────────────────────────────────────────────
+
+    /// apply_mic_preset overlays DSP fields + triggers live rebuild, while preserving
+    /// mic.enabled and mic.hw_mic. Unknown preset name → BadRequest.
+    ///
+    /// The test uses `Engine::new(MockRunner::new(), cfg)` (empty queue).
+    /// MockRunner returns (0,"","") for all calls — so the live rebuild path succeeds:
+    ///   - ensure_pw_version(): pipewire --version → "" → version stays None (OK)
+    ///   - recreate(): remove() source_exists → "" → absent (skip destroy)
+    ///                 create() source_exists → "" → absent → write conf → spawn
+    #[test]
+    fn apply_mic_preset_overlays_and_preserves_enabled_and_hwmic() {
+        let _l = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_preset_apply");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Start with mic enabled + a pinned hw_mic that must survive the preset apply.
+        let mut cfg = make_config_mic_disabled();
+        cfg.profiles[0].mic.enabled = true;
+        cfg.profiles[0].mic.hw_mic = Some("alsa_input.keepme".into());
+
+        // MockRunner with no queued outputs → returns (0,"","") for every call,
+        // which is "tolerant" for the mic rebuild (source seen as absent → spawn).
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Apply the "Less Nasal" preset.
+        engine.apply_mic_preset("Less Nasal").expect("apply_mic_preset must succeed for a known preset");
+
+        let st = engine.state();
+
+        // Catalog is populated: all factory mic presets present.
+        assert!(
+            st.mic_presets.iter().any(|p| p.name == "Walkie Talkie"),
+            "mic_presets must include Walkie Talkie from the factory catalog"
+        );
+
+        // EQ was overlaid: Less Nasal has 10 bands → state always returns 10 eq_bands.
+        assert_eq!(st.mic.eq_bands.len(), 10, "mic eq_bands must be 10 after preset apply");
+
+        // Suppression is enabled in Less Nasal preset.
+        let supp = st
+            .mic
+            .stages
+            .iter()
+            .find(|s| s.kind == crate::state::StageName::Suppression)
+            .expect("suppression stage must appear in mic.stages");
+        assert!(supp.enabled, "suppression must be enabled after applying Less Nasal");
+
+        // mic.enabled and mic.hw_mic must be preserved (not touched by the overlay).
+        assert!(st.mic.enabled, "mic.enabled must be preserved after preset apply");
+        assert_eq!(
+            st.mic.hw_mic,
+            Some("alsa_input.keepme".into()),
+            "mic.hw_mic must be preserved after preset apply"
+        );
+
+        // Unknown preset name → BadRequest.
+        assert!(
+            matches!(
+                engine.apply_mic_preset("Nope"),
+                Err(EngineError::BadRequest(_))
+            ),
+            "unknown mic preset name must yield BadRequest"
+        );
+
+        // Config was persisted to disk.
+        assert!(
+            tmp.join("config.toml").exists(),
+            "config.toml must be written after preset apply"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
