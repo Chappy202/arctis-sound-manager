@@ -208,6 +208,8 @@ pub enum Request {
     SetChatmix { position: i64 },
     /// Set (or clear) the system default-output channel.
     SetDefaultSinkChannel { channel: Option<String> },
+    /// Apply a named mic DSP preset (sets all mic DSP parameters in one shot).
+    ApplyMicPreset { name: String },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1391,6 +1393,29 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("set-default-sink-channel"), "{json}");
         assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
+    }
+
+    // ── Task 5 (eq-mic-preset-packs): ApplyMicPreset wire-tag + round-trip ──
+
+    #[test]
+    fn parse_apply_mic_preset_wire_tag() {
+        let r: Request =
+            serde_json::from_str(r#"{"cmd":"apply-mic-preset","name":"Less Nasal"}"#).unwrap();
+        assert!(matches!(r, Request::ApplyMicPreset { ref name } if name == "Less Nasal"));
+    }
+
+    #[test]
+    fn request_apply_mic_preset_round_trips() {
+        let req = Request::ApplyMicPreset {
+            name: "Less Nasal".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("apply-mic-preset"),
+            "cmd tag must be apply-mic-preset, got: {json}"
+        );
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
     }
 
     // ── F2.1: SetChannelVolume / SetChannelMute wire-tag + round-trip tests ──
