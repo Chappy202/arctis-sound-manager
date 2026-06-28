@@ -5,6 +5,7 @@
   import { deriveConnectionStatus, connectionLabel as getConnectionLabel } from "../connection.js";
   import { connectionStatus as daemonConnectionStatus, startConnectionMonitor, reconnect } from "../stores/connection.js";
   import ProfilesDropdown from "./ProfilesDropdown.svelte";
+  import NewProfileModal from "./NewProfileModal.svelte";
   import CoexistBanner from "./CoexistBanner.svelte";
 
   interface Props {
@@ -114,6 +115,7 @@
             <span class="battery-value">{batteryValue}</span>
           </div>
         {/if}
+        <NewProfileModal />
         <ProfilesDropdown />
       </div>
     </header>

@@ -1,16 +1,12 @@
 <script lang="ts">
   import { engineState } from "../stores.js";
-  import { switchProfile, profileNew, profileRename, profileDelete, profileExport, profileImport } from "../ipc.js";
+  import { switchProfile, profileRename, profileDelete, profileExport, profileImport } from "../ipc.js";
 
   /** Controlled open state for the dropdown menu. */
   let open = $state(false);
   let menuEl: HTMLUListElement | undefined = $state();
   let triggerEl: HTMLButtonElement | undefined = $state();
 
-  /** Inline "new profile" name entry state. */
-  let creatingNew = $state(false);
-  let newProfileName = $state("");
-  let newProfileInput: HTMLInputElement | undefined = $state();
   let switching = $state(false);
 
   /** Inline rename state. */
@@ -46,8 +42,6 @@
 
   function closeMenu() {
     open = false;
-    creatingNew = false;
-    newProfileName = "";
     renamingProfile = null;
     renameValue = "";
     importingProfile = false;
@@ -64,23 +58,6 @@
       engineState.set(next);
     } catch (e) {
       console.error("[ProfilesDropdown] switchProfile failed:", e);
-    } finally {
-      switching = false;
-    }
-  }
-
-  async function createProfile() {
-    const name = newProfileName.trim();
-    if (!name || switching) return;
-    switching = true;
-    creatingNew = false;
-    open = false;
-    newProfileName = "";
-    try {
-      const next = await profileNew(name);
-      engineState.set(next);
-    } catch (e) {
-      console.error("[ProfilesDropdown] profileNew failed:", e);
     } finally {
       switching = false;
     }
@@ -213,12 +190,6 @@
     if (open) {
       document.addEventListener("mousedown", handleOutsideClick);
       return () => document.removeEventListener("mousedown", handleOutsideClick);
-    }
-  });
-
-  $effect(() => {
-    if (creatingNew && newProfileInput) {
-      requestAnimationFrame(() => newProfileInput?.focus());
     }
   });
 
@@ -364,31 +335,7 @@
           <li class="menu-divider" role="separator" aria-hidden="true"></li>
         {/if}
 
-        {#if creatingNew}
-          <li class="new-profile-row" role="presentation">
-            <input
-              bind:this={newProfileInput}
-              bind:value={newProfileName}
-              class="new-profile-input"
-              type="text"
-              placeholder="Profile name…"
-              maxlength={48}
-              aria-label="New profile name"
-              onkeydown={(e) => {
-                if (e.key === "Enter") { e.preventDefault(); createProfile(); }
-                else if (e.key === "Escape") { creatingNew = false; newProfileName = ""; }
-              }}
-            />
-            <button
-              class="new-profile-confirm"
-              onclick={createProfile}
-              disabled={!newProfileName.trim()}
-              aria-label="Create profile"
-            >
-              Create
-            </button>
-          </li>
-        {:else if importingProfile}
+        {#if importingProfile}
           <li class="import-row" role="presentation">
             <textarea
               bind:this={importTextarea}
@@ -420,17 +367,6 @@
             </div>
           </li>
         {:else}
-          <li role="presentation">
-            <button
-              role="menuitem"
-              data-action="new"
-              class="profile-action"
-              onclick={() => { creatingNew = true; }}
-            >
-              <span class="action-icon" aria-hidden="true">+</span>
-              New profile…
-            </button>
-          </li>
           <li role="presentation">
             <button
               role="menuitem"
@@ -649,32 +585,7 @@
     text-align: center;
   }
 
-  /* ===== Inline new-profile form ===== */
-  .new-profile-row {
-    display: flex;
-    gap: var(--ss-space-2);
-    align-items: center;
-    padding: var(--ss-space-2) var(--ss-space-3);
-  }
-
-  .new-profile-input {
-    flex: 1;
-    height: var(--ss-control-h-sm);
-    padding: 0 var(--ss-space-2);
-    background: var(--ss-surface-input);
-    border: var(--ss-border-width) solid var(--ss-border-strong);
-    border-radius: var(--ss-radius-xs);
-    color: var(--ss-text-primary);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    min-width: 0;
-  }
-
-  .new-profile-input:focus {
-    outline: none;
-    border-color: var(--ss-accent-border);
-  }
-
+  /* ===== Confirm button (shared by import form) ===== */
   .new-profile-confirm {
     height: var(--ss-control-h-sm);
     padding: 0 var(--ss-space-3);
