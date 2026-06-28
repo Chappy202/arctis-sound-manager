@@ -134,6 +134,13 @@ pub struct EqPresetSnapshot {
     pub band_count: usize,
 }
 
+/// Lightweight summary of one microphone preset for the state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicPresetSnapshot {
+    pub name: String,
+    pub description: String,
+}
+
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {

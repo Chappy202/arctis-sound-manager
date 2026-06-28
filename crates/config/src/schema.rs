@@ -334,6 +334,20 @@ pub struct EqPreset {
     pub bands: Vec<EqBandConfig>,
 }
 
+/// A named, reusable preset for the microphone DSP chain (shared library across all profiles).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicPreset {
+    pub name: String,
+    pub description: String,
+    pub gain: MicGainStage,
+    pub highpass: MicHighpassStage,
+    pub suppression: MicSuppressionStage,
+    pub compressor: MicCompressorStage,
+    pub gate: MicGateStage,
+    pub eq_enabled: bool,
+    pub eq: Vec<EqBandConfig>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1476,5 +1490,23 @@ description = "Chat"
         assert!(!p.master_mute);
         assert_eq!(p.chatmix_position, 4); // center of 0..=9 (game/chat balanced)
         assert_eq!(p.default_sink_channel, None);
+    }
+
+    #[test]
+    fn mic_preset_round_trips_via_toml() {
+        let p = MicPreset {
+            name: "Less Nasal".into(),
+            description: "Tame nasal honk".into(),
+            gain: MicGainStage::default(),
+            highpass: MicHighpassStage::default(),
+            suppression: MicSuppressionStage { enabled: true, ..Default::default() },
+            compressor: MicCompressorStage::default(),
+            gate: MicGateStage::default(),
+            eq_enabled: true,
+            eq: vec![EqBandConfig { kind: "peaking".into(), freq_hz: 1000.0, q: 0.7071, gain_db: -4.0 }],
+        };
+        let toml = toml::to_string(&p).unwrap();
+        let back: MicPreset = toml::from_str(&toml).unwrap();
+        assert_eq!(p, back);
     }
 }
