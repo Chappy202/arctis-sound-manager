@@ -168,6 +168,7 @@
 
 <article
   class="channel-strip"
+  role="listitem"
   aria-labelledby={labelId}
   data-channel-id={channel.id}
   style="--accent: {accentFor(channel.id)}"
@@ -275,8 +276,8 @@
   .channel-strip {
     display: flex;
     flex-direction: column;
-    width: var(--ss-channel-strip-w);
-    min-width: var(--ss-channel-strip-w-min);
+    flex: 1 1 0;
+    min-width: 140px;
     background: var(--ss-surface-1);
     border: var(--ss-border-width) solid var(--ss-border);
     border-top: 2px solid var(--accent, var(--ss-accent));
@@ -284,7 +285,6 @@
     padding: var(--ss-space-3);
     gap: var(--ss-space-3);
     box-shadow: var(--ss-e1);
-    flex-shrink: 0;
   }
 
   /* ===== Header ===== */

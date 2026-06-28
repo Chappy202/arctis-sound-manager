@@ -9,6 +9,7 @@
   import MasterStrip from "./MasterStrip.svelte";
   import MicStrip from "./MicStrip.svelte";
   import ChatmixSlider from "./ChatmixSlider.svelte";
+  import { orderChannels } from "./mixerLayout.js";
 
   // init() is idempotent — safe to call here AND from AppShell.
   // Calling it here ensures the mixer works even if AppShell hasn't yet mounted.
@@ -79,6 +80,7 @@
   let addId = $state("");
   let addBusy = $state(false);
   let addError = $state<string | null>(null);
+  let addOpen = $state(false);
 
   async function handleAddChannel() {
     const id = addId.trim();
@@ -91,6 +93,7 @@
         engineState.set(newState);
       }
       addId = "";
+      addOpen = false;
     } catch (err: unknown) {
       addError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -161,66 +164,90 @@
     </div>
 
     <!-- ===== Channel strips row ===== -->
-    <div class="channels-container">
-      {#if $engineState.channels.length === 0}
-        <p class="channels-empty">No channels reported by the daemon.</p>
-      {:else}
+    {#if $engineState.channels.length === 0}
+      <p class="channels-empty">No channels reported by the daemon.</p>
+    {:else}
+      <div
+        class="channels-row"
+        role="list"
+        aria-label="Audio channel strips"
+      >
+        <!-- Master (role="listitem" is on MasterStrip's root element) -->
+        <MasterStrip
+          mixerState={$engineState}
+          unrouted={grouped.unrouted}
+          onClearStream={handleClearStream}
+          onError={(m) => (dropError = m)}
+        />
+
+        <!-- Standard + custom channels in canonical order -->
+        {#each orderChannels($engineState.channels) as channel (channel.id)}
+          <!-- role="listitem" is on ChannelStrip's root <article> element -->
+          <ChannelStrip
+            {channel}
+            streams={grouped.byChannel[channel.id] ?? []}
+            outputDevices={$outputsStore}
+            onDropStream={handleDropStream}
+            onOutputChanged={() => {
+              // State will be refreshed via state-changed event.
+              // No extra action needed here.
+            }}
+            onRemove={$engineState.channels.length > 1 && !removeBusy
+              ? () => handleRemoveChannel(channel.id)
+              : undefined}
+            onError={(m) => (dropError = m)}
+          />
+        {/each}
+
+        <!-- Mic (role="listitem" is on MicStrip's root element) -->
+        <MicStrip mic={$engineState.mic} onError={(m) => (dropError = m)} />
+
+        <!-- ===== Add channel — compact end-of-row affordance ===== -->
         <div
-          class="channels-row"
-          role="list"
-          aria-label="Audio channel strips"
+          class="add-affordance"
+          class:add-affordance--open={addOpen}
+          role="listitem"
         >
-          <MasterStrip mixerState={$engineState} unrouted={grouped.unrouted}
-            onClearStream={handleClearStream} onError={(m) => (dropError = m)} />
-
-          {#each $engineState.channels as channel (channel.id)}
-            <div role="listitem">
-              <ChannelStrip
-                {channel}
-                streams={grouped.byChannel[channel.id] ?? []}
-                outputDevices={$outputsStore}
-                onDropStream={handleDropStream}
-                onOutputChanged={() => {
-                  // State will be refreshed via state-changed event.
-                  // No extra action needed here.
-                }}
-                onRemove={$engineState.channels.length > 1 && !removeBusy
-                  ? () => handleRemoveChannel(channel.id)
-                  : undefined}
-                onError={(m) => (dropError = m)}
-              />
-            </div>
-          {/each}
-
-          <MicStrip mic={$engineState.mic} onError={(m) => (dropError = m)} />
-
-          <!-- ===== Add channel affordance ===== -->
-          <div class="add-channel-strip" role="listitem">
-            <p class="add-channel-label">ADD CHANNEL</p>
-            <div class="add-channel-row">
-              <input
-                class="add-channel-input"
-                type="text"
-                placeholder="id (e.g. aux)"
-                bind:value={addId}
-                disabled={addBusy}
-                aria-label="New channel id"
-                onkeydown={handleAddKeydown}
-              />
+          {#if !addOpen}
+            <button
+              class="add-open-btn"
+              aria-label="Add custom channel"
+              title="Add custom channel"
+              onclick={() => { addOpen = true; addError = null; }}
+            >+</button>
+          {:else}
+            <div class="add-form">
+              <p class="add-form-label">ADD CHANNEL</p>
+              <div class="add-form-row">
+                <input
+                  class="add-form-input"
+                  type="text"
+                  placeholder="id (e.g. aux)"
+                  bind:value={addId}
+                  disabled={addBusy}
+                  aria-label="New channel id"
+                  onkeydown={handleAddKeydown}
+                />
+                <button
+                  class="add-form-submit"
+                  disabled={addBusy || !addId.trim()}
+                  aria-label="Add channel"
+                  onclick={handleAddChannel}
+                >+</button>
+              </div>
+              {#if addError}
+                <p class="add-form-error" role="alert">{addError}</p>
+              {/if}
               <button
-                class="add-channel-btn"
-                disabled={addBusy || !addId.trim()}
-                aria-label="Add channel"
-                onclick={handleAddChannel}
-              >+</button>
+                class="add-form-cancel"
+                aria-label="Cancel add channel"
+                onclick={() => { addOpen = false; addError = null; addId = ""; }}
+              >Cancel</button>
             </div>
-            {#if addError}
-              <p class="add-channel-error" role="alert">{addError}</p>
-            {/if}
-          </div>
+          {/if}
         </div>
-      {/if}
-    </div>
+      </div>
+    {/if}
 
     <!-- ===== Drop / clear error banner (Fix 3) ===== -->
     {#if dropError}
@@ -235,10 +262,13 @@
     <ChatmixSlider position={$engineState.chatmix_position}
       hardwareActive={$engineState.device_present && $engineState.dial_controls_balance} />
 
-    <!-- ===== Route list ===== -->
-    <div class="routes-container">
-      <RouteList />
-    </div>
+    <!-- ===== Route list — collapsible, de-emphasised ===== -->
+    <details class="routes-disclosure">
+      <summary class="routes-summary">Remembered routes</summary>
+      <div class="routes-body">
+        <RouteList />
+      </div>
+    </details>
   {/if}
 </div>
 
@@ -409,18 +439,13 @@
     font-weight: 600;
   }
 
-  /* ===== Channel strips ===== */
-  .channels-container {
-    overflow-x: auto;
-    /* Subtle scroll fade on the right edge */
-    -webkit-overflow-scrolling: touch;
-  }
-
+  /* ===== Channel strips — full-width flex row ===== */
   .channels-row {
     display: flex;
     gap: var(--ss-space-3);
-    padding-bottom: var(--ss-space-2); /* room for scrollbar */
-    min-width: min-content;
+    width: 100%;
+    flex-wrap: wrap;
+    align-items: stretch;
   }
 
   .channels-empty {
@@ -431,22 +456,65 @@
     margin: 0;
   }
 
-  /* ===== Add channel strip ===== */
-  .add-channel-strip {
+  /* ===== Add-channel affordance (end-of-row) ===== */
+  .add-affordance {
     display: flex;
     flex-direction: column;
-    width: var(--ss-channel-strip-w, 120px);
-    min-width: var(--ss-channel-strip-w-min, 100px);
+    flex: 0 0 auto;
+    align-self: stretch;
+  }
+
+  /* Closed state: slim "+" button, same height as the strip row */
+  .add-open-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 100%;
+    min-height: 60px;
     background: var(--ss-surface-1);
     border: var(--ss-border-width) dashed var(--ss-border);
     border-radius: var(--ss-radius-md);
-    padding: var(--ss-space-3);
-    gap: var(--ss-space-2);
-    flex-shrink: 0;
-    justify-content: flex-start;
+    color: var(--ss-text-tertiary);
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    transition:
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard),
+      background var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  .add-channel-label {
+  .add-open-btn:hover {
+    border-color: var(--ss-border-strong);
+    color: var(--ss-text-secondary);
+    background: var(--ss-surface-2);
+  }
+
+  .add-open-btn:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
+  }
+
+  /* Open state: compact inline form */
+  .add-affordance--open {
+    flex: 0 0 auto;
+    min-width: 160px;
+  }
+
+  .add-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-2);
+    padding: var(--ss-space-3);
+    background: var(--ss-surface-1);
+    border: var(--ss-border-width) dashed var(--ss-border);
+    border-radius: var(--ss-radius-md);
+    height: 100%;
+    box-sizing: border-box;
+  }
+
+  .add-form-label {
     font-family: var(--ss-font-ui);
     font-size: var(--ss-type-micro-size);
     font-weight: var(--ss-type-micro-weight);
@@ -456,12 +524,12 @@
     margin: 0;
   }
 
-  .add-channel-row {
+  .add-form-row {
     display: flex;
     gap: var(--ss-space-1);
   }
 
-  .add-channel-input {
+  .add-form-input {
     flex: 1;
     min-width: 0;
     height: var(--ss-control-h-sm);
@@ -474,17 +542,17 @@
     font-size: var(--ss-type-caption-size);
   }
 
-  .add-channel-input:focus {
+  .add-form-input:focus {
     outline: none;
     border-color: var(--ss-accent-border);
   }
 
-  .add-channel-input:disabled {
+  .add-form-input:disabled {
     cursor: not-allowed;
     color: var(--ss-text-disabled);
   }
 
-  .add-channel-btn {
+  .add-form-submit {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -501,26 +569,54 @@
     transition: filter var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  .add-channel-btn:hover:not(:disabled) {
+  .add-form-submit:hover:not(:disabled) {
     filter: brightness(1.15);
   }
 
-  .add-channel-btn:disabled {
+  .add-form-submit:disabled {
     cursor: not-allowed;
     opacity: 0.4;
   }
 
-  .add-channel-btn:focus-visible {
+  .add-form-submit:focus-visible {
     outline: 2px solid var(--ss-accent);
     outline-offset: 2px;
   }
 
-  .add-channel-error {
+  .add-form-error {
     font-family: var(--ss-font-ui);
     font-size: var(--ss-type-caption-size);
     color: var(--ss-danger);
     margin: 0;
     word-break: break-word;
+  }
+
+  .add-form-cancel {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: var(--ss-control-h-sm);
+    padding: 0 var(--ss-space-2);
+    background: transparent;
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-xs);
+    color: var(--ss-text-tertiary);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    cursor: pointer;
+    transition:
+      border-color var(--ss-dur-fast) var(--ss-ease-standard),
+      color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  .add-form-cancel:hover {
+    border-color: var(--ss-border-strong);
+    color: var(--ss-text-secondary);
+  }
+
+  .add-form-cancel:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: 2px;
   }
 
   /* ===== Drop / clear error banner (Fix 3) ===== */
@@ -559,8 +655,63 @@
     background: rgba(229, 72, 77, 0.15);
   }
 
-  /* ===== Routes ===== */
-  /* .routes-container — RouteList is a self-contained card, no extra styles needed */
+  /* ===== Routes — collapsible section ===== */
+  .routes-disclosure {
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-radius: var(--ss-radius-md);
+    background: var(--ss-surface-1);
+    overflow: hidden;
+  }
+
+  .routes-summary {
+    display: flex;
+    align-items: center;
+    gap: var(--ss-space-2);
+    padding: var(--ss-space-3) var(--ss-space-4);
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-tertiary);
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    transition: color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+
+  /* Remove default disclosure triangle in WebKit */
+  .routes-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  /* Custom chevron via ::before */
+  .routes-summary::before {
+    content: "›";
+    display: inline-block;
+    font-size: 14px;
+    line-height: 1;
+    color: var(--ss-text-tertiary);
+    transition: transform var(--ss-dur-fast) var(--ss-ease-standard);
+    transform: rotate(0deg);
+  }
+
+  .routes-disclosure[open] .routes-summary::before {
+    transform: rotate(90deg);
+  }
+
+  .routes-summary:hover {
+    color: var(--ss-text-secondary);
+  }
+
+  .routes-summary:focus-visible {
+    outline: 2px solid var(--ss-accent);
+    outline-offset: -2px;
+  }
+
+  .routes-body {
+    padding: 0 var(--ss-space-4) var(--ss-space-4);
+  }
 
   @media (prefers-reduced-motion: reduce) {
     .loading-spinner {

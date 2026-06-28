@@ -66,7 +66,7 @@
   }
 </script>
 
-<div class="strip master" style="--accent: var(--ss-accent-master)">
+<div class="strip master" role="listitem" style="--accent: var(--ss-accent-master)">
   <!-- ===== Header ===== -->
   <div class="strip-header">
     <span class="channel-icon" aria-hidden="true">◉</span>
@@ -126,12 +126,12 @@
 <style>
   .strip.master {
     display: flex; flex-direction: column; gap: var(--ss-space-3);
-    width: var(--ss-channel-strip-w, 120px); min-width: var(--ss-channel-strip-w-min, 100px);
+    flex: 1 1 0; min-width: 140px;
     background: var(--ss-surface-1);
     border: var(--ss-border-width) solid var(--ss-border);
     border-top: 2px solid var(--accent);
     border-radius: var(--ss-radius-md); padding: var(--ss-space-3);
-    flex-shrink: 0; box-shadow: var(--ss-e1);
+    box-shadow: var(--ss-e1);
   }
 
   /* ===== Header ===== */
