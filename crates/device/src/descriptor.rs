@@ -19,6 +19,14 @@ pub struct DeviceDescriptor {
     /// Sent as its own single report when a command has `save = true`.
     #[serde(default)]
     pub save_command: Option<Vec<u8>>,
+    /// Ordered raw init reports sent ONCE on attach (each is a FULL report
+    /// including the leading report-id byte; padded to `report_length` before
+    /// write). Unlike `commands`, these are not value-encoded or per-command
+    /// gated — they are a fixed, owner-validated device-init sequence (see the
+    /// descriptor TOML for per-opcode provenance). Empty by default so other
+    /// descriptors parse unchanged.
+    #[serde(default)]
+    pub init_writes: Vec<Vec<u8>>,
 }
 
 /// A single declarative write command: which opcode bytes to send and how to
@@ -119,6 +127,34 @@ mod tests {
         assert!(c.save);
         assert_eq!(c.encoding, ValueEncoding::IntRange { min: 0, max: 3 });
         assert_eq!(d.save_command, Some(vec![0x09]));
+    }
+
+    #[test]
+    fn nova_descriptor_parses_23_init_writes() {
+        use crate::registry::Registry;
+        use arctis_domain::DeviceId;
+        let d = Registry::builtin()
+            .unwrap()
+            .find(DeviceId::new(0x1038, 0x12e5))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            d.init_writes.len(),
+            23,
+            "Nova descriptor must have exactly 23 init_writes"
+        );
+        // The ChatMix dial-enable report is the 17th entry (0-based index 16).
+        assert_eq!(
+            d.init_writes[16],
+            vec![0x06, 0x49, 0x01],
+            "init_writes[16] must be the ChatMix dial-enable opcode [0x06,0x49,0x01]"
+        );
+        // First report is a wake/probe.
+        assert_eq!(
+            d.init_writes[0],
+            vec![0x06, 0x20],
+            "init_writes[0] must be the wake/probe [0x06,0x20]"
+        );
     }
 
     #[test]

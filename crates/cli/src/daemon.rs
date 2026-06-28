@@ -550,10 +550,15 @@ impl arctis_engine::DeviceOpener for HidOpener {
                     .ok_or(arctis_device::DeviceError::NotConnected)?
                     .clone();
                 let transport = arctis_device::HidrawTransport::open(id, iface)?;
-                // SAFETY GATE: enabled_writes starts EMPTY. OWNER-RUN tasks (Task 7)
-                // add one name at a time AFTER real-HW validation. Do NOT add a name
-                // here unless its OWNER-RUN gate in this plan is signed off.
-                let enabled: Vec<String> = vec![/* filled by Task 7 gates */];
+                // OWNER-VALIDATED 2026-06-28: ChatMix dial-enable init burst is
+                // enabled. Opcodes sourced from the reference app's device_init
+                // (nova_pro_wireless.yaml), owner-confirmed on real hardware
+                // (VID 0x1038, PID 0x12e5). This sends the dial-relevant init
+                // subset on attach so the Game/Chat dial emits [0x07,0x45] frames.
+                // Per-command writes (mic_volume, sidetone, etc.) remain DISABLED —
+                // not listed here. Do NOT add names unless their OWNER-RUN gate is
+                // signed off.
+                let enabled: Vec<String> = vec!["chatmix_dial_init".to_string()];
                 let controller = arctis_device::DeviceController::new(transport, desc)
                     .with_enabled_writes(&enabled.iter().map(|s| s.as_str()).collect::<Vec<_>>());
                 Ok(Some((controller, enabled)))

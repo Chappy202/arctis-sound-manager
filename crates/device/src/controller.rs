@@ -95,6 +95,28 @@ impl<T: Transport> DeviceController<T> {
         Ok(false)
     }
 
+    /// Send the device's `init_writes` sequence once (e.g. on attach): each
+    /// entry is padded to `report_length` and written via the transport, in
+    /// order. Returns how many reports were sent. Surfaces the first transport
+    /// error (G2 — never swallow writes silently).
+    ///
+    /// This is a raw, owner-validated init burst (the ChatMix dial-enable
+    /// sequence), NOT per-command allowlist-gated; callers gate WHETHER to call
+    /// it (see `maybe_send_chatmix_init` in `engine/device.rs` + HidOpener).
+    /// All automated tests use [`crate::mock::MockTransport`] — no real HID
+    /// write occurs in tests.
+    pub fn send_init_writes(&mut self) -> Result<usize, DeviceError> {
+        let len = self.descriptor.report_length;
+        let mut sent = 0usize;
+        for report in &self.descriptor.init_writes {
+            let mut buf = report.clone();
+            buf.resize(len, 0);
+            self.transport.write_report(&buf)?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
     /// Send a single write command. Refuses unless (a) it is in enabled_writes
     /// AND (b) its capability is present in the descriptor.
     pub fn set(&mut self, name: &str, value: i64) -> Result<(), DeviceError> {
@@ -165,6 +187,59 @@ mod tests {
             DeviceController::new(MockTransport::new(), d).with_enabled_writes(&["mic_led"]);
         let err = c.set("mic_led", 5).unwrap_err();
         assert!(matches!(err, DeviceError::Unsupported(_)));
+    }
+
+    // ── ChatMix dial-enable init burst tests (send_init_writes) ─────────────
+
+    /// send_init_writes sends all 23 Nova init reports, each padded to 64 bytes.
+    #[test]
+    fn send_init_writes_sends_23_padded_reports() {
+        let d = nova();
+        let report_len = d.report_length;
+        let mut c = DeviceController::new(MockTransport::new(), d);
+        let n = c
+            .send_init_writes()
+            .expect("send_init_writes must not error with MockTransport");
+        assert_eq!(n, 23, "must return 23 (the count of reports sent)");
+        let written = &c.transport().written;
+        assert_eq!(written.len(), 23, "MockTransport must record exactly 23 writes");
+        // Every report must be padded to report_length.
+        for (i, w) in written.iter().enumerate() {
+            assert_eq!(
+                w.len(),
+                report_len,
+                "report[{i}] must be padded to report_length ({report_len})"
+            );
+        }
+        // Spot-check: first report is [0x06, 0x20, 0x00, …].
+        assert_eq!(written[0][0], 0x06, "report[0] byte[0] must be report_id 0x06");
+        assert_eq!(written[0][1], 0x20, "report[0] byte[1] must be 0x20 (wake/probe)");
+        assert!(
+            written[0][2..].iter().all(|&b| b == 0),
+            "report[0] tail must be zero-padded"
+        );
+        // Spot-check: the dial-enable report at index 16 is [0x06, 0x49, 0x01, 0x00, …].
+        assert_eq!(written[16][0], 0x06, "report[16] byte[0] must be report_id 0x06");
+        assert_eq!(written[16][1], 0x49, "report[16] byte[1] must be 0x49 (chatmix_enable opcode)");
+        assert_eq!(written[16][2], 0x01, "report[16] byte[2] must be 0x01 (enabled)");
+        assert!(
+            written[16][3..].iter().all(|&b| b == 0),
+            "report[16] tail must be zero-padded"
+        );
+    }
+
+    /// send_init_writes with an empty init_writes list returns 0 and writes nothing.
+    #[test]
+    fn send_init_writes_empty_descriptor_sends_nothing() {
+        let mut d = nova();
+        d.init_writes.clear();
+        let mut c = DeviceController::new(MockTransport::new(), d);
+        let n = c.send_init_writes().expect("must succeed with empty list");
+        assert_eq!(n, 0, "zero reports sent when init_writes is empty");
+        assert!(
+            c.transport().written.is_empty(),
+            "no writes recorded when init_writes is empty"
+        );
     }
 
     // ── Task B2: is_dial_frame + validate_chatmix tests ─────────────────────

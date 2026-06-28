@@ -62,15 +62,16 @@ fn drain_commands<T: Transport>(
     }
 }
 
-/// Send the one-time ChatMix-enable init write on attach, IFF the opener enabled it.
-///
-/// Goes through the gated `controller.set` (no bypass); a no-op when `chatmix_enable`
-/// is not in `enabled` (the production default — HidOpener's allowlist is empty until
-/// the owner validates [0x06,0x49,0x01] and opts in). Surfaces failures via log.
+/// On attach, send the ChatMix dial-enable init burst IFF the opener enabled it
+/// ("chatmix_dial_init" in `enabled`). No-op otherwise. Surfaces failures via
+/// eprintln (G2 — never swallow). The burst is sent via
+/// `DeviceController::send_init_writes` (owner-validated raw reports, NOT the
+/// per-command allowlist-gated `set()` path).
 fn maybe_send_chatmix_init<T: Transport>(controller: &mut DeviceController<T>, enabled: &[String]) {
-    if enabled.iter().any(|n| n == "chatmix_enable") {
-        if let Err(e) = controller.set("chatmix_enable", 1) {
-            eprintln!("[device] chatmix-enable init on attach failed: {e}");
+    if enabled.iter().any(|n| n == "chatmix_dial_init") {
+        match controller.send_init_writes() {
+            Ok(n) => eprintln!("[device] sent ChatMix dial-enable init burst ({n} reports)"),
+            Err(e) => eprintln!("[device] ChatMix dial-enable init burst failed: {e}"),
         }
     }
 }
@@ -425,51 +426,63 @@ mod tests {
         handle.join().expect("worker must not panic");
     }
 
-    // ─────────────────────────────────────────────
-    // Task B3: maybe_send_chatmix_init helper tests
-    // ─────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────
+    // ChatMix dial-enable init burst attach-gating tests
+    // (replaces B3 single-opcode helper tests; the new helper calls
+    //  send_init_writes() which writes all 23 dial-enable init reports at once)
+    // ─────────────────────────────────────────────────────────────────────────
 
-    /// Enabled → exactly one report with bytes [0x06,0x49,0x01] is sent to the transport.
+    /// Enabled via "chatmix_dial_init" → all 23 init reports are sent via the
+    /// transport, each padded to 64 bytes. The dial-enable report is at index 16.
     #[test]
-    fn chatmix_init_sent_when_enabled() {
-        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
-            .with_enabled_writes(&["chatmix_enable"]);
-        maybe_send_chatmix_init(&mut c, &["chatmix_enable".to_string()]);
+    fn chatmix_dial_init_sent_when_enabled() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc());
+        maybe_send_chatmix_init(&mut c, &["chatmix_dial_init".to_string()]);
         let written = &c.transport().written;
-        assert_eq!(written.len(), 1, "exactly one report must be written on attach");
-        assert_eq!(written[0][0], 0x06, "report_id must be 0x06");
-        assert_eq!(written[0][1], 0x49, "opcode must be 0x49");
-        assert_eq!(written[0][2], 0x01, "value must be 0x01 (enabled)");
+        assert_eq!(
+            written.len(),
+            23,
+            "all 23 init reports must be sent to the transport on attach"
+        );
+        // Every report must be padded to 64 bytes.
+        for (i, w) in written.iter().enumerate() {
+            assert_eq!(w.len(), 64, "report[{i}] must be padded to 64 bytes");
+        }
+        // Spot-check wake/probe at index 0.
+        assert_eq!(written[0][0], 0x06, "report[0][0] must be report_id 0x06");
+        assert_eq!(written[0][1], 0x20, "report[0][1] must be 0x20 (wake/probe)");
+        // Spot-check ChatMix dial-enable report at index 16.
+        assert_eq!(written[16][0], 0x06, "report[16][0] must be report_id 0x06");
+        assert_eq!(written[16][1], 0x49, "report[16][1] must be 0x49 (chatmix_enable opcode)");
+        assert_eq!(written[16][2], 0x01, "report[16][2] must be 0x01 (enabled)");
         assert!(
-            written[0][3..].iter().all(|&b| b == 0),
-            "remainder must be zero-padded"
+            written[16][3..].iter().all(|&b| b == 0),
+            "report[16] tail must be zero-padded"
         );
     }
 
-    /// Not enabled → zero bytes written (G2 core property: no init in production).
+    /// Not enabled → zero bytes written (G2 core property: no HID write without
+    /// explicit owner sign-off in the enabled list).
     #[test]
-    fn chatmix_init_not_sent_when_not_enabled() {
-        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
-            .with_enabled_writes(&[]);
+    fn chatmix_dial_init_not_sent_when_not_enabled() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc());
         maybe_send_chatmix_init(&mut c, &[]);
         assert!(
             c.transport().written.is_empty(),
-            "no bytes must be written when chatmix_enable is absent from the enabled list"
+            "no bytes must be written when 'chatmix_dial_init' is absent from the enabled list"
         );
     }
 
-    /// Enabled list names chatmix_enable but controller gate is empty → nothing written,
-    /// no panic. The controller's own allowlist is the real gate; the helper's enabled
-    /// check is a fast-path skip; errors from set() are logged, not propagated.
+    /// Wrong name in enabled list (e.g. old "chatmix_enable") → zero bytes written.
+    /// The gate is keyed on the exact string "chatmix_dial_init".
     #[test]
-    fn chatmix_init_controller_gate_blocks_even_if_enabled_list_set() {
-        let mut c = DeviceController::new(MockTransport::new(), nova_desc())
-            .with_enabled_writes(&[]); // controller gate closed
-        // enabled list says yes, controller says no → set() returns Err, eprintln!, no write
+    fn chatmix_dial_init_not_sent_for_wrong_key() {
+        let mut c = DeviceController::new(MockTransport::new(), nova_desc());
+        // "chatmix_enable" is the --validate single-opcode path, NOT the init burst key.
         maybe_send_chatmix_init(&mut c, &["chatmix_enable".to_string()]);
         assert!(
             c.transport().written.is_empty(),
-            "controller gate must block the write even when enabled list contains chatmix_enable"
+            "wrong key 'chatmix_enable' must not trigger the dial-enable init burst"
         );
     }
 

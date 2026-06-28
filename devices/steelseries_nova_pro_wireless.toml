@@ -11,6 +11,67 @@ capabilities = [
 # Documented save/commit opcode (HeadsetControl sendCommandWithSave).
 save_command = [0x09]
 
+# ── CHATMIX DIAL-ENABLE INIT BURST ─────────────────────────────────────────
+#
+# Provenance: subset of `nova_pro_wireless.yaml` `device_init` from the
+# reference Python app (/home/jj/Dev/Personal/sound-manager/Arctis-Sound-Manager).
+# Owner-validated 2026-06-28: the owner runs the reference app in production and
+# has confirmed these opcodes on real hardware (VID 0x1038, PID 0x12e5).
+#
+# This is the DIAL-RELEVANT subset only. The following settings-apply opcodes
+# from the full reference device_init were intentionally EXCLUDED per owner
+# choice (they would reset EQ/ANC/gain/sidetone/etc. to hard-coded values):
+#   0x33 (EQ bands), 0xc3 (wireless), 0x2e (preset), 0xc1 (inactive-time),
+#   0xb9 (transparency), 0x37 (mic-volume), 0x47 (line-out level),
+#   0xbd (ANC mode), 0x27 (mic-gain), 0x39 (sidetone), 0xbf (LED strength),
+#   0x43 (line-out), 0xb2/0x83/0xb3 (various settings).
+#
+# Without this burst the headset never enters ChatMix/dial mode and never
+# emits [0x07,0x45] dial frames. The last phase of the sequence
+# [0x06,0x3b,0x00] [0x06,0x8d,0x01] [0x06,0x49,0x01] is the mode-switch that
+# enables the Game/Chat balance dial.
+#
+# Each entry is a FULL raw HID report (leading byte = report id = 0x06).
+# It is padded to `report_length` (64 bytes) before being written to the device.
+# These are sent ONCE on attach by `DeviceController::send_init_writes` when
+# the daemon enables "chatmix_dial_init" (owner sign-off in HidOpener).
+#
+# No OLED writes. No save/0x09. These are transient mode-switch reports;
+# a replug resets the device to default state.
+#
+# NOTE: This key must appear before any [table] or [[array.of.tables]] headers
+# so that TOML scoping assigns it to the root DeviceDescriptor.
+init_writes = [
+  # ── Wake / probe group ─────────────────────────────────────────────
+  [0x06, 0x20],          # wake/probe (ref: immediately after connect)
+  [0x06, 0x20],          # wake/probe (repeated)
+  [0x06, 0x10],          # probe
+  [0x06, 0x10],          # probe (repeated)
+  [0x06, 0x10],          # probe (repeated)
+  [0x06, 0x3b],          # mode correction probe (ref comment: "correction")
+  [0x06, 0x8d, 0x01],    # audio/Sonar mode on
+  # ── Second wake group ──────────────────────────────────────────────
+  [0x06, 0x20],          # wake/probe
+  [0x06, 0x20],          # wake/probe
+  [0x06, 0x20],          # wake/probe
+  [0x06, 0x80],          # probe
+  [0x06, 0x3b],          # mode correction probe
+  [0x06, 0x8d, 0x01],    # audio/Sonar mode on (repeated)
+  # ── Pre-enable ─────────────────────────────────────────────────────
+  [0x06, 0x69, 0x00],    # pre-enable (ref: immediately before the enable group)
+  # ── ChatMix mode-switch group (DIAL ENABLE) ─────────────────────────
+  [0x06, 0x3b, 0x00],    # mode-switch init
+  [0x06, 0x8d, 0x01],    # audio/Sonar mode on
+  [0x06, 0x49, 0x01],    # CHATMIX DIAL ENABLE — puts headset into Game/Chat dial mode
+  # ── Post-enable settle group ────────────────────────────────────────
+  [0x06, 0xb7, 0x00],    # settle (ref: appears 3x after enable)
+  [0x06, 0xb7, 0x00],    # settle
+  [0x06, 0xb7, 0x00],    # settle
+  [0x06, 0xb0],          # status request (prompts a status frame from the headset)
+  [0x06, 0x20, 0x00],    # wake/probe with value=0x00
+  [0x06, 0xb7, 0x00],    # final settle
+]
+
 [status]
 # 0x06 0xb0 = status request. Writer prepends report_id, so request starts at 0xb0.
 request = [0xb0]
@@ -50,7 +111,8 @@ offset = 3
 parser = { type = "int" }
 
 # ── WRITE COMMANDS ─────────────────────────────────────────────────────────
-# Each is a SINGLE opcode. No bursts. No OLED. Capability-gated.
+# Each is a SINGLE opcode. No OLED. Capability-gated.
+# (init_writes above handles the dial-enable burst — not a per-command write.)
 # HeadsetControl-corroborated for THIS model (lib/devices/..nova_pro_wireless.hpp):
 
 [commands.sidetone]                 # { 0x06, 0x39, 0..3 } + save
