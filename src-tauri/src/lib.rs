@@ -71,6 +71,13 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let mut ticker =
                         tokio::time::interval(std::time::Duration::from_millis(250));
+                    // Emit-on-change guard: only push `state-changed` when the
+                    // snapshot actually differs from the last one we emitted.
+                    // The poll stays at 250 ms for low latency, but an idle GUI
+                    // does zero reactive work (EngineState derives PartialEq, and
+                    // none of its fields are time-varying), so the EQ curve and
+                    // every other $derived stop recomputing 4x/sec while idle.
+                    let mut last_state: Option<arctis_engine::EngineState> = None;
                     loop {
                         ticker.tick().await;
                         let socket = {
@@ -88,7 +95,10 @@ pub fn run() {
                         if let Ok(Ok(resp)) = result {
                             if resp.ok {
                                 if let Some(engine_state) = resp.state {
-                                    let _ = handle.emit("state-changed", &engine_state);
+                                    if last_state.as_ref() != Some(&engine_state) {
+                                        let _ = handle.emit("state-changed", &engine_state);
+                                        last_state = Some(engine_state);
+                                    }
                                 }
                             }
                         }

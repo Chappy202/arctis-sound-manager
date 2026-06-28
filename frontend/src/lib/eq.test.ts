@@ -263,4 +263,10 @@ describe("reconcileBands", () => {
     const incoming = [mk(1), mk(2), mk(3)];
     expect(reconcileBands(local, incoming, false).length).toBe(3);
   });
+  it("returns the SAME local reference when idle and content is unchanged (perf guard)", () => {
+    const local = [mk(3), mk(0)];
+    const incoming = [mk(3), mk(0)]; // equal by value, different reference
+    // Must return `local` (not `incoming`) so downstream $derived don't churn.
+    expect(reconcileBands(local, incoming, false)).toBe(local);
+  });
 });

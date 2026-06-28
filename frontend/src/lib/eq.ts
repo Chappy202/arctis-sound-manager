@@ -230,13 +230,35 @@ export function logFreqAxis(samples: number): number[] {
 // State reconciliation
 // ---------------------------------------------------------------------------
 
+/** Deep value-equality for two band arrays (kind/freq/Q/gain). Pure. */
+export function bandsEqual(a: Band[], b: Band[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.kind !== y.kind ||
+      x.freqHz !== y.freqHz ||
+      x.q !== y.q ||
+      x.gainDb !== y.gainDb
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Reconcile the locally-edited band array against an incoming engine snapshot.
  * While the user is editing (any modality), keep the local array unchanged so a
  * background state refresh can never clobber an in-progress edit. When idle,
- * adopt the incoming array. Pure — unit-testable.
+ * adopt the incoming array — but only when it actually differs in value, so an
+ * unchanged snapshot returns the SAME `local` reference. That referential
+ * stability is what stops the EQ curve (and every band-derived value) from
+ * recomputing on each background state refresh. Pure — unit-testable.
  */
 export function reconcileBands(local: Band[], incoming: Band[], editing: boolean): Band[] {
   if (editing) return local;
-  return incoming;
+  return bandsEqual(local, incoming) ? local : incoming;
 }
