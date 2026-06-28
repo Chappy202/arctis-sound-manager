@@ -76,8 +76,8 @@ describe("VolumeCommitter", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  // Test 5: dispose() cancels the timer without committing
-  it("dispose cancels: schedule then dispose → timer fires but spy NOT called", () => {
+  // Test 5: dispose() cancels the timer without committing (timer never fires)
+  it("dispose cancels: schedule then dispose → timer is cancelled so spy is never called", () => {
     const spy = vi.fn();
     const c = createVolumeCommitter(80, spy);
     c.schedule(9);
