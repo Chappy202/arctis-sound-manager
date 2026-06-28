@@ -131,15 +131,18 @@ impl<R: CommandRunner> AudioBackend<R> {
     }
 
     /// Apply volume+mute using a 0–100 percent value via `pw-cli s <id> Props …`.
-    /// Converts pct to linear (pct / 100.0) for channelVolumes.
-    /// Channel sinks are stereo → 2 identical channelVolume entries.
+    /// Uses the PERCEPTUAL (cubic) scale to match wpctl/PipeWire/pavucontrol:
+    /// user pct → raw linear channelVolumes = (pct/100)^3. (wpctl set-volume 0.5
+    /// yields channelVolumes 0.125 = 0.5^3.) `parse_node_volume` reads the inverse
+    /// (cbrt) so write/read round-trip. Channel sinks are stereo → 2 identical entries.
     pub fn apply_volume_mute_pct(
         &mut self,
         volume_pct: u8,
         muted: bool,
     ) -> Result<(), AudioError> {
         let id = self.find_node_id()?;
-        let linear = volume_pct as f32 / 100.0;
+        let frac = (volume_pct as f32 / 100.0).clamp(0.0, 1.0);
+        let linear = frac * frac * frac; // (pct/100)^3
         let argv = set_node_volume_props_argv(&id, &[linear, linear], muted)?;
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let out = self.runner.run("pw-cli", &args)?;
@@ -405,6 +408,51 @@ id 58, type PipeWire:Interface:Node/3
         be.apply_volume_mute(0.0, true).unwrap();
         let last = be.runner().last_call().unwrap();
         assert!(last.last().unwrap().contains("mute = true"));
+    }
+
+    #[test]
+    fn apply_volume_mute_pct_uses_cubic_perceptual_scale() {
+        // pct=50 (perceptual) → raw linear channelVolumes 0.125 (=0.5^3), matching wpctl.
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // find_node_id
+            .with_output(0, "", ""); // the set
+        let mut be = AudioBackend::new(runner, spec());
+        be.apply_volume_mute_pct(50, false).unwrap();
+        let last = be.runner().last_call().unwrap();
+        assert_eq!(
+            last.last().unwrap(),
+            "{ channelVolumes = [ 0.125 0.125 ] mute = false }",
+            "pct=50 must apply cubic linear 0.125, not raw-linear 0.5"
+        );
+    }
+
+    #[test]
+    fn apply_volume_mute_pct_read_round_trips_perceptual() {
+        // Write→read inverse: apply_volume_mute_pct(P) emits channelVolumes = (P/100)^3;
+        // parse_node_volume reads cbrt(channelVolumes)*100 back to P (±1 rounding).
+        use crate::sinks::parse_node_volume;
+        for p in [0u8, 8, 25, 50, 100] {
+            let runner = MockRunner::new()
+                .with_output(0, LS_WITH_SINK, "") // find_node_id
+                .with_output(0, "", ""); // the set
+            let mut be = AudioBackend::new(runner, spec());
+            be.apply_volume_mute_pct(p, false).unwrap();
+            // Extract the raw linear value the backend emitted.
+            let json = be.runner().last_call().unwrap().last().unwrap().clone();
+            let inner = json
+                .split("[ ")
+                .nth(1)
+                .and_then(|s| s.split(' ').next())
+                .unwrap();
+            let linear: f64 = inner.parse().unwrap();
+            // Feed it back through the live-read parser via a synthetic pw-dump.
+            let dump = format!(
+                "[{{\"type\":\"PipeWire:Interface:Node\",\"id\":1,\"info\":{{\"props\":{{\"node.name\":\"n\"}},\"params\":{{\"Props\":[{{\"channelVolumes\":[{linear},{linear}],\"mute\":false}}]}}}}}}]"
+            );
+            let read = parse_node_volume(&dump, "n").unwrap();
+            let diff = (read as i16 - p as i16).abs();
+            assert!(diff <= 1, "round-trip pct {p} → linear {linear} → read {read} (diff {diff})");
+        }
     }
 
     #[test]

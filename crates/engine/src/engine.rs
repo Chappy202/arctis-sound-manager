@@ -971,9 +971,9 @@ impl<R: CommandRunner> Engine<R> {
             channel.volume_pct = pct;
         }
         self.save_config()?;
-        // Apply live: raw-linear channelVolumes via pw-cli Props (same path as reconcile +
-        // parse_node_volume read). NOTE: `wpctl set-volume` applies WirePlumber's cubic curve
-        // (50% → channelVolumes 0.125), which mismatches the linear read — hardware-confirmed.
+        // Apply live: perceptual (cubic) channelVolumes via pw-cli Props (same scale as
+        // wpctl/PipeWire/pavucontrol, and inverse of the parse_node_volume cbrt read):
+        // 50% → channelVolumes 0.125 (=0.5^3). Hardware-confirmed to match the system.
         {
             let profile = self.config.active()?.clone();
             let channel = profile
@@ -1488,7 +1488,7 @@ impl<R: CommandRunner> Engine<R> {
     /// Apply a live hardware-dial ChatMix reading.
     ///
     /// Sets the GAME sink to `media_mix`% and the CHAT sink to `chat_mix`%
-    /// using raw-linear channelVolumes (same path as `set_channel_volume`), updates
+    /// using perceptual (cubic) channelVolumes (same path as `set_channel_volume`), updates
     /// the in-memory `volume_pct` and `chatmix_position`, and stamps
     /// `last_volume_write` so `state()` reflects the new values immediately —
     /// WITHOUT calling `save_config` (no per-tick disk I/O).
@@ -3964,9 +3964,9 @@ mod tests {
 
     #[test]
     fn set_channel_volume_pct_emits_correct_pwcli_props_argv() {
-        // I2: set_channel_volume must call pw-cli s <node_id> Props {channelVolumes:[pct/100,…]}
-        // (raw-linear, same path as reconcile + parse_node_volume read — NOT wpctl set-volume
-        //  which applies WirePlumber's cubic curve: 50% → channelVolumes 0.125).
+        // I2: set_channel_volume must call pw-cli s <node_id> Props {channelVolumes:[(pct/100)^3,…]}
+        // (perceptual/cubic, same scale as wpctl/PipeWire/pavucontrol and inverse of the
+        //  parse_node_volume cbrt read): 50% → channelVolumes 0.125 (=0.5^3).
         // ls_all_present() maps Arctis_Game → id "10"
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm_vol_pct_{}", std::process::id()));
@@ -3994,9 +3994,9 @@ mod tests {
                 "s",
                 "10",
                 "Props",
-                "{ channelVolumes = [ 0.5 0.5 ] mute = false }",
+                "{ channelVolumes = [ 0.125 0.125 ] mute = false }",
             ],
-            "second call must be pw-cli s <id> Props {{channelVolumes:[0.5,0.5], mute:false}}"
+            "second call must be pw-cli s <id> Props {{channelVolumes:[0.125,0.125], mute:false}}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4011,7 +4011,7 @@ mod tests {
         cfg.profiles[0].channels[0].volume_pct = 80;
         let pw_dump = concat!(
             r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
-            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+            r#""params":{"Props":[{"channelVolumes":[0.125,0.125],"mute":false}]}}}]"#
         );
         let runner = MockRunner::new().with_output(0, pw_dump, ""); // [0] pw-dump
         let mut engine = Engine::new(runner, cfg);
@@ -4030,7 +4030,7 @@ mod tests {
         cfg.profiles[0].channels[0].volume_pct = 80;
         let pw_dump = concat!(
             r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
-            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+            r#""params":{"Props":[{"channelVolumes":[0.125,0.125],"mute":false}]}}}]"#
         );
         // Queue only ONE pw-dump output; if state() calls pw-dump twice, the second
         // call returns an empty response and volume_pct would diverge.
@@ -4065,7 +4065,7 @@ mod tests {
         cfg.profiles[0].channels[0].volume_pct = 80;
         let pw_dump = concat!(
             r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
-            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+            r#""params":{"Props":[{"channelVolumes":[0.125,0.125],"mute":false}]}}}]"#
         );
         // Queue two pw-dump outputs: one for the first state(), one for after cache expiry.
         let runner = MockRunner::new()
@@ -4160,10 +4160,10 @@ mod tests {
             r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
             r#""params":{"Props":[{"channelVolumes":[1.0,1.0],"mute":false}]}}}]"#
         );
-        // Fresh pw-dump after the write: reflects the updated linear 0.5 value.
+        // Fresh pw-dump after the write: reflects the perceptual 50% (cubic linear 0.125).
         let pw_dump_new = concat!(
             r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
-            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+            r#""params":{"Props":[{"channelVolumes":[0.125,0.125],"mute":false}]}}}]"#
         );
         let ls = ls_all_present();
         let runner = MockRunner::new()
@@ -6909,7 +6909,7 @@ mod tests {
     }
 
     /// apply_dial_mix(80, 100): game=80%, chat=100% applied via pw-cli Props
-    /// (raw-linear: 0.8 and 1.0), chatmix_position updated, NO config file written.
+    /// (perceptual/cubic: 0.8^3=0.512 and 1.0^3=1.0), chatmix_position updated, NO config written.
     #[test]
     fn apply_dial_mix_applies_both_channels_no_save() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -6946,9 +6946,9 @@ mod tests {
                 "s",
                 "10",
                 "Props",
-                "{ channelVolumes = [ 0.8 0.8 ] mute = false }",
+                "{ channelVolumes = [ 0.512 0.512 ] mute = false }",
             ],
-            "call[1] must set game to 80% (0.8 linear)"
+            "call[1] must set game to 80% perceptual (0.8^3=0.512 linear)"
         );
         assert_eq!(
             calls[2],

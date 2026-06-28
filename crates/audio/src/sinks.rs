@@ -123,8 +123,9 @@ pub fn parse_output_sinks(
 ///
 /// Looks for a `PipeWire:Interface:Node` whose `info.props.node.name` matches
 /// `node_name`, then reads the first entry of `info.params.Props[0].channelVolumes`
-/// (falling back to `info.params.Props[0].volume`) and converts the linear value
-/// to a 0–100 percent integer.
+/// (falling back to `info.params.Props[0].volume`) and converts the raw linear
+/// value to a 0–100 PERCEPTUAL percent integer via the inverse of the cubic write:
+/// pct = cbrt(channelVolumes) * 100 (matches wpctl/PipeWire/pavucontrol).
 ///
 /// Returns `None` if the node is absent, the JSON is malformed, or no volume
 /// field is present. Callers should fall back to the config's `volume_pct`.
@@ -154,7 +155,8 @@ pub fn parse_node_volume(pw_dump_json: &str, node_name: &str) -> Option<u8> {
             .and_then(|a| a.first())
             .and_then(|v| v.as_f64())
             .or_else(|| first.get("volume").and_then(|v| v.as_f64()))?;
-        let pct = (linear * 100.0).round().clamp(0.0, 100.0) as u8;
+        // Inverse of the cubic write: perceptual pct = cbrt(channelVolumes) * 100.
+        let pct = ((linear as f32).cbrt() * 100.0).round().clamp(0.0, 100.0) as u8;
         return Some(pct);
     }
     None
