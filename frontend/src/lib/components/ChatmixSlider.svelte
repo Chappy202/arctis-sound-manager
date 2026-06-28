@@ -12,8 +12,13 @@
    * - onValueCommit → flushes IPC commit on pointer-up; clears drag flag.
    * - Reconcile $effect → accepts engine echoes only when NOT dragging
    *   (untrack prevents the effect from re-running when dragging/value change).
-   * - Grey-out: when hardwareActive the slider is disabled + dimmed with a
-   *   "Controlled by headset dial" hint; slider remains visible.
+   *   When hardwareActive, dragging is always false so the thumb TRACKS the
+   *   live dial position on every engine state poll (~2s cadence).
+   *   // TODO: could subscribe to ChatmixSet events for real-time sync
+   * - Synced: when hardwareActive the slider is disabled (non-interactive)
+   *   but the thumb moves to reflect the dial position. Hint reads "Synced
+   *   to headset dial". Dim is subtle (opacity: 0.9) so the moving thumb
+   *   is clearly visible.
    */
   import { untrack } from "svelte";
   import { Slider } from "bits-ui";
@@ -82,6 +87,12 @@
 </script>
 
 <div class="chatmix" class:disabled={hardwareActive}>
+  <!-- Scope label: clarifies this control is Game↔Chat balance only -->
+  <div class="chatmix-scope">
+    <span class="chatmix-title">CHATMIX</span>
+    <span class="chatmix-subtitle">Game ↔ Chat balance</span>
+  </div>
+
   <span class="end game">🎮 Game</span>
 
   <!--
@@ -89,6 +100,8 @@
       value  → scalar 0–9 (controlled)
       onValueChange  → called each drag step
       onValueCommit  → called once on pointer-up / key-commit
+    When hardwareActive, disabled blocks user input but the thumb still
+    tracks the dial via the reconcile $effect writing `value = 9 - position`.
   -->
   <Slider.Root
     type="single"
@@ -114,7 +127,7 @@
   <span class="end chat">💬 Chat</span>
 
   {#if hardwareActive}
-    <span class="hw-note">Controlled by headset dial</span>
+    <span class="hw-note">Synced to headset dial</span>
   {/if}
 </div>
 
@@ -131,7 +144,31 @@
     flex-wrap: wrap;
   }
 
-  .chatmix.disabled { opacity: 0.6; }
+  /* Synced state: subtle dim so the moving thumb stays clearly visible */
+  .chatmix.disabled { opacity: 0.9; }
+
+  /* ===== Scope label — full-width row above the slider ===== */
+  .chatmix-scope {
+    width: 100%;
+    display: flex;
+    align-items: baseline;
+    gap: var(--ss-space-2);
+  }
+
+  .chatmix-title {
+    font-family: var(--ss-font-display);
+    font-size: var(--ss-type-micro-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-secondary);
+  }
+
+  .chatmix-subtitle {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-tertiary);
+  }
 
   /* ===== End labels ===== */
   .end {
@@ -167,7 +204,8 @@
   }
 
   :global(.chatmix-slider-root[data-disabled]) {
-    cursor: not-allowed;
+    /* default cursor signals read-only (synced), not broken/unavailable */
+    cursor: default;
     pointer-events: none;
   }
 
@@ -232,9 +270,12 @@
   }
 
   :global(.chatmix-slider-thumb[data-disabled]) {
-    background: var(--ss-surface-input-alt);
-    border-color: var(--ss-border-strong);
-    cursor: not-allowed;
+    /* Keep accent border so the thumb reads as "active/synced", not broken.
+       cursor: default signals read-only (the dial owns it). */
+    background: white;
+    border-color: var(--ss-accent);
+    cursor: default;
     box-shadow: none;
+    opacity: 0.8;
   }
 </style>
