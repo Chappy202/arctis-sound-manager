@@ -11,7 +11,11 @@ pub const LEGACY_USER_SERVICES: &[&str] = &[
 
 #[derive(Debug, Default, PartialEq)]
 pub struct LegacyReport {
+    /// Always empty from `detect_from`; retained so callers can still construct
+    /// reports with loopbacks for unit-testing the destroy teardown path.
     pub legacy_loopbacks: Vec<String>,
+    /// Legacy systemd user service unit files found under `~/.config/systemd/user/`.
+    pub legacy_services: Vec<String>,
     pub hrir_switch_present: bool,
     pub rpm_daemon_running: bool,
 }
@@ -152,14 +156,20 @@ pub fn run_teardown<R: CommandRunner>(
     }
 }
 
-/// Scan `node_list_stdout` (output of `pw-cli ls Node`) and the user's `home`
-/// directory for signs of the legacy audio stack.
-pub fn detect_from(node_list_stdout: &str, home: &std::path::Path) -> LegacyReport {
+/// Scan the user's `home` directory for signs of the legacy audio stack.
+///
+/// `_node_list_stdout` is kept for caller compatibility (callers obtain it
+/// before calling us) but is no longer used for detection — node names such as
+/// `Arctis_Game/Chat/Media` are our own engine sinks and must never be treated
+/// as a legacy marker.
+pub fn detect_from(_node_list_stdout: &str, home: &std::path::Path) -> LegacyReport {
     let mut report = LegacyReport::default();
 
-    for name in ["Arctis_Game", "Arctis_Chat", "Arctis_Media"] {
-        if node_list_stdout.contains(name) {
-            report.legacy_loopbacks.push(name.to_string());
+    // Detect legacy systemd user service unit files.
+    let systemd_dir = home.join(".config/systemd/user");
+    for svc in LEGACY_USER_SERVICES {
+        if systemd_dir.join(svc).exists() {
+            report.legacy_services.push(svc.to_string());
         }
     }
 
@@ -175,6 +185,7 @@ pub fn detect_from(node_list_stdout: &str, home: &std::path::Path) -> LegacyRepo
 /// or `None` if the system appears clean.
 pub fn warning(report: &LegacyReport) -> Option<String> {
     if report.legacy_loopbacks.is_empty()
+        && report.legacy_services.is_empty()
         && !report.hrir_switch_present
         && !report.rpm_daemon_running
     {
@@ -186,6 +197,12 @@ pub fn warning(report: &LegacyReport) -> Option<String> {
         parts.push(format!(
             "legacy loopback nodes detected: {}",
             report.legacy_loopbacks.join(", ")
+        ));
+    }
+    if !report.legacy_services.is_empty() {
+        parts.push(format!(
+            "legacy systemd services found: {}",
+            report.legacy_services.join(", ")
         ));
     }
     if report.hrir_switch_present {
@@ -207,14 +224,51 @@ mod tests {
     use arctis_audio::MockRunner;
 
     #[test]
-    fn detects_loopbacks() {
-        let node_output =
-            "id 10\n    node.name = \"Arctis_Game\"\nid 11\n    node.name = \"Arctis_Chat\"\n";
-        let tmp = std::env::temp_dir().join(format!("asm7_coexist_{}", std::process::id()));
+    fn our_own_sinks_are_not_flagged_as_legacy() {
+        // Regression: Arctis_Game/Chat/Media are our own engine channel sinks,
+        // not legacy loopbacks. A node list containing them on a clean system
+        // (no legacy service files) must produce an empty report and no warning.
+        let node_output = "id 10\n    node.name = \"Arctis_Game\"\n\
+                           id 11\n    node.name = \"Arctis_Chat\"\n\
+                           id 12\n    node.name = \"Arctis_Media\"\n";
+        let tmp = std::env::temp_dir().join(format!("asm7_own_sinks_{}", std::process::id()));
         let report = detect_from(node_output, &tmp);
-        assert!(report.legacy_loopbacks.contains(&"Arctis_Game".to_string()));
-        assert!(report.legacy_loopbacks.contains(&"Arctis_Chat".to_string()));
-        assert!(warning(&report).is_some());
+        assert!(
+            report.legacy_loopbacks.is_empty(),
+            "Arctis_Game/Chat/Media must NOT appear in legacy_loopbacks"
+        );
+        assert!(
+            report.legacy_services.is_empty(),
+            "no service files exist so legacy_services must be empty"
+        );
+        assert!(
+            warning(&report).is_none(),
+            "clean system with our own sinks must produce no warning"
+        );
+    }
+
+    #[test]
+    fn legacy_service_files_are_detected() {
+        let tmp = std::env::temp_dir().join(format!("asm7_svcfile_{}", std::process::id()));
+        let systemd_dir = tmp.join(".config/systemd/user");
+        std::fs::create_dir_all(&systemd_dir).unwrap();
+        let svc_file = systemd_dir.join("arctis-manager.service");
+        std::fs::write(&svc_file, "[Unit]\nDescription=legacy\n").unwrap();
+
+        let report = detect_from("", &tmp);
+
+        // Clean up before assertions so temp files are removed even on failure.
+        let _ = std::fs::remove_file(&svc_file);
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            report.legacy_services.contains(&"arctis-manager.service".to_string()),
+            "arctis-manager.service must appear in legacy_services when unit file exists"
+        );
+        assert!(
+            warning(&report).is_some(),
+            "presence of a legacy service file must trigger a warning"
+        );
     }
 
     #[test]

@@ -264,6 +264,7 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 .unwrap_or_else(|_| std::path::PathBuf::from("/root"));
             let report = crate::coexist::detect_from(&node_stdout, &home);
             let any_detected = !report.legacy_loopbacks.is_empty()
+                || !report.legacy_services.is_empty()
                 || report.hrir_switch_present
                 || report.rpm_daemon_running;
             let coexist_report = arctis_client::CoexistReport {
