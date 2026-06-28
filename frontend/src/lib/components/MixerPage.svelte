@@ -33,6 +33,11 @@
     ),
   );
 
+  // Memoize the canonical channel order so it's computed once per state change
+  // instead of inline in the {#each}; the keyed block then reuses ChannelStrip
+  // instances by id.
+  let orderedChannels = $derived(orderChannels($engineState?.channels ?? []));
+
   // Fix 3: visible error banner for drop/clear failures.
   let dropError = $state<string | null>(null);
 
@@ -182,7 +187,7 @@
         />
 
         <!-- Standard + custom channels in canonical order -->
-        {#each orderChannels($engineState.channels) as channel (channel.id)}
+        {#each orderedChannels as channel (channel.id)}
           <!-- role="listitem" is on ChannelStrip's root <article> element -->
           <ChannelStrip
             {channel}

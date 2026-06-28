@@ -3,7 +3,7 @@ mod error;
 mod meters;
 mod state;
 
-use state::DaemonState;
+use state::{DaemonState, MeterSubscribers};
 use tauri::{Emitter, Manager};
 use tokio::sync::Mutex;
 
@@ -12,6 +12,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Mutex::new(DaemonState::new()))
+        .manage(MeterSubscribers::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::switch_profile,
@@ -59,6 +60,9 @@ pub fn run() {
             commands::set_master_mute,
             commands::set_chatmix,
             commands::set_default_sink_channel,
+            // Level-meter subscriber gate (perf)
+            commands::meter_subscribe,
+            commands::meter_unsubscribe,
         ])
         .setup(|app| {
             // ── State-poll task (every 250 ms) ──────────────────────────────
@@ -139,11 +143,18 @@ pub fn run() {
                 });
             }
 
-            // ── Real signal-peak meter task (~25 Hz) ────────────────────────
+            // ── Real signal-peak meter task (~15 Hz) ────────────────────────
             // Spawns pw-record capture workers for each Arctis channel sink
             // (via its .monitor port) and the clean-mic source.  Collects
-            // PCM peaks from the workers every 40 ms and emits a `levels`
+            // PCM peaks from the workers every ~66 ms and emits a `levels`
             // event with { node_name: 0.0..1.0 } real signal peak values.
+            //
+            // Two guards keep this off the scroll-compositing hot path:
+            //   * Subscriber gate — when no LevelMeter is mounted the UI's
+            //     subscriber count is 0, so we skip the emit entirely.
+            //   * Emit-on-change — skip the emit when no peak changed by more
+            //     than EMIT_EPSILON since the last tick (mirrors `state-changed`).
+            // 15 Hz is plenty: the JS peakDecay envelope smooths the display.
             //
             // Workers that fail (node absent, pw-record not found) hold their
             // last level at 0.0 — honest: no data = silence.  MeterTask Drop
@@ -158,15 +169,35 @@ pub fn run() {
                         .await
                         .expect("meter task spawn failed");
 
-                    // Emit at ~25 Hz (every 40 ms).
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(40));
+                    // Emit at ~15 Hz (every 66 ms).
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(66));
+                    let mut last_emitted: Option<meters::LevelsPayload> = None;
                     loop {
                         ticker.tick().await;
+
+                        // Subscriber gate: if no LevelMeter is mounted, do no
+                        // emit work at all. Drain the watch channels so a freshly
+                        // mounted meter starts from current data, and reset the
+                        // change-guard so the first post-subscribe tick emits.
+                        let subscribers = handle
+                            .state::<MeterSubscribers>()
+                            .0
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if subscribers == 0 {
+                            let _ = task.current_levels();
+                            last_emitted = None;
+                            continue;
+                        }
+
                         let payload = task.current_levels();
-                        // Only emit if at least one node has reported a level.
-                        // (When no Arctis nodes exist all entries are 0.0 from
-                        // the watch channel default — still honest to emit.)
+                        // Emit-on-change guard: skip when nothing audible changed.
+                        if let Some(prev) = &last_emitted {
+                            if meters::levels_unchanged(prev, &payload) {
+                                continue;
+                            }
+                        }
                         let _ = handle.emit("levels", &payload);
+                        last_emitted = Some(payload);
                     }
                 });
             }

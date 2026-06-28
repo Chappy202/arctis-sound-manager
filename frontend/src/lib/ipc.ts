@@ -487,6 +487,17 @@ export const onLevels = (cb: (levels: LevelsPayload) => void): Promise<UnlistenF
   listen<LevelsPayload>("levels", (e) => cb(e.payload));
 
 /**
+ * Register interest in the `levels` event. The Rust meter task only emits while
+ * the subscriber count is > 0, so the UI must call this when a meter mounts and
+ * {@link meterUnsubscribe} when it unmounts. Idempotency/counting is handled by
+ * the shared subscription in LevelMeter.svelte — call once per "first mount".
+ */
+export const meterSubscribe = (): Promise<void> => invoke("meter_subscribe");
+
+/** Release interest in the `levels` event (decrements the Rust subscriber count). */
+export const meterUnsubscribe = (): Promise<void> => invoke("meter_unsubscribe");
+
+/**
  * Subscribe to live AppStream list updates pushed by the daemon.
  * Emitted whenever PipeWire app streams change (appear/disappear/move).
  * Returns an unlisten function to clean up the subscription.

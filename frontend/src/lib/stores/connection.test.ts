@@ -134,7 +134,10 @@ describe("startConnectionMonitor", () => {
     stop2();
   });
 
-  it("sets engineState and loadError(null) on success", async () => {
+  it("does NOT write engineState on success (pure liveness ping)", async () => {
+    // Perf fix (P1): the monitor must not overwrite engineState — the
+    // state-changed event is the single source of truth. A healthy poll only
+    // pings getState() and flips connection status.
     const ipc = await loadIpc();
     vi.mocked(ipc.getState).mockResolvedValue(fakeState as EngineState);
 
@@ -144,8 +147,35 @@ describe("startConnectionMonitor", () => {
     const stop = conn.startConnectionMonitor(1000);
     await vi.advanceTimersByTimeAsync(1000);
 
-    expect(vi.mocked(stores.engineState.set)).toHaveBeenCalledWith(fakeState);
+    expect(vi.mocked(ipc.getState)).toHaveBeenCalled();
+    expect(vi.mocked(stores.engineState.set)).not.toHaveBeenCalled();
+    // A first healthy poll with no prior error does not redundantly clear loadError.
+    expect(vi.mocked(stores.loadError.set)).not.toHaveBeenCalled();
+    stop();
+  });
+
+  it("clears loadError only on recovery, not on every healthy poll", async () => {
+    const ipc = await loadIpc();
+    // First poll fails, subsequent polls succeed.
+    vi.mocked(ipc.getState)
+      .mockRejectedValueOnce(new Error("timeout"))
+      .mockResolvedValue(fakeState as EngineState);
+
+    const stores = await loadStores();
+    const conn = await loadConn();
+
+    const stop = conn.startConnectionMonitor(1000);
+
+    await vi.advanceTimersByTimeAsync(1000); // poll 1 → error set
+    expect(vi.mocked(stores.loadError.set)).toHaveBeenCalledWith("timeout");
+
+    await vi.advanceTimersByTimeAsync(1000); // poll 2 → recovery clears error
     expect(vi.mocked(stores.loadError.set)).toHaveBeenCalledWith(null);
+
+    const callsAfterRecovery = vi.mocked(stores.loadError.set).mock.calls.length;
+    await vi.advanceTimersByTimeAsync(2000); // polls 3-4 → no redundant writes
+    expect(vi.mocked(stores.loadError.set).mock.calls.length).toBe(callsAfterRecovery);
+
     stop();
   });
 

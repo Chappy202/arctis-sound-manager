@@ -1,7 +1,8 @@
 use crate::error::CommandError;
-use crate::state::DaemonState;
+use crate::state::{DaemonState, MeterSubscribers};
 use arctis_client::{send_request_to, Request};
 use arctis_engine::{AppStream, EngineState, OutputDeviceSnapshot};
+use std::sync::atomic::Ordering;
 use tauri::State;
 use tokio::sync::Mutex;
 
@@ -488,4 +489,25 @@ pub async fn mic_preset_apply(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::ApplyMicPreset { name }).await
+}
+
+// ── Level-meter subscriber gate (perf) ───────────────────────────────────────
+//
+// The UI calls `meter_subscribe` when a LevelMeter mounts and `meter_unsubscribe`
+// when it unmounts. The meter task skips emitting the `levels` event whenever the
+// count is 0, so pages with no meters do zero meter-dispatch work.
+
+#[tauri::command]
+pub fn meter_subscribe(meters: State<'_, MeterSubscribers>) {
+    meters.0.fetch_add(1, Ordering::Relaxed);
+}
+
+#[tauri::command]
+pub fn meter_unsubscribe(meters: State<'_, MeterSubscribers>) {
+    // Saturating decrement — never wrap below 0 if unsubscribe ever races ahead.
+    let _ = meters
+        .0
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_sub(1))
+        });
 }

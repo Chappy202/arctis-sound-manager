@@ -101,6 +101,26 @@
   const fieldRows = $derived(mapDeviceFields(deviceFields));
   const hasDaemon = $derived($engineState !== null && $loadError === null);
 
+  // Pre-filtered row groups — hoisted out of the template so each {#each}/{#if}
+  // doesn't re-run Array.filter on every reactive tick (the state poll runs at
+  // 250 ms; these only change when device_fields changes).
+  const FIRMWARE_KEYS = ["firmware", "model", "serial"];
+  const STATUS_EXCLUDE_KEYS = [
+    "battery", "battery_level", "battery_charging",
+    "firmware", "model", "serial",
+    "anc_mode", "anc_enabled",
+    "sidetone",
+    "mic_muted", "mic_gain",
+    "mic_led", "mic_volume",
+    "transparency_level", "inactive_time",
+  ];
+  const firmwareRows = $derived(fieldRows.filter((r) => FIRMWARE_KEYS.includes(r.key)));
+  const statusRows = $derived(fieldRows.filter((r) => !STATUS_EXCLUDE_KEYS.includes(r.key)));
+  const nonBatteryRows = $derived(fieldRows.filter((r) => r.kind !== "battery"));
+  const micReadoutRows = $derived(
+    fieldRows.filter((r) => ["mic_muted", "mic_gain"].includes(r.key)),
+  );
+
   // Enabled controls derived from available device fields
   const controls = $derived(enabledControls(deviceFields));
 
@@ -355,7 +375,7 @@
               </div>
             </div>
           {/if}
-          {#each fieldRows.filter(r => r.kind !== "battery") as row (row.key)}
+          {#each nonBatteryRows as row (row.key)}
             {#if ["firmware", "model", "serial", "battery_charging"].includes(row.key)}
               <div class="field-row">
                 <span class="field-label">{row.label.toUpperCase()}</span>
@@ -524,14 +544,14 @@
           {/if}
 
           <!-- Read-only mic fields from device state -->
-          {#each fieldRows.filter(r => ["mic_muted", "mic_gain"].includes(r.key)) as row (row.key)}
+          {#each micReadoutRows as row (row.key)}
             <div class="field-row">
               <span class="field-label">{row.label.toUpperCase()}</span>
               <span class="field-value field-value--readout">{row.value}</span>
             </div>
           {/each}
 
-          {#if !controls.has("mic_led") && !controls.has("mic_volume") && fieldRows.filter(r => ["mic_muted","mic_gain"].includes(r.key)).length === 0}
+          {#if !controls.has("mic_led") && !controls.has("mic_volume") && micReadoutRows.length === 0}
             <div class="field-row">
               <span class="field-label">STATUS</span>
               <span class="field-value">—</span>
@@ -579,14 +599,14 @@
       {/if}
 
       <!-- ─── FIRMWARE / INFO card ──────────────────────────────────────────── -->
-      {#if fieldRows.some(r => ["firmware", "model", "serial"].includes(r.key))}
+      {#if firmwareRows.length > 0}
         <div class="device-card device-card--live">
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">ℹ</span>
             <h2 class="card-title">FIRMWARE</h2>
           </div>
           <div class="card-body">
-            {#each fieldRows.filter(r => ["firmware", "model", "serial"].includes(r.key)) as row (row.key)}
+            {#each firmwareRows as row (row.key)}
               <div class="field-row">
                 <span class="field-label">{row.label.toUpperCase()}</span>
                 <span class="field-value field-value--readout">{row.value}</span>
@@ -597,15 +617,7 @@
       {/if}
 
       <!-- Remaining fields not in any card above -->
-      {#if fieldRows.filter(r =>
-        !["battery", "battery_level", "battery_charging",
-          "firmware", "model", "serial",
-          "anc_mode", "anc_enabled",
-          "sidetone",
-          "mic_muted", "mic_gain",
-          "mic_led", "mic_volume",
-          "transparency_level", "inactive_time"
-        ].includes(r.key)).length > 0}
+      {#if statusRows.length > 0}
         <div class="device-card device-card--live">
           <div class="card-header">
             <span class="card-icon" aria-hidden="true">◉</span>
@@ -613,15 +625,7 @@
             <span class="pill pill--connected">CONNECTED</span>
           </div>
           <div class="card-body">
-            {#each fieldRows.filter(r =>
-              !["battery", "battery_level", "battery_charging",
-                "firmware", "model", "serial",
-                "anc_mode", "anc_enabled",
-                "sidetone",
-                "mic_muted", "mic_gain",
-                "mic_led", "mic_volume",
-                "transparency_level", "inactive_time"
-              ].includes(r.key)) as row (row.key)}
+            {#each statusRows as row (row.key)}
               <div class="field-row">
                 <span class="field-label">{row.label.toUpperCase()}</span>
                 <span class="field-value field-value--readout">{row.value}</span>

@@ -41,7 +41,7 @@
           <span>TARGET SINK</span>
           <span></span>
         </li>
-        {#each routes as [app, sink]}
+        {#each routes as [app, sink] (app)}
           <li class="route-row" aria-label="{app} routed to {sink}">
             <span class="route-app" title={app}>{app}</span>
             <span class="route-arrow" aria-hidden="true">→</span>

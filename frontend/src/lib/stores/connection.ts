@@ -15,7 +15,7 @@
  */
 import { writable } from "svelte/store";
 import { getState } from "../ipc.js";
-import { engineState, loadError, init, destroy } from "../stores.js";
+import { loadError, init, destroy } from "../stores.js";
 
 // ---------------------------------------------------------------------------
 // Public types + store
@@ -49,7 +49,14 @@ let started = false;
 /**
  * Start a periodic health monitor that calls getState() every `intervalMs`.
  *
- * On success: refreshes engineState, clears loadError, marks connected.
+ * This is a pure liveness ping. It does NOT write engineState — the 250 ms
+ * `state-changed` event (subscribed in stores.ts) is the single source of truth
+ * for the store, and it already applies a Rust-side emit-on-change guard.
+ * Overwriting engineState here every poll would replace the object reference and
+ * needlessly re-run every app-wide $derived. We only flip connection status and
+ * clear/set loadError (the latter guarded so it never writes redundantly).
+ *
+ * On success: marks connected, clears any stale loadError.
  * On failure: marks disconnected, sets loadError.
  *
  * Returns a stop function that cancels the interval and allows a new monitor
@@ -61,15 +68,20 @@ export function startConnectionMonitor(intervalMs = 5000): () => void {
   started = true;
 
   let inFlight = false;
+  // Tracks the last error we wrote, so we only clear loadError on recovery
+  // (avoids a redundant `loadError.set(null)` notify on every healthy poll).
+  let lastErrorSet: string | null = null;
 
   const id = setInterval(async () => {
     if (inFlight) return; // skip if previous poll hasn't completed
     inFlight = true;
     try {
-      const state = await getState();
-      engineState.set(state);
-      loadError.set(null);
+      await getState(); // liveness ping only — result is intentionally unused
       markConnected();
+      if (lastErrorSet !== null) {
+        loadError.set(null);
+        lastErrorSet = null;
+      }
     } catch (e) {
       const msg =
         e instanceof Error
@@ -79,6 +91,7 @@ export function startConnectionMonitor(intervalMs = 5000): () => void {
             : "Daemon unavailable";
       markDisconnected();
       loadError.set(msg);
+      lastErrorSet = msg;
     } finally {
       inFlight = false;
     }

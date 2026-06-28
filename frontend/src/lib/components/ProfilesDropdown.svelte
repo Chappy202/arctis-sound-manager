@@ -253,7 +253,7 @@
         aria-label="Profiles"
         onkeydown={handleMenuKey}
       >
-        {#each profiles as profile}
+        {#each profiles as profile (profile)}
           <li role="presentation">
             {#if renamingProfile === profile}
               <!-- Inline rename form for this profile -->

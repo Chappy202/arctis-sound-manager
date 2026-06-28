@@ -52,6 +52,24 @@ use tokio::sync::watch;
 /// Serialised directly as the `levels` Tauri event payload.
 pub type LevelsPayload = HashMap<String, f32>;
 
+/// Emit-on-change epsilon. ~0.5/255 — below this the change is imperceptible on
+/// any meter bar, so we skip the `levels` event entirely (mirrors the
+/// `state-changed` emit-on-change guard in lib.rs).
+pub(crate) const EMIT_EPSILON: f32 = 0.002;
+
+/// Returns true if two payloads are equal within [`EMIT_EPSILON`] for every key
+/// (same key set, every peak within epsilon). Used to suppress redundant
+/// `levels` emits when nothing audible changed since the last tick.
+pub(crate) fn levels_unchanged(a: &LevelsPayload, b: &LevelsPayload) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|(k, va)| match b.get(k) {
+        Some(vb) => (va - vb).abs() < EMIT_EPSILON,
+        None => false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Node configuration
 // ---------------------------------------------------------------------------
@@ -419,5 +437,41 @@ mod tests {
     fn mic_node_targets_source_directly() {
         let mic = NODES.iter().find(|n| n.name == "arctis_clean_mic").unwrap();
         assert_eq!(mic.pw_target, "arctis_clean_mic");
+    }
+
+    // --- levels_unchanged (emit-on-change guard) ---
+
+    fn payload(pairs: &[(&str, f32)]) -> LevelsPayload {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn identical_payloads_are_unchanged() {
+        let a = payload(&[("Arctis_Game", 0.5), ("Arctis_Chat", 0.1)]);
+        let b = payload(&[("Arctis_Game", 0.5), ("Arctis_Chat", 0.1)]);
+        assert!(levels_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn sub_epsilon_change_is_unchanged() {
+        let a = payload(&[("Arctis_Game", 0.5000)]);
+        let b = payload(&[("Arctis_Game", 0.5000 + EMIT_EPSILON / 2.0)]);
+        assert!(levels_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn supra_epsilon_change_is_changed() {
+        let a = payload(&[("Arctis_Game", 0.50)]);
+        let b = payload(&[("Arctis_Game", 0.51)]);
+        assert!(!levels_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn different_key_sets_are_changed() {
+        let a = payload(&[("Arctis_Game", 0.5)]);
+        let b = payload(&[("Arctis_Chat", 0.5)]);
+        assert!(!levels_unchanged(&a, &b));
+        let c = payload(&[("Arctis_Game", 0.5), ("Arctis_Chat", 0.5)]);
+        assert!(!levels_unchanged(&a, &c));
     }
 }
