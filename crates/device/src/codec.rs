@@ -42,6 +42,19 @@ fn parse_field(field: &StatusField, frame: &[u8]) -> Option<StatusValue> {
 /// Maximum number of response frames drained in a single [] call.
 const MAX_STATUS_FRAMES: usize = 8;
 
+/// Per-frame read timeout in milliseconds for `read_status`.
+///
+/// The `[0x06,0xb0]` status reply and any queued `[0x07,0x45]` dial frames
+/// arrive fast (firmware queues them immediately after the request). 80 ms is
+/// sufficient to drain all queued frames; 500 ms was pure dead wait. Keeping a
+/// generous-but-not-excessive value avoids dropping the battery reply under
+/// heavier system load.
+///
+/// NOTE: verify during live testing that battery_charge is still reported after
+/// this reduction. If battery frames arrive late on real hardware, bump back to
+/// 150–200 ms.
+const STATUS_READ_TIMEOUT_MS: i32 = 80;
+
 /// Build the status-request report, send it, and drain up to [`MAX_STATUS_FRAMES`]
 /// response frames, merging decoded fields into a single [`DeviceState`].
 ///
@@ -83,7 +96,7 @@ pub fn read_status<T: Transport>(
         }
 
         let mut buf = vec![0u8; desc.report_length];
-        match transport.read_report(&mut buf, 500) {
+        match transport.read_report(&mut buf, STATUS_READ_TIMEOUT_MS) {
             Ok(n) => {
                 let frame_state = decode_frame(desc, &buf[..n]);
                 state.fields.extend(frame_state.fields);

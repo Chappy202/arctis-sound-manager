@@ -83,6 +83,17 @@ const CHATMIX_FULL_ATTEN_DB: f32 = -40.0;
 /// bounded staleness is not user-visible.
 const VOLUME_DUMP_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
 
+/// Derive the GUI ChatMix position 0..=9 from the two hardware-reported mix
+/// levels (`media_mix` = game level, `chat_mix` = chat level, each 0..=100).
+/// 9 = full game (chat fully attenuated), 0 = full chat (game attenuated).
+/// Both inputs are clamped to 0..=100 before the computation.
+pub fn mix_to_chatmix_position(media_mix: u8, chat_mix: u8) -> i64 {
+    let m = media_mix.min(100) as i64;
+    let c = chat_mix.min(100) as i64;
+    let raw = (((m - c + 100) as f32) / 200.0 * 9.0).round() as i64;
+    raw.clamp(0, 9)
+}
+
 /// Map a ChatMix position 0..=9 to (game_db, chat_db) attenuations.
 /// center = 4.5 is the true midpoint of the 0..=9 range and matches the hardware
 /// Nova Pro dial mapping in `crates/cli/src/dial.rs`, so the GUI ChatMix slider and
@@ -1471,6 +1482,82 @@ impl<R: CommandRunner> Engine<R> {
         let _ = self.set_channel_volume("chat", db_to_volume_pct(chat_db));
         self.save_config()?;
         self.emit(Event::ChatmixSet { position: pos });
+        Ok(())
+    }
+
+    /// Apply a live hardware-dial ChatMix reading.
+    ///
+    /// Sets the GAME sink to `media_mix`% and the CHAT sink to `chat_mix`%
+    /// using raw-linear channelVolumes (same path as `set_channel_volume`), updates
+    /// the in-memory `volume_pct` and `chatmix_position`, and stamps
+    /// `last_volume_write` so `state()` reflects the new values immediately —
+    /// WITHOUT calling `save_config` (no per-tick disk I/O).
+    /// Channels absent in the active profile are silently skipped (graceful no-op).
+    pub fn apply_dial_mix(&mut self, media_mix: u8, chat_mix: u8) -> Result<(), EngineError> {
+        let media_mix = media_mix.min(100);
+        let chat_mix = chat_mix.min(100);
+        let position = mix_to_chatmix_position(media_mix, chat_mix);
+
+        // Clone channel configs before mutating so we release the shared borrow first.
+        let game_ch: Option<arctis_config::ChannelConfig> = self
+            .config
+            .active()?
+            .channels
+            .iter()
+            .find(|ch| ch.id == "game")
+            .cloned();
+        let chat_ch: Option<arctis_config::ChannelConfig> = self
+            .config
+            .active()?
+            .channels
+            .iter()
+            .find(|ch| ch.id == "chat")
+            .cloned();
+
+        // Update in-memory volume_pct and chatmix_position — no save_config.
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            if game_ch.is_some() {
+                if let Some(ch) = profile.channels.iter_mut().find(|ch| ch.id == "game") {
+                    ch.volume_pct = media_mix;
+                }
+            }
+            if chat_ch.is_some() {
+                if let Some(ch) = profile.channels.iter_mut().find(|ch| ch.id == "chat") {
+                    ch.volume_pct = chat_mix;
+                }
+            }
+            profile.chatmix_position = position;
+        }
+
+        // Apply live to game sink (no-op when absent).
+        if let Some(channel) = game_ch {
+            let def = convert::channel_def_from_cfg(&channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.apply_volume_mute_pct(media_mix, channel.muted) {
+                eprintln!("apply_dial_mix: game volume apply error (ignoring): {e}");
+            }
+        }
+
+        // Apply live to chat sink (no-op when absent).
+        if let Some(channel) = chat_ch {
+            let def = convert::channel_def_from_cfg(&channel);
+            let spec = def.sink_spec();
+            let mut be = AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.apply_volume_mute_pct(chat_mix, channel.muted) {
+                eprintln!("apply_dial_mix: chat volume apply error (ignoring): {e}");
+            }
+        }
+
+        // Stamp so state() cache logic immediately returns updated values.
+        self.last_volume_write = Some(std::time::Instant::now());
+        self.emit(Event::ChatmixSet { position });
         Ok(())
     }
 
@@ -4463,7 +4550,7 @@ mod tests {
     #[test]
     fn device_set_errors_when_worker_not_wired() {
         let cfg = make_config_no_eq_no_routes();
-        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let engine = Engine::new(MockRunner::new(), cfg);
         // device_tx is None — must return BadRequest
         let result = engine.device_set("sidetone", 2);
         assert!(
@@ -6743,5 +6830,194 @@ mod tests {
             !engine2.state().dial_controls_balance,
             "state() must reflect config=false"
         );
+    }
+
+    // ── DIAL-REWORK: mix_to_chatmix_position pure fn + apply_dial_mix ─────────
+
+    #[test]
+    fn mix_to_chatmix_position_full_game_is_9() {
+        assert_eq!(
+            mix_to_chatmix_position(100, 0),
+            9,
+            "full game (media=100, chat=0) must map to position 9"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_full_chat_is_0() {
+        assert_eq!(
+            mix_to_chatmix_position(0, 100),
+            0,
+            "full chat (media=0, chat=100) must map to position 0"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_equal_levels_is_center() {
+        let pos = mix_to_chatmix_position(100, 100);
+        assert!(
+            pos == 4 || pos == 5,
+            "equal levels (100,100) must map to center position 4 or 5, got {pos}"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_game_dominant_above_center() {
+        let pos = mix_to_chatmix_position(100, 66);
+        assert!(
+            pos > 4,
+            "game-dominant (media=100, chat=66) must give position >4 (game side), got {pos}"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_chat_dominant_below_center() {
+        let pos = mix_to_chatmix_position(66, 100);
+        assert!(
+            pos < 5,
+            "chat-dominant (media=66, chat=100) must give position <5 (chat side), got {pos}"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_clamps_above_100() {
+        // Values above 100 must be treated as 100.
+        assert_eq!(
+            mix_to_chatmix_position(200, 0),
+            mix_to_chatmix_position(100, 0),
+            "media_mix > 100 must clamp to 100"
+        );
+        assert_eq!(
+            mix_to_chatmix_position(0, 200),
+            mix_to_chatmix_position(0, 100),
+            "chat_mix > 100 must clamp to 100"
+        );
+    }
+
+    #[test]
+    fn mix_to_chatmix_position_result_always_in_0_to_9() {
+        // Exhaustive spot-check covering boundary combos.
+        for m in [0u8, 50, 100, 200] {
+            for c in [0u8, 50, 100, 200] {
+                let pos = mix_to_chatmix_position(m, c);
+                assert!(
+                    (0..=9).contains(&pos),
+                    "mix_to_chatmix_position({m},{c}) = {pos} out of 0..=9"
+                );
+            }
+        }
+    }
+
+    /// apply_dial_mix(80, 100): game=80%, chat=100% applied via pw-cli Props
+    /// (raw-linear: 0.8 and 1.0), chatmix_position updated, NO config file written.
+    #[test]
+    fn apply_dial_mix_applies_both_channels_no_save() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_dial_mix_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present(); // Arctis_Game=10, Arctis_Chat=11
+
+        // Queue: ls+Props for game, ls+Props for chat (4 total; no save_config calls)
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // [0] ls → game id 10
+            .with_output(0, "", "") // [1] Props for game
+            .with_output(0, &ls, "") // [2] ls → chat id 11
+            .with_output(0, "", ""); // [3] Props for chat
+        let mut engine = Engine::new(runner, cfg);
+
+        engine
+            .apply_dial_mix(80, 100)
+            .expect("apply_dial_mix must succeed");
+
+        // Verify the 4 pw-cli calls (no extra save_config calls through runner)
+        let calls = &engine.runner.calls;
+        assert_eq!(calls.len(), 4, "exactly 4 runner calls (ls+Props×2), got {}", calls.len());
+        assert_eq!(
+            calls[0],
+            vec!["pw-cli", "ls", "Node"],
+            "call[0] must be pw-cli ls Node (find game id)"
+        );
+        assert_eq!(
+            calls[1],
+            vec![
+                "pw-cli",
+                "s",
+                "10",
+                "Props",
+                "{ channelVolumes = [ 0.8 0.8 ] mute = false }",
+            ],
+            "call[1] must set game to 80% (0.8 linear)"
+        );
+        assert_eq!(
+            calls[2],
+            vec!["pw-cli", "ls", "Node"],
+            "call[2] must be pw-cli ls Node (find chat id)"
+        );
+        assert_eq!(
+            calls[3],
+            vec![
+                "pw-cli",
+                "s",
+                "11",
+                "Props",
+                "{ channelVolumes = [ 1.0 1.0 ] mute = false }",
+            ],
+            "call[3] must set chat to 100% (1.0 linear)"
+        );
+
+        // Verify no config file was written (no save_config on the hot path)
+        let cfg_path = tmp.join("config.toml");
+        assert!(
+            !cfg_path.exists(),
+            "config.toml must NOT be written by apply_dial_mix (no save on hot path)"
+        );
+
+        // Verify state() reflects the updated chatmix_position
+        let expected_pos = mix_to_chatmix_position(80, 100);
+        let state = engine.state(); // pw-dump gets empty default → falls back to config
+        assert_eq!(
+            state.chatmix_position, expected_pos,
+            "state().chatmix_position must reflect mix_to_chatmix_position(80,100)={expected_pos}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// apply_dial_mix with absent game and chat channels is a graceful no-op (no panic or error).
+    #[test]
+    fn apply_dial_mix_graceful_when_channels_absent() {
+        // remove_channel calls save_config → needs a real config dir.
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("asm_dial_mix_absent_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // Build a config with only media/aux, then remove game/chat via remove_channel.
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        // MockRunner default empty response → sink_exists() returns false → teardown no-op.
+        engine.remove_channel("game").expect("remove game");
+        engine.remove_channel("chat").expect("remove chat");
+
+        // Snapshot call count after remove_channel (those make pw-cli ls Node calls).
+        let calls_before = engine.runner.calls.len();
+
+        let result = engine.apply_dial_mix(80, 20);
+        assert!(
+            result.is_ok(),
+            "apply_dial_mix with absent channels must not error: {result:?}"
+        );
+        // apply_dial_mix must make NO additional pw-cli calls when both channels absent.
+        assert_eq!(
+            engine.runner.calls.len(),
+            calls_before,
+            "apply_dial_mix must not make new runner calls when game and chat are absent"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }

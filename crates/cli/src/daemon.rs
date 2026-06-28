@@ -703,7 +703,7 @@ pub fn run_daemon() -> Result<(), EngineError> {
                 HidOpener,
                 device_shared_for_worker,
                 None,
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_millis(150),
                 stop_worker,
                 Some(cmd_rx),
             );
@@ -716,23 +716,26 @@ pub fn run_daemon() -> Result<(), EngineError> {
     let dial_handle = std::thread::Builder::new()
         .name("dial-balance".into())
         .spawn(move || {
-            let mut last_chat_mix: Option<i64> = None;
+            let mut last_mix: Option<(i64, i64)> = None;
             while !stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
-                // Read chat_mix from shared device state (updated by device-worker).
-                let chat_mix_opt: Option<i64> = {
+                // Read BOTH media_mix (game level) and chat_mix from shared device state.
+                let mix_opt: Option<(i64, i64)> = {
                     if let Ok(g) = device_shared_for_dial.lock() {
-                        g.fields.get("chat_mix").and_then(|s| s.parse::<i64>().ok())
+                        let media = g.fields.get("media_mix").and_then(|s| s.parse::<i64>().ok());
+                        let chat = g.fields.get("chat_mix").and_then(|s| s.parse::<i64>().ok());
+                        media.zip(chat)
                     } else {
                         None
                     }
                 };
 
-                if let Some(chat_mix) = chat_mix_opt {
+                if let Some((media_mix, chat_mix)) = mix_opt {
                     if let Ok(mut eng) = engine_for_dial.lock() {
                         if let Err(e) = crate::dial::apply_dial_balance(
                             &mut *eng,
+                            media_mix,
                             chat_mix,
-                            &mut last_chat_mix,
+                            &mut last_mix,
                             dial_controls_balance,
                         ) {
                             eprintln!("daemon: dial-balance apply error (ignoring): {e}");
@@ -740,11 +743,8 @@ pub fn run_daemon() -> Result<(), EngineError> {
                     }
                 }
 
-                // Sleep ~250 ms in 50 ms increments so shutdown can exit within ≤50 ms.
-                for _ in 0..5 {
-                    if stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
+                // Sleep 50 ms so shutdown exits within ≤50 ms (reduced from 250 ms).
+                if !stop_dial.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
