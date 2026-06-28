@@ -120,6 +120,7 @@
       }
     } catch (err: unknown) {
       console.error("[MixerPage] channelRemove failed:", err);
+      dropError = err instanceof Error ? err.message : String(err);
     } finally {
       removeBusy = false;
     }
@@ -260,7 +261,8 @@
     <!-- ===== ChatMix slider ===== -->
     <!-- hardwareActive: grey-out only when device present AND dial owns balance (Fix 1) -->
     <ChatmixSlider position={$engineState.chatmix_position}
-      hardwareActive={$engineState.device_present && $engineState.dial_controls_balance} />
+      hardwareActive={$engineState.device_present && $engineState.dial_controls_balance}
+      onError={(m) => (dropError = m)} />
 
     <!-- ===== Route list — collapsible, de-emphasised ===== -->
     <details class="routes-disclosure">

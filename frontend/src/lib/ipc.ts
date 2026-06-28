@@ -388,7 +388,7 @@ export const setMicVolume = (volumePct: number): Promise<EngineState> =>
 export const setMasterMute = (muted: boolean): Promise<EngineState> =>
   invoke<EngineState>("set_master_mute", { muted });
 
-/** Set the ChatMix position (0.0 = all game, 1.0 = all chat). */
+/** Set the ChatMix position (integer 0–9; 0 = full chat, 9 = full game). */
 export const setChatmix = (position: number): Promise<EngineState> =>
   invoke<EngineState>("set_chatmix", { position });
 

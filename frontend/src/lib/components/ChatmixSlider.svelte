@@ -19,9 +19,10 @@
   import { Slider } from "bits-ui";
   import { setChatmix } from "../ipc.js";
   import { engineState } from "../stores.js";
+  import { toErrorMsg } from "./channelStripUtils.js";
 
-  let { position, hardwareActive = false }:
-    { position: number; hardwareActive?: boolean } = $props();
+  let { position, hardwareActive = false, onError = () => {} }:
+    { position: number; hardwareActive?: boolean; onError?: (msg: string) => void } = $props();
 
   // -----------------------------------------------------------------------
   // Local state — thumb position + drag flag
@@ -29,18 +30,25 @@
 
   // untrack() reads the initial prop value without registering a reactive dep.
   // Subsequent engine updates flow through the reconcile $effect below.
-  let value = $state(untrack(() => position));
+  //
+  // Display↔position inversion: engine 0=full-chat, 9=full-game; spec requires
+  // Game on the LEFT (slider min). So display = 9 − position:
+  //   engine 9 (full game) → display 0 → thumb at LEFT under "Game" label ✓
+  //   engine 0 (full chat) → display 9 → thumb at RIGHT under "Chat" label ✓
+  let value = $state(untrack(() => 9 - position));
   let dragging = $state(false);
 
   // -----------------------------------------------------------------------
-  // IPC commit — log errors but don't throw uncaught (no onError prop)
+  // IPC commit — log errors and surface via onError prop (M1)
   // -----------------------------------------------------------------------
 
   async function commit(pos: number) {
     try {
       engineState.set(await setChatmix(pos));
     } catch (e) {
+      const msg = toErrorMsg(e);
       console.error("setChatmix failed:", e);
+      onError(msg);
     }
   }
 
@@ -56,7 +64,7 @@
 
   function handleValueCommit(v: number) {
     value = v;
-    void commit(v);
+    void commit(9 - v);   // invert display→engine: display 0 (Game/left) → engine 9
     dragging = false;
   }
 
@@ -69,7 +77,7 @@
 
   $effect(() => {
     const incoming = position;          // reactive dep
-    if (untrack(() => !dragging)) value = incoming;
+    if (untrack(() => !dragging)) value = 9 - incoming;  // invert engine→display
   });
 </script>
 
