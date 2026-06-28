@@ -83,6 +83,11 @@ export interface EqPresetSnapshot {
   band_count: number;
 }
 
+export interface MicPresetSnapshot {
+  name: string;
+  description: string;
+}
+
 export interface EngineState {
   active_profile: string;
   profiles: string[];
@@ -94,6 +99,8 @@ export interface EngineState {
   mic: MicSnapshot;
   surround: SurroundSnapshot;
   eq_presets: EqPresetSnapshot[];
+  factory_eq_presets: EqPresetSnapshot[];
+  mic_presets: MicPresetSnapshot[];
   master_volume_db: number;
   master_mute: boolean;
   chatmix_position: number;
@@ -348,6 +355,10 @@ export const eqPresetSave = (name: string, channel: string): Promise<EngineState
 /** Apply a named EQ preset to a channel's EQ bands. */
 export const eqPresetApply = (preset: string, channel: string): Promise<EngineState> =>
   invoke<EngineState>("eq_preset_apply", buildEqPresetApplyArgs(preset, channel));
+
+/** Apply a named mic preset. */
+export const micPresetApply = (name: string): Promise<EngineState> =>
+  invoke<EngineState>("mic_preset_apply", { name });
 
 /** Delete a named EQ preset. */
 export const eqPresetDelete = (name: string): Promise<EngineState> =>
