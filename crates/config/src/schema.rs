@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ConfigError;
 
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Frequency-domain EQ band definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +23,10 @@ pub struct EqBandConfig {
 }
 
 // ── Mic-chain config ─────────────────────────────────────────────────────────
+
+fn default_volume_pct() -> u8 {
+    100
+}
 
 fn default_hp_hz() -> f32 {
     90.0
@@ -191,7 +195,7 @@ impl Default for MicGateStage {
 /// Default = **clean passthrough** — all stages disabled, no external plugin needed.
 /// Old configs lacking a `[profiles.*.mic]` block deserialize cleanly to passthrough
 /// via `#[serde(default)]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MicChainConfig {
     /// Master switch. false => Clean Mic source not built at all. Defaults to false.
     #[serde(default)]
@@ -221,12 +225,33 @@ pub struct MicChainConfig {
     /// Mic EQ bands. Reuses `EqBandConfig` from the channel EQ. Empty = EQ stage off.
     #[serde(default)]
     pub eq: Vec<EqBandConfig>,
+    /// Mic source volume as a 0–100 % value (100 % = unity). Replaces any dB-based field for
+    /// Task A2+. `serde` default = 100 so old configs without this field load at full volume.
+    #[serde(default = "default_volume_pct")]
+    pub volume_pct: u8,
 }
 
 impl MicChainConfig {
-    /// Explicit passthrough constructor: all stages disabled, empty EQ.
+    /// Explicit passthrough constructor: all stages disabled, empty EQ, full volume.
     pub fn passthrough() -> Self {
         Self::default()
+    }
+}
+
+impl Default for MicChainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hw_mic: None,
+            gain: MicGainStage::default(),
+            highpass: MicHighpassStage::default(),
+            suppression: MicSuppressionStage::default(),
+            compressor: MicCompressorStage::default(),
+            gate: MicGateStage::default(),
+            eq_enabled: false,
+            eq: Vec::new(),
+            volume_pct: 100,
+        }
     }
 }
 
@@ -241,8 +266,14 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub eq: Vec<EqBandConfig>, // empty => flat 10-band default at apply time
     /// Software volume in dB. 0.0 = unity gain. Range: -60..=+6.
+    /// @deprecated — Task A2+ uses `volume_pct` as the source of truth; this field
+    /// is kept for back-compat so the workspace still compiles.
     #[serde(default)]
     pub volume_db: f32,
+    /// Software volume as a 0–100 % value (100 % = unity / 0 dB).
+    /// `serde` default = 100 so old configs without this field load at full volume.
+    #[serde(default = "default_volume_pct")]
+    pub volume_pct: u8,
     /// Whether the channel is muted.
     #[serde(default)]
     pub muted: bool,
@@ -311,8 +342,14 @@ pub struct Profile {
     #[serde(default)]
     pub surround: SurroundConfig,
     /// Master output gain in dB applied to the headset output. 0.0 = unity.
+    /// @deprecated — Task A2+ uses `master_volume_pct` as the source of truth; this field
+    /// is kept for back-compat so the workspace still compiles.
     #[serde(default)]
     pub master_volume_db: f32,
+    /// Master output volume as a 0–100 % value (100 % = unity / 0 dB).
+    /// `serde` default = 100 so old configs without this field load at full volume.
+    #[serde(default = "default_volume_pct")]
+    pub master_volume_pct: u8,
     /// Master mute (mutes the headset output).
     #[serde(default)]
     pub master_mute: bool,
@@ -373,6 +410,7 @@ impl Config {
                 output_device: None,
                 eq: Vec::new(),
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             ChannelConfig {
@@ -382,6 +420,7 @@ impl Config {
                 output_device: None,
                 eq: Vec::new(),
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             ChannelConfig {
@@ -391,6 +430,7 @@ impl Config {
                 output_device: None,
                 eq: Vec::new(),
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             ChannelConfig {
@@ -400,6 +440,7 @@ impl Config {
                 output_device: None,
                 eq: Vec::new(),
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
         ];
@@ -414,6 +455,7 @@ impl Config {
                 mic: MicChainConfig::default(),
                 surround: SurroundConfig::default(),
                 master_volume_db: 0.0,
+                master_volume_pct: 100,
                 master_mute: false,
                 chatmix_position: 4,
                 default_sink_channel: None,
@@ -458,6 +500,7 @@ impl Config {
                         output_device: None,
                         eq: Vec::new(),
                         volume_db: 0.0,
+                        volume_pct: 100,
                         muted: false,
                     });
                 }
@@ -948,6 +991,7 @@ description = "Chat"
                 q: 0.7,
                 gain_db: 3.0,
             }],
+            volume_pct: 80,
         };
 
         let serialized = toml::to_string(&cfg).expect("serialize");
@@ -1460,7 +1504,7 @@ description = "Chat"
         cfg.profiles[0].channels.push(ChannelConfig {
             id: "stream".into(), node_name: "Arctis_Stream".into(),
             description: "Custom".into(), output_device: None,
-            eq: vec![], volume_db: 0.0, muted: false,
+            eq: vec![], volume_db: 0.0, volume_pct: 100, muted: false,
         });
         cfg.ensure_standard_channels();
         let ids: Vec<String> = cfg.profiles[0].channels.iter().map(|c| c.id.clone()).collect();
@@ -1473,8 +1517,79 @@ description = "Chat"
         let cfg = Config::default_config();
         let p = &cfg.profiles[0];
         assert_eq!(p.master_volume_db, 0.0);
+        assert_eq!(p.master_volume_pct, 100);
         assert!(!p.master_mute);
         assert_eq!(p.chatmix_position, 4); // center of 0..=9 (game/chat balanced)
         assert_eq!(p.default_sink_channel, None);
+    }
+
+    // ── Task A1: volume_pct fields ────────────────────────────────────────────
+
+    /// default_config() channels have volume_pct = 100 (unity).
+    #[test]
+    fn default_channel_volume_pct_is_100() {
+        let cfg = Config::default_config();
+        let profile = cfg.active().unwrap();
+        for ch in &profile.channels {
+            assert_eq!(ch.volume_pct, 100, "channel '{}' must default to volume_pct=100", ch.id);
+        }
+    }
+
+    /// default_config() profile has master_volume_pct = 100 (unity).
+    #[test]
+    fn default_master_volume_pct_is_100() {
+        let cfg = Config::default_config();
+        assert_eq!(cfg.profiles[0].master_volume_pct, 100);
+    }
+
+    /// MicChainConfig::default() has volume_pct = 100 (unity).
+    #[test]
+    fn mic_default_volume_pct_is_100() {
+        let mic = MicChainConfig::default();
+        assert_eq!(mic.volume_pct, 100, "mic default volume_pct must be 100");
+    }
+
+    /// A new config with explicit volume_pct values round-trips via TOML.
+    #[test]
+    fn volume_pct_round_trips_via_toml() {
+        let mut cfg = Config::default_config();
+        cfg.profiles[0].channels[0].volume_pct = 75;
+        cfg.profiles[0].master_volume_pct = 60;
+        cfg.profiles[0].mic.volume_pct = 80;
+        let serialized = toml::to_string(&cfg).expect("serialize");
+        let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
+        assert_eq!(deserialized.profiles[0].channels[0].volume_pct, 75);
+        assert_eq!(deserialized.profiles[0].master_volume_pct, 60);
+        assert_eq!(deserialized.profiles[0].mic.volume_pct, 80);
+    }
+
+    /// An old TOML without volume_pct deserializes with volume_pct = 100 (serde default).
+    #[test]
+    fn old_config_without_volume_pct_deserializes_with_100_default() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+master_volume_db = -6.0
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+volume_db = -6.0
+"#;
+        // Direct deserialization (no migration): volume_pct comes from serde default.
+        let cfg: Config = toml::from_str(toml_str).expect("deserialize");
+        let profile = cfg.active().expect("active profile");
+        assert_eq!(
+            profile.channels[0].volume_pct, 100,
+            "serde default must supply 100 when volume_pct absent"
+        );
+        assert_eq!(
+            profile.master_volume_pct, 100,
+            "serde default must supply 100 for master_volume_pct when absent"
+        );
     }
 }

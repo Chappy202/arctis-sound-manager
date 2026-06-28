@@ -50,6 +50,7 @@ impl Config {
             output_device: None,
             eq: Vec::new(),
             volume_db: 0.0,
+            volume_pct: 100,
             muted: false,
         });
         Ok(())

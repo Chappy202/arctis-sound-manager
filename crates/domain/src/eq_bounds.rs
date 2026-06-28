@@ -56,3 +56,54 @@ pub const MIC_ATTEN_LIMIT_MAX_DB: f32 = 100.0;
 /// Per-channel software volume bounds (dB → linear via 10^(db/20)).
 pub const CHANNEL_VOLUME_MIN_DB: f32 = -60.0;
 pub const CHANNEL_VOLUME_MAX_DB: f32 = 6.0;
+
+// ── Volume percent bounds ──────────────────────────────────────────────────────
+
+/// Minimum percent volume for a channel/master/mic sink (0 = silence).
+pub const VOLUME_PCT_MIN: u8 = 0;
+
+/// Maximum percent volume for a channel/master/mic sink (100 = unity / 0 dB).
+pub const VOLUME_PCT_MAX: u8 = 100;
+
+/// Convert a software-volume dB value (e.g. from [`ChannelConfig::volume_db`]) to a
+/// 0–100 percent value.
+///
+/// Formula: `clamp(round(100 × 10^(db/20)), 0, 100)`.
+///
+/// Representative mappings:
+/// - 0 dB → 100 %
+/// - −6 dB → ~50 %
+/// - −60 dB → 0 %
+/// - +6 dB (or any above 0 dB) → 100 % (clamped)
+pub fn db_to_volume_pct(db: f32) -> u8 {
+    let pct = (100.0_f32 * 10f32.powf(db / 20.0)).round();
+    pct.clamp(VOLUME_PCT_MIN as f32, VOLUME_PCT_MAX as f32) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_to_volume_pct_zero_db_is_100() {
+        assert_eq!(db_to_volume_pct(0.0), 100);
+    }
+
+    #[test]
+    fn db_to_volume_pct_minus_6_db_is_approx_50() {
+        // 10^(−6/20) ≈ 0.5012; 100 × 0.5012 ≈ 50.12; round = 50
+        assert_eq!(db_to_volume_pct(-6.0), 50);
+    }
+
+    #[test]
+    fn db_to_volume_pct_minus_60_db_is_0() {
+        // 10^(−60/20) = 10^−3 = 0.001; 100 × 0.001 = 0.1; round = 0
+        assert_eq!(db_to_volume_pct(-60.0), 0);
+    }
+
+    #[test]
+    fn db_to_volume_pct_plus_6_db_clamps_to_100() {
+        // 10^(6/20) ≈ 1.9953; 100 × 1.9953 ≈ 199.53; clamp → 100
+        assert_eq!(db_to_volume_pct(6.0), 100);
+    }
+}
