@@ -188,7 +188,6 @@
         class="action-btn gear-btn"
         aria-label="Output device for {channel.id.toUpperCase()}"
         aria-haspopup="true"
-        aria-expanded={popoverOpen}
       >⚙</Popover.Trigger>
       <Popover.Portal>
         <Popover.Content class="output-popover-content" sideOffset={8}>
@@ -329,7 +328,7 @@
   }
 
   /* Shared icon-button base for gear / eq / remove */
-  :global(.action-btn) {
+  .strip-actions :global(.action-btn) {
     display: flex;
     align-items: center;
     justify-content: center;
@@ -352,38 +351,38 @@
       color var(--ss-dur-fast) var(--ss-ease-standard);
   }
 
-  :global(.action-btn:hover) {
+  .strip-actions :global(.action-btn:hover) {
     border-color: var(--ss-border-strong);
     background: var(--ss-surface-2);
     color: var(--ss-text-primary);
   }
 
-  :global(.action-btn:focus-visible) {
+  .strip-actions :global(.action-btn:focus-visible) {
     outline: 2px solid var(--ss-accent);
     outline-offset: 2px;
   }
 
-  :global(.action-btn:disabled) {
+  .strip-actions :global(.action-btn:disabled) {
     cursor: not-allowed;
     opacity: 0.5;
   }
 
   /* Gear button: accent on open state */
-  :global(.gear-btn[aria-expanded="true"]) {
+  .strip-actions :global(.gear-btn[aria-expanded="true"]) {
     border-color: var(--ss-accent-border);
     color: var(--ss-accent);
     background: var(--ss-accent-soft);
   }
 
   /* Remove button: danger tint on hover */
-  .remove-btn {
+  .strip-actions :global(.remove-btn) {
     margin-left: auto;
   }
 
-  .remove-btn:hover {
-    color: var(--ss-danger) !important;
-    background: var(--ss-danger-soft) !important;
-    border-color: var(--ss-danger) !important;
+  .strip-actions :global(.remove-btn:hover) {
+    color: var(--ss-danger);
+    background: var(--ss-danger-soft);
+    border-color: var(--ss-danger);
   }
 
   /* ===== Output device popover content (portalled — :global required) ===== */
