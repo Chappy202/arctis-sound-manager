@@ -479,3 +479,13 @@ pub async fn eq_preset_delete(
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::EqPresetDelete { name }).await
 }
+
+// ── Task 5 (eq-mic-preset-packs): mic preset apply command ───────────────────
+
+#[tauri::command]
+pub async fn mic_preset_apply(
+    name: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ApplyMicPreset { name }).await
+}

@@ -42,6 +42,8 @@ pub fn run() {
             commands::eq_preset_save,
             commands::eq_preset_apply,
             commands::eq_preset_delete,
+            // eq-mic-preset-packs: mic preset apply
+            commands::mic_preset_apply,
             // F4: Channel add / remove
             commands::channel_add,
             commands::channel_remove,

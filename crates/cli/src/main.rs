@@ -385,6 +385,21 @@ enum MicAction {
         /// Volume percent, 0-100. 100 = unity (full volume).
         pct: u8,
     },
+    /// Mic preset management (list, apply).
+    Preset {
+        #[command(subcommand)]
+        action: MicPresetAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MicPresetAction {
+    /// List all available mic presets.
+    List,
+    /// Apply a named mic preset.
+    Apply {
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -556,6 +571,11 @@ fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
 }
 
 fn dispatch_mic(action: MicAction) -> ExitCode {
+    // Preset actions have their own daemon-optional dispatch (mirrors dispatch_eq_preset).
+    if let MicAction::Preset { action } = action {
+        return dispatch_mic_preset(action);
+    }
+
     if !daemon::socket_path().exists() {
         eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
         eprintln!(
@@ -594,6 +614,8 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
         MicAction::HwMic { device } => daemon::Request::MicHwMic { device },
         MicAction::Backend { backend } => daemon::Request::MicSuppressionBackend { backend },
         MicAction::Volume { pct } => daemon::Request::SetMicVolume { volume_pct: pct },
+        // Preset is handled before the daemon check above; this arm is unreachable.
+        MicAction::Preset { .. } => unreachable!(),
     };
 
     match daemon::send_request(&req) {
@@ -1807,8 +1829,17 @@ fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
                 match daemon::send_request(&daemon::Request::GetState) {
                     Ok(resp) if resp.ok => {
                         if let Some(state) = resp.state {
+                            println!("Built-in:");
+                            if state.factory_eq_presets.is_empty() {
+                                println!("  (none)");
+                            } else {
+                                for p in &state.factory_eq_presets {
+                                    println!("  {} ({} bands)", p.name, p.band_count);
+                                }
+                            }
+                            println!("Saved:");
                             if state.eq_presets.is_empty() {
-                                println!("no EQ presets saved");
+                                println!("  (none)");
                             } else {
                                 for p in &state.eq_presets {
                                     println!("  {} ({} bands)", p.name, p.band_count);
@@ -1827,8 +1858,18 @@ fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            let factory = arctis_engine::presets::factory_eq_presets();
+            println!("Built-in:");
+            if factory.is_empty() {
+                println!("  (none)");
+            } else {
+                for p in &factory {
+                    println!("  {} ({} bands)", p.name, p.bands.len());
+                }
+            }
+            println!("Saved:");
             if cfg.eq_presets.is_empty() {
-                println!("no EQ presets saved");
+                println!("  (none)");
             } else {
                 for p in &cfg.eq_presets {
                     println!("  {} ({} bands)", p.name, p.bands.len());
@@ -1866,6 +1907,73 @@ fn dispatch_eq_preset(action: EqPresetAction) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error deleting preset: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_mic_preset(action: MicPresetAction) -> ExitCode {
+    match action {
+        MicPresetAction::List => {
+            if daemon::socket_path().exists() {
+                match daemon::send_request(&daemon::Request::GetState) {
+                    Ok(resp) if resp.ok => {
+                        if let Some(state) = resp.state {
+                            if state.mic_presets.is_empty() {
+                                println!("no mic presets available");
+                            } else {
+                                for p in &state.mic_presets {
+                                    println!("  {} — {}", p.name, p.description);
+                                }
+                            }
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(_) | Err(_) => {}
+                }
+            }
+            let factory = arctis_engine::presets::factory_mic_presets();
+            if factory.is_empty() {
+                println!("no mic presets available");
+            } else {
+                for p in &factory {
+                    println!("  {} — {}", p.name, p.description);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        MicPresetAction::Apply { name } => {
+            if daemon::socket_path().exists() {
+                let req = daemon::Request::ApplyMicPreset { name: name.clone() };
+                match daemon::send_request(&req) {
+                    Ok(resp) if resp.ok => {
+                        println!("mic preset '{name}' applied");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(resp) => {
+                        eprintln!("error: {}", resp.error.unwrap_or_default());
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let cfg = match config_store::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error loading config: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut engine = Engine::new(RealRunner, cfg);
+            match engine.apply_mic_preset(&name) {
+                Ok(()) => {
+                    println!("mic preset '{name}' applied");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error applying mic preset: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -3131,6 +3239,36 @@ mod tests {
             super::Command::DefaultSink {
                 action: super::DefaultSinkAction::Set { channel }
             } if channel == "game"
+        ));
+    }
+
+    // ── Task 6: mic preset CLI parse tests ──────────────────────────────────
+
+    #[test]
+    fn cli_parses_mic_preset_apply() {
+        let cmd = parse(&["mic", "preset", "apply", "Less Nasal"])
+            .expect("mic preset apply should parse");
+        match cmd {
+            super::Command::Mic {
+                action:
+                    super::MicAction::Preset {
+                        action: super::MicPresetAction::Apply { name },
+                    },
+            } => assert_eq!(name, "Less Nasal"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_mic_preset_list() {
+        let cmd = parse(&["mic", "preset", "list"]).expect("mic preset list should parse");
+        assert!(matches!(
+            cmd,
+            super::Command::Mic {
+                action: super::MicAction::Preset {
+                    action: super::MicPresetAction::List
+                }
+            }
         ));
     }
 }

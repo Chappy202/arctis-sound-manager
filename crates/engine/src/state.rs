@@ -141,6 +141,13 @@ pub struct EqPresetSnapshot {
     pub band_count: usize,
 }
 
+/// Lightweight summary of one microphone preset for the state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicPresetSnapshot {
+    pub name: String,
+    pub description: String,
+}
+
 /// A flat, UI-agnostic snapshot the CLI/daemon/(future UI) render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineState {
@@ -158,6 +165,12 @@ pub struct EngineState {
     /// Master output volume as 0–100 percent. 100 = unity / 0 dB.
     #[serde(default = "default_vol_pct_100")]
     pub master_volume_pct: u8,
+    /// Read-only factory EQ preset catalog. Always populated regardless of user presets.
+    #[serde(default)]
+    pub factory_eq_presets: Vec<EqPresetSnapshot>,
+    /// Read-only factory mic preset catalog.
+    #[serde(default)]
+    pub mic_presets: Vec<MicPresetSnapshot>,
     /// Whether the master output is muted.
     #[serde(default)]
     pub master_mute: bool,
@@ -251,6 +264,9 @@ pub enum Event {
         channel_id: String,
     },
     EqPresetDeleted {
+        name: String,
+    },
+    MicPresetApplied {
         name: String,
     },
     Reconciled,

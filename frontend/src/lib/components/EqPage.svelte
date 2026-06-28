@@ -15,6 +15,7 @@
   import { eqEditing, pulseEditing } from "../stores/eqEditing.js";
   import { reconcileBands, type Band } from "../eq.js";
   import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
+  import { groupPresets } from "./eqPresetUtils.js";
   import EqGraph from "./EqGraph.svelte";
   import EqBandPanel from "./EqBandPanel.svelte";
   import BandList from "./BandList.svelte";
@@ -109,8 +110,15 @@
   // EQ preset management
   // ---------------------------------------------------------------------------
 
-  /** Names of saved presets from engine state. */
-  const eqPresets = $derived($engineState?.eq_presets ?? []);
+  /** Presets split into built-in (factory) and user-saved groups. */
+  const _presetGroups = $derived(
+    groupPresets(
+      $engineState?.factory_eq_presets ?? [],
+      $engineState?.eq_presets ?? [],
+    ),
+  );
+  const factoryPresets = $derived(_presetGroups.builtin);
+  const eqPresets = $derived(_presetGroups.saved);
 
   /** Whether we are in "save preset" mode (inline name entry). */
   let savingPreset = $state(false);
@@ -243,46 +251,74 @@
   <div class="preset-card">
     <div class="card-header">
       <h2 class="card-title">PRESETS</h2>
-      {#if eqPresets.length > 0}
-        <span class="band-count">{eqPresets.length}</span>
-      {/if}
       {#if presetFeedback}
         <span class="preset-feedback" role="status" aria-live="polite">{presetFeedback}</span>
       {/if}
     </div>
 
-    {#if eqPresets.length > 0}
-      <div class="preset-list" role="list">
-        {#each eqPresets as preset}
-          <div class="preset-row" role="listitem">
-            <span class="preset-name" title="{preset.name} ({preset.band_count} bands)">
-              {preset.name}
-            </span>
-            <span class="preset-meta">{preset.band_count}b</span>
-            <div class="preset-actions">
-              <button
-                class="preset-btn"
-                onclick={() => applyPreset(preset.name)}
-                title="Apply to {currentChannelLabel}"
-                aria-label="Apply preset {preset.name} to {currentChannelLabel}"
-              >
-                Apply
-              </button>
-              <button
-                class="preset-btn danger"
-                onclick={() => deletePreset(preset.name)}
-                title="Delete preset {preset.name}"
-                aria-label="Delete preset {preset.name}"
-              >
-                ✕
-              </button>
+    <!-- Built-in (factory) presets — read-only, Apply only -->
+    {#if factoryPresets.length > 0}
+      <div class="preset-group">
+        <span class="preset-group-label">Built-in</span>
+        <div class="preset-list" role="list">
+          {#each factoryPresets as preset}
+            <div class="preset-row" role="listitem">
+              <span class="preset-name" title="{preset.name} ({preset.band_count} bands)">
+                {preset.name}
+              </span>
+              <span class="preset-meta">{preset.band_count}b</span>
+              <div class="preset-actions">
+                <button
+                  class="preset-btn"
+                  onclick={() => applyPreset(preset.name)}
+                  title="Apply to {currentChannelLabel}"
+                  aria-label="Apply built-in preset {preset.name} to {currentChannelLabel}"
+                >
+                  Apply
+                </button>
+              </div>
             </div>
-          </div>
-        {/each}
+          {/each}
+        </div>
       </div>
-    {:else}
-      <p class="preset-empty">No saved presets. Save the current channel EQ as a named preset.</p>
     {/if}
+
+    <!-- Saved (user) presets — Apply + Delete -->
+    <div class="preset-group">
+      <span class="preset-group-label">Saved</span>
+      {#if eqPresets.length > 0}
+        <div class="preset-list" role="list">
+          {#each eqPresets as preset}
+            <div class="preset-row" role="listitem">
+              <span class="preset-name" title="{preset.name} ({preset.band_count} bands)">
+                {preset.name}
+              </span>
+              <span class="preset-meta">{preset.band_count}b</span>
+              <div class="preset-actions">
+                <button
+                  class="preset-btn"
+                  onclick={() => applyPreset(preset.name)}
+                  title="Apply to {currentChannelLabel}"
+                  aria-label="Apply preset {preset.name} to {currentChannelLabel}"
+                >
+                  Apply
+                </button>
+                <button
+                  class="preset-btn danger"
+                  onclick={() => deletePreset(preset.name)}
+                  title="Delete preset {preset.name}"
+                  aria-label="Delete preset {preset.name}"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <p class="preset-empty">No saved presets. Save the current channel EQ as a named preset.</p>
+      {/if}
+    </div>
 
     <!-- Save current EQ as preset -->
     <div class="preset-save-area">
@@ -587,11 +623,27 @@
     color: var(--ss-accent);
   }
 
+  /* ===== Preset groups (Built-in / Saved) ===== */
+  .preset-group {
+    margin-bottom: var(--ss-space-3);
+  }
+
+  .preset-group-label {
+    display: block;
+    font-family: var(--ss-font-display);
+    font-size: var(--ss-type-micro-size);
+    font-weight: var(--ss-type-micro-weight);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    text-transform: uppercase;
+    color: var(--ss-text-tertiary);
+    margin-bottom: var(--ss-space-1);
+    padding: 0 var(--ss-space-2);
+  }
+
   .preset-list {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-bottom: var(--ss-space-3);
   }
 
   .preset-row {

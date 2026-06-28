@@ -371,6 +371,20 @@ pub struct EqPreset {
     pub bands: Vec<EqBandConfig>,
 }
 
+/// A named, reusable preset for the microphone DSP chain (shared library across all profiles).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicPreset {
+    pub name: String,
+    pub description: String,
+    pub gain: MicGainStage,
+    pub highpass: MicHighpassStage,
+    pub suppression: MicSuppressionStage,
+    pub compressor: MicCompressorStage,
+    pub gate: MicGateStage,
+    pub eq_enabled: bool,
+    pub eq: Vec<EqBandConfig>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1649,5 +1663,23 @@ volume_db = -6.0
             profile.master_volume_pct, 100,
             "serde default must supply 100 for master_volume_pct when absent"
         );
+    }
+
+    #[test]
+    fn mic_preset_round_trips_via_toml() {
+        let p = MicPreset {
+            name: "Less Nasal".into(),
+            description: "Tame nasal honk".into(),
+            gain: MicGainStage::default(),
+            highpass: MicHighpassStage::default(),
+            suppression: MicSuppressionStage { enabled: true, ..Default::default() },
+            compressor: MicCompressorStage::default(),
+            gate: MicGateStage::default(),
+            eq_enabled: true,
+            eq: vec![EqBandConfig { kind: "peaking".into(), freq_hz: 1000.0, q: 0.7071, gain_db: -4.0 }],
+        };
+        let toml = toml::to_string(&p).unwrap();
+        let back: MicPreset = toml::from_str(&toml).unwrap();
+        assert_eq!(p, back);
     }
 }

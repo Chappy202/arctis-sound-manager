@@ -7,6 +7,7 @@ pub mod convert;
 pub mod device;
 pub mod engine;
 pub mod error;
+pub mod presets;
 pub mod state;
 
 pub use children::ChildOwner;
@@ -15,6 +16,6 @@ pub use engine::Engine;
 pub use error::EngineError;
 pub use state::{
     AppStream, ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, EqPresetSnapshot, Event,
-    MicParam, MicSnapshot, MicStageSnapshot, OutputDeviceSnapshot, StageAvailability, StageName,
-    SuppressionBackend, SurroundSnapshot,
+    MicParam, MicPresetSnapshot, MicSnapshot, MicStageSnapshot, OutputDeviceSnapshot,
+    StageAvailability, StageName, SuppressionBackend, SurroundSnapshot,
 };

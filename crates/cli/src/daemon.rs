@@ -270,6 +270,10 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             ),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ApplyMicPreset { name } => match engine.apply_mic_preset(&name) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::CoexistStatus => {
             // Run pw-cli ls Node + check home dir for legacy components.
             let node_stdout = RealRunner
