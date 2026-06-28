@@ -171,7 +171,7 @@
           aria-label="Audio channel strips"
         >
           <MasterStrip mixerState={$engineState} unrouted={grouped.unrouted}
-            onClearStream={handleClearStream} />
+            onClearStream={handleClearStream} onError={(m) => (dropError = m)} />
 
           {#each $engineState.channels as channel (channel.id)}
             <div role="listitem">
@@ -192,7 +192,7 @@
             </div>
           {/each}
 
-          <MicStrip mic={$engineState.mic} />
+          <MicStrip mic={$engineState.mic} onError={(m) => (dropError = m)} />
 
           <!-- ===== Add channel affordance ===== -->
           <div class="add-channel-strip" role="listitem">

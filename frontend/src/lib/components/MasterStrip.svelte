@@ -3,9 +3,17 @@
     type EngineState, type AppStream } from "../ipc.js";
   import { engineState } from "../stores.js";
   import AppPill from "./AppPill.svelte";
+  import VolumeSlider from "./VolumeSlider.svelte";
+  import Checkbox from "../ui/Checkbox.svelte";
 
-  let { mixerState, unrouted, onClearStream }:
-    { mixerState: EngineState; unrouted: AppStream[]; onClearStream: (id: string) => void } = $props();
+  interface Props {
+    mixerState: EngineState;
+    unrouted: AppStream[];
+    onClearStream: (id: string) => void;
+    onError?: (msg: string) => void;
+  }
+
+  let { mixerState, unrouted, onClearStream, onError = () => {} }: Props = $props();
 
   let dragOver = $state(false);
 
@@ -30,33 +38,78 @@
     if (id) onClearStream(id);
   }
 
-  async function handleVolumeChange(e: Event) {
-    const pct = Number((e.target as HTMLInputElement).value);
+  async function handleMasterVolumeCommit(pct: number) {
+    // Rejections propagate to VolumeSlider → onError.
     engineState.set(await setMasterVolume(pct));
   }
+
+  let muteBusy = $state(false);
+
   async function handleMuteToggle() {
-    engineState.set(await setMasterMute(!mixerState.master_mute));
+    if (muteBusy) return;
+    muteBusy = true;
+    try {
+      engineState.set(await setMasterMute(!mixerState.master_mute));
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      muteBusy = false;
+    }
   }
-  async function handleDefaultToggle(e: Event) {
-    const checked = (e.target as HTMLInputElement).checked;
-    engineState.set(await setDefaultSinkChannel(checked ? "game" : null));
+
+  async function handleDefaultToggle(checked: boolean) {
+    try {
+      engineState.set(await setDefaultSinkChannel(checked ? "game" : null));
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    }
   }
 </script>
 
 <div class="strip master" style="--accent: var(--ss-accent-master)">
-  <h3 class="strip-name">MASTER</h3>
-  <input class="vol" type="range" min="0" max="100" step="1"
-    value={mixerState.master_volume_pct} oninput={handleVolumeChange} aria-label="Master volume" />
-  <span class="vol-label">{mixerState.master_volume_pct}%</span>
-  <button class="mute" class:on={mixerState.master_mute} onclick={handleMuteToggle}
-    aria-pressed={mixerState.master_mute}>{mixerState.master_mute ? "Muted" : "Mute"}</button>
+  <!-- ===== Header ===== -->
+  <div class="strip-header">
+    <span class="channel-icon" aria-hidden="true">◉</span>
+    <h3 class="channel-label">MASTER</h3>
+  </div>
 
-  <label class="default-toggle">
-    <input type="checkbox" checked={mixerState.default_sink_channel != null}
-      onchange={handleDefaultToggle} />
-    Auto-route new apps
-  </label>
+  <!-- TODO (C3a/follow-up): output-device gear once a master-output / mic-source list IPC exists -->
 
+  <!-- ===== Volume area ===== -->
+  <div class="volume-area">
+    <VolumeSlider
+      volume={mixerState.master_volume_pct}
+      accent="var(--ss-accent-master)"
+      label="Master volume"
+      oncommit={handleMasterVolumeCommit}
+      {onError}
+    />
+  </div>
+
+  <!-- ===== Mute button ===== -->
+  <button
+    class="mute-btn"
+    class:muted={mixerState.master_mute}
+    disabled={muteBusy}
+    title={mixerState.master_mute ? "Unmute master" : "Mute master"}
+    aria-label={mixerState.master_mute ? "Unmute master" : "Mute master"}
+    aria-pressed={mixerState.master_mute}
+    onclick={handleMuteToggle}
+  >
+    <span aria-hidden="true">{mixerState.master_mute ? "🔇" : "🔊"}</span>
+  </button>
+
+  <!-- ===== Auto-route toggle ===== -->
+  <div class="default-toggle">
+    <Checkbox
+      checked={mixerState.default_sink_channel != null}
+      onCheckedChange={handleDefaultToggle}
+      ariaLabel="Auto-route new apps"
+    />
+    <span>Auto-route new apps</span>
+  </div>
+
+  <!-- ===== Apps tray ===== -->
   <p class="tray-label">Apps to be routed</p>
   <div class="tray" class:drag-over={dragOver}
     role="list" aria-label="Unrouted applications"
@@ -72,27 +125,72 @@
 
 <style>
   .strip.master {
-    display: flex; flex-direction: column; gap: var(--ss-space-2);
+    display: flex; flex-direction: column; gap: var(--ss-space-3);
     width: var(--ss-channel-strip-w, 120px); min-width: var(--ss-channel-strip-w-min, 100px);
     background: var(--ss-surface-1);
-    border: var(--ss-border-width) solid var(--accent);
-    border-radius: var(--ss-radius-md); padding: var(--ss-space-3); flex-shrink: 0;
+    border: var(--ss-border-width) solid var(--ss-border);
+    border-top: 2px solid var(--accent);
+    border-radius: var(--ss-radius-md); padding: var(--ss-space-3);
+    flex-shrink: 0; box-shadow: var(--ss-e1);
   }
-  .strip-name { font-family: var(--ss-font-display); text-transform: uppercase;
-    color: var(--accent); margin: 0; font-size: var(--ss-type-h2-size); }
-  .vol { width: 100%; accent-color: var(--accent); }
-  .vol-label { font-family: var(--ss-font-mono); font-size: var(--ss-type-caption-size);
-    color: var(--ss-text-secondary); }
-  .mute { cursor: pointer; }
-  .mute.on { color: var(--ss-danger); }
-  .default-toggle { display: flex; gap: var(--ss-space-1); align-items: center;
-    font-size: var(--ss-type-caption-size); color: var(--ss-text-tertiary); }
-  .tray-label { font-size: var(--ss-type-micro-size); text-transform: uppercase;
-    color: var(--ss-text-tertiary); margin: var(--ss-space-2) 0 0; }
-  .tray { display: flex; flex-direction: column; gap: var(--ss-space-1); min-height: 60px;
+
+  /* ===== Header ===== */
+  .strip-header {
+    display: flex; align-items: center; gap: var(--ss-space-2);
+  }
+  .channel-icon {
+    font-size: 14px; line-height: 1;
+  }
+  .channel-label {
+    font-family: var(--ss-font-display); font-size: 13px; font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ss-text-primary); margin: 0; line-height: 1;
+  }
+
+  /* ===== Volume area ===== */
+  .volume-area {
+    display: flex; flex-direction: row; align-items: stretch; justify-content: center;
+    gap: var(--ss-space-2); flex: 1; min-height: 120px;
+  }
+
+  /* ===== Mute button ===== */
+  .mute-btn {
+    display: flex; align-items: center; justify-content: center;
+    width: var(--ss-control-h-sm); height: var(--ss-control-h-sm);
+    border-radius: var(--ss-radius-xs); background: var(--ss-surface-input);
+    border: var(--ss-border-width) solid var(--ss-border);
+    cursor: pointer; font-size: 13px; align-self: center;
+    transition:
+      background var(--ss-dur-fast) var(--ss-ease-standard),
+      border-color var(--ss-dur-fast) var(--ss-ease-standard);
+  }
+  .mute-btn:hover { border-color: var(--ss-border-strong); background: var(--ss-surface-2); }
+  .mute-btn.muted { background: var(--ss-accent); border-color: var(--ss-accent-border); }
+  .mute-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+  .mute-btn:focus-visible { outline: 2px solid var(--ss-accent); outline-offset: 2px; }
+
+  /* ===== Auto-route toggle ===== */
+  .default-toggle {
+    display: flex; gap: var(--ss-space-2); align-items: center;
+    font-family: var(--ss-font-ui); font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-tertiary);
+  }
+
+  /* ===== Apps tray ===== */
+  .tray-label {
+    font-family: var(--ss-font-ui); font-size: var(--ss-type-micro-size);
+    text-transform: uppercase; color: var(--ss-text-tertiary);
+    margin: var(--ss-space-1) 0 0;
+  }
+  .tray {
+    display: flex; flex-direction: column; gap: var(--ss-space-1); min-height: 60px;
     padding: var(--ss-space-2); border: var(--ss-border-width) dashed var(--ss-border);
-    border-radius: var(--ss-radius-sm); }
+    border-radius: var(--ss-radius-sm);
+    transition: background var(--ss-dur-fast) var(--ss-ease-standard);
+  }
   .tray.drag-over { background: var(--ss-drag-highlight); border-color: var(--accent); }
-  .tray-empty { font-size: var(--ss-type-caption-size); color: var(--ss-text-disabled);
-    font-style: italic; }
+  .tray-empty {
+    font-family: var(--ss-font-ui); font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-disabled); font-style: italic;
+  }
 </style>
