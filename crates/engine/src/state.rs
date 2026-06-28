@@ -155,6 +155,9 @@ pub struct EngineState {
     pub surround: SurroundSnapshot,
     #[serde(default)]
     pub eq_presets: Vec<EqPresetSnapshot>,
+    /// Read-only factory EQ preset catalog. Always populated regardless of user presets.
+    #[serde(default)]
+    pub factory_eq_presets: Vec<EqPresetSnapshot>,
     /// Master output gain in dB (0.0 = unity). Populated from the active profile.
     #[serde(default)]
     pub master_volume_db: f32,

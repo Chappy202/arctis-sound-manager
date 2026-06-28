@@ -449,6 +449,14 @@ impl<R: CommandRunner> Engine<R> {
             })
             .collect();
 
+        let factory_eq_presets = crate::presets::factory_eq_presets()
+            .iter()
+            .map(|p| EqPresetSnapshot {
+                name: p.name.clone(),
+                band_count: p.bands.len(),
+            })
+            .collect();
+
         EngineState {
             active_profile: self.config.active_profile.clone(),
             profiles: self.config.profile_names(),
@@ -459,6 +467,7 @@ impl<R: CommandRunner> Engine<R> {
             mic,
             surround,
             eq_presets,
+            factory_eq_presets,
             master_volume_db: active.as_ref().map(|p| p.master_volume_db).unwrap_or(0.0),
             master_mute: active.as_ref().map(|p| p.master_mute).unwrap_or(false),
             chatmix_position: active.as_ref().map(|p| p.chatmix_position).unwrap_or(4),
@@ -1066,15 +1075,20 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Apply a named preset's bands to `channel_id` in the active profile. Live-applies via AudioBackend.
     pub fn apply_eq_preset(&mut self, preset: &str, channel_id: &str) -> Result<(), EngineError> {
-        // Find preset
+        // Find preset — user library first, then factory catalog (user always wins on name conflict)
         let preset_bands = self
             .config
             .eq_presets
             .iter()
             .find(|p| p.name == preset)
-            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {preset}")))?
-            .bands
-            .clone();
+            .map(|p| p.bands.clone())
+            .or_else(|| {
+                crate::presets::factory_eq_presets()
+                    .into_iter()
+                    .find(|p| p.name == preset)
+                    .map(|p| p.bands)
+            })
+            .ok_or_else(|| EngineError::BadRequest(format!("EQ preset not found: {preset}")))?;
 
         // Mutate channel EQ in active profile
         {
@@ -3941,6 +3955,107 @@ mod tests {
             tmp.join("config.toml").exists(),
             "config.toml must be written"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn apply_eq_preset_resolves_factory_name() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("fxeq_factory");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // No user presets — factory catalog must be consulted
+        let cfg = make_config_no_eq_no_routes();
+
+        // "Bass Boost" has 10 bands → apply_all: 1 ls (find_node_id) + 10 band set calls
+        let ls = ls_all_present();
+        let mut runner = MockRunner::new();
+        runner = runner.with_output(0, &ls, "");
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", "");
+        }
+
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .apply_eq_preset("Bass Boost", "game")
+            .expect("factory preset should apply successfully");
+
+        let st = engine.state();
+        let game = st.channels.iter().find(|c| c.id == "game").unwrap();
+        // "Bass Boost" band 0 is lowshelf/31 Hz/4.0 dB; default flat band is peaking/0.0 dB
+        assert_eq!(game.eq_bands[0].kind, "lowshelf", "Bass Boost band 0 must be lowshelf");
+        assert_eq!(
+            game.eq_bands[0].gain_db, 4.0,
+            "Bass Boost band 0 lowshelf gain must be 4.0 dB"
+        );
+        assert!(
+            st.factory_eq_presets.iter().any(|p| p.name == "Reference (Calibrated)"),
+            "state must expose factory catalog including Reference (Calibrated)"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn apply_eq_preset_unknown_name_errors() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("fxeq_unknown");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let result = engine.apply_eq_preset("NonExistent__XYZ", "game");
+        assert!(
+            matches!(result, Err(EngineError::BadRequest(_))),
+            "unknown preset name must return BadRequest"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn apply_eq_preset_user_preset_wins_over_factory() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("fxeq_user_wins");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // User preset with same name as a factory preset — user must win
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.eq_presets.push(arctis_config::EqPreset {
+            name: "Bass Boost".into(),
+            kind_hint: None,
+            bands: vec![EqBandConfig {
+                kind: "peaking".into(),
+                freq_hz: 100.0,
+                q: 1.0,
+                gain_db: 9.9,
+            }],
+        });
+
+        // User preset has 1 band but apply_all runs 10 dense bands; queue all 10
+        let ls = ls_all_present();
+        let mut runner = MockRunner::new();
+        runner = runner.with_output(0, &ls, "");
+        for _ in 0..10 {
+            runner = runner.with_output(0, "", "");
+        }
+
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .apply_eq_preset("Bass Boost", "game")
+            .expect("user preset should apply");
+
+        // Channel config must reflect user preset (1 band), not factory (10 bands)
+        let active = engine.config().active_profile.clone();
+        let profile = engine.config().profile(&active).unwrap();
+        let ch = profile.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(ch.eq.len(), 1, "user preset (1 band) must win over factory (10 bands)");
+        assert_eq!(ch.eq[0].freq_hz, 100.0, "user band freq must be preserved");
+        assert_eq!(ch.eq[0].gain_db, 9.9, "user band gain must be preserved");
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
