@@ -104,3 +104,16 @@ opcode = [0x37]
 capability = "mic_volume"
 save = true
 encoding = { type = "int_range", min = 1, max = 10 }
+
+# ChatMix hardware-dial enable. Puts the headset into game/chat dial mode so it emits
+# [0x07,0x45] dial frames. Reverse-engineered from a USB capture; software mode switch,
+# recoverable by replug. GATED: stays disabled (allowlist empty) until OWNER-RUN
+# validation (asm-cli device chatmix-enable --validate) signs it off. save=false (one-time).
+[commands.chatmix_enable]
+opcode = [0x49]
+capability = "chat_mix"
+save = false
+encoding = { type = "enum", entries = [
+    { value = 0, label = "disabled" },
+    { value = 1, label = "enabled" },
+] }

@@ -110,6 +110,61 @@ mod tests {
         assert!(matches!(err, DeviceError::Unsupported(_)));
     }
 
+    // ── chatmix_enable gate tests (Task B1) ──────────────────────────────────
+
+    #[test]
+    fn chatmix_enable_refused_while_allowlist_empty_and_nothing_written() {
+        // Production default: enabled_writes is empty.  The command must be
+        // refused AND the mock transport must record zero bytes written — this is
+        // the core G2 safety assertion: the opcode is never sent while the gate is
+        // closed.
+        let mut c = DeviceController::new(MockTransport::new(), nova()).with_enabled_writes(&[]);
+        let err = c.set("chatmix_enable", 1).unwrap_err();
+        assert!(
+            matches!(err, DeviceError::Unsupported(_)),
+            "chatmix_enable must be refused with Unsupported when allowlist is empty"
+        );
+        // G2 proof: zero bytes on the wire.
+        assert!(
+            c.transport().written.is_empty(),
+            "no bytes must reach the transport while the allowlist gate is closed"
+        );
+    }
+
+    #[test]
+    fn chatmix_enable_sends_exactly_one_report_with_correct_bytes_when_enabled() {
+        // When the owner-validated gate is open (name in enabled_writes), exactly
+        // ONE report must be written (save=false → no save frame) with the wire
+        // bytes [0x06, 0x49, 0x01, 0, …].
+        let mut c = DeviceController::new(MockTransport::new(), nova())
+            .with_enabled_writes(&["chatmix_enable"]);
+        c.set("chatmix_enable", 1).expect("enabled write succeeds");
+        assert_eq!(
+            c.transport().written.len(),
+            1,
+            "save=false → exactly one write (no save frame)"
+        );
+        let report = &c.transport().written[0];
+        assert_eq!(report[0], 0x06, "report_id");
+        assert_eq!(report[1], 0x49, "opcode");
+        assert_eq!(report[2], 0x01, "value=1 (enabled)");
+        assert!(
+            report[3..].iter().all(|&b| b == 0),
+            "remainder must be zero-padded"
+        );
+    }
+
+    #[test]
+    fn chatmix_enable_value_0_encodes_disabled_byte() {
+        // Confirms that enum value 0 (\"disabled\") encodes correctly as wire byte 0x00.
+        let mut c = DeviceController::new(MockTransport::new(), nova())
+            .with_enabled_writes(&["chatmix_enable"]);
+        c.set("chatmix_enable", 0).expect("value 0 is a valid enum entry");
+        let report = &c.transport().written[0];
+        assert_eq!(report[1], 0x49, "opcode");
+        assert_eq!(report[2], 0x00, "value=0 (disabled)");
+    }
+
     #[test]
     fn read_delegates_to_read_status() {
         let d = nova();
