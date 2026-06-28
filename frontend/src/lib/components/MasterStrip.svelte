@@ -165,7 +165,7 @@
       border-color var(--ss-dur-fast) var(--ss-ease-standard);
   }
   .mute-btn:hover { border-color: var(--ss-border-strong); background: var(--ss-surface-2); }
-  .mute-btn.muted { background: var(--ss-accent); border-color: var(--ss-accent-border); }
+  .mute-btn.muted { background: var(--accent); border-color: var(--accent); }
   .mute-btn:disabled { cursor: not-allowed; opacity: 0.5; }
   .mute-btn:focus-visible { outline: 2px solid var(--ss-accent); outline-offset: 2px; }
 
