@@ -44,8 +44,8 @@ export interface ChannelSnapshot {
   output_device: string | null;
   /** Full per-band EQ state; empty = flat / no overrides. */
   eq_bands: EqBandSnapshot[];
-  /** Software volume in dB. Range: -60..=+6. 0 dB = unity gain. */
-  volume_db: number;
+  /** Software volume 0–100 percent. 100 = unity gain. */
+  volume_pct: number;
   /** Whether the channel is muted. */
   muted: boolean;
 }
@@ -94,7 +94,7 @@ export interface EngineState {
   mic: MicSnapshot;
   surround: SurroundSnapshot;
   eq_presets: EqPresetSnapshot[];
-  master_volume_db: number;
+  master_volume_pct: number;
   master_mute: boolean;
   chatmix_position: number;
   default_sink_channel: string | null;
@@ -145,9 +145,9 @@ export function buildDeviceSetArgs(
 /** Builds the camelCase arg object for set_channel_volume. */
 export function buildSetChannelVolumeArgs(
   channel: string,
-  volume_db: number,
-): { channel: string; volumeDb: number } {
-  return { channel, volumeDb: volume_db };
+  volume_pct: number,
+): { channel: string; volumePct: number } {
+  return { channel, volumePct: volume_pct };
 }
 
 /** Builds the arg object for set_channel_mute. */
@@ -229,11 +229,11 @@ export const setChannelOutput = (channel: string, device: string | null): Promis
   invoke<EngineState>("set_channel_output", buildSetChannelOutputArgs(channel, device));
 
 /**
- * Set the software volume (dB) for a channel. Range: -60..=+6. 0 dB = unity gain.
+ * Set the software volume (percent 0–100) for a channel. 100 = unity gain.
  * Returns the updated EngineState for immediate store application.
  */
-export const setChannelVolume = (channel: string, volumeDb: number): Promise<EngineState> =>
-  invoke<EngineState>("set_channel_volume", buildSetChannelVolumeArgs(channel, volumeDb));
+export const setChannelVolume = (channel: string, volumePct: number): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_volume", buildSetChannelVolumeArgs(channel, volumePct));
 
 /**
  * Set the mute state for a channel.
@@ -374,9 +374,9 @@ export const listOutputs = (): Promise<OutputDeviceSnapshot[]> => invoke<OutputD
 export const moveStream = (stream: string, channel: string): Promise<EngineState> =>
   invoke<EngineState>("move_stream", { stream, channel });
 
-/** Set the master volume in dB. */
-export const setMasterVolume = (volumeDb: number): Promise<EngineState> =>
-  invoke<EngineState>("set_master_volume", { volumeDb });
+/** Set the master volume (percent 0–100). 100 = unity. */
+export const setMasterVolume = (volumePct: number): Promise<EngineState> =>
+  invoke<EngineState>("set_master_volume", { volumePct });
 
 /** Set the master mute state. */
 export const setMasterMute = (muted: boolean): Promise<EngineState> =>

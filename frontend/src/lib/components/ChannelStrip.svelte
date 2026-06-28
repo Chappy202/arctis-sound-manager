@@ -7,9 +7,9 @@
   import LevelMeter from "./LevelMeter.svelte";
   import AppPill from "./AppPill.svelte";
 
-  // Domain bounds — mirror crates/domain/src/eq_bounds.rs CHANNEL_VOLUME_MIN/MAX_DB
-  const VOLUME_MIN_DB = -60;
-  const VOLUME_MAX_DB = 6;
+  // Domain bounds — 0–100 percent volume (100 = unity / 0 dB).
+  const VOLUME_MIN_PCT = 0;
+  const VOLUME_MAX_PCT = 100;
 
   interface Props {
     channel: ChannelSnapshot;
@@ -90,25 +90,23 @@
   let volumeBusy = $state(false);
   let muteBusy = $state(false);
 
-  /** Format a dB value for the readout: "0.0 dB", "-60 dB", "+6.0 dB". */
-  function formatDb(db: number): string {
-    const fixed = db.toFixed(1);
-    return db > 0 ? `+${fixed} dB` : `${fixed} dB`;
+  /** Format a percent volume for the readout: "100%", "75%", "0%". */
+  function formatPct(pct: number): string {
+    return `${Math.round(pct)}%`;
   }
 
-  /** Translate slider value (number) → slider position % for the fader fill. */
-  function sliderPercent(db: number): number {
-    const pct = ((db - VOLUME_MIN_DB) / (VOLUME_MAX_DB - VOLUME_MIN_DB)) * 100;
+  /** Translate slider value (0–100 percent) → slider position % for the fader fill. */
+  function sliderPercent(pct: number): number {
     return Math.max(0, Math.min(100, pct));
   }
 
   async function handleVolumeChange(e: Event) {
     const input = e.target as HTMLInputElement;
-    const db = parseFloat(input.value);
-    if (volumeBusy || isNaN(db)) return;
+    const pct = parseInt(input.value, 10);
+    if (volumeBusy || isNaN(pct)) return;
     volumeBusy = true;
     try {
-      const newState = await setChannelVolume(channel.id, db);
+      const newState = await setChannelVolume(channel.id, pct);
       if (newState) {
         engineState.set(newState);
       }
@@ -117,7 +115,7 @@
       console.error("[ChannelStrip] setChannelVolume failed:", err);
       onError(msg);
       // Revert input to reflect actual state
-      input.value = String(channel.volume_db);
+      input.value = String(channel.volume_pct);
     } finally {
       volumeBusy = false;
     }
@@ -214,27 +212,27 @@
   <div class="volume-slot" class:volume-busy={volumeBusy}>
     <!-- Custom fader visual (decorative — mirrors the range input value) -->
     <div class="fader-track" aria-hidden="true">
-      <div class="fader-fill" style="height: {sliderPercent(channel.volume_db)}%"></div>
-      <div class="fader-thumb" style="bottom: calc({sliderPercent(channel.volume_db)}% - 8px)"></div>
+      <div class="fader-fill" style="height: {sliderPercent(channel.volume_pct)}%"></div>
+      <div class="fader-thumb" style="bottom: calc({sliderPercent(channel.volume_pct)}% - 8px)"></div>
     </div>
 
     <!-- Accessible range input (the real interactive element) -->
     <input
       class="fader-input"
       type="range"
-      min={VOLUME_MIN_DB}
-      max={VOLUME_MAX_DB}
-      step="0.5"
-      value={channel.volume_db}
+      min={VOLUME_MIN_PCT}
+      max={VOLUME_MAX_PCT}
+      step="1"
+      value={channel.volume_pct}
       disabled={volumeBusy}
-      aria-label="Volume for {channel.id.toUpperCase()} ({formatDb(channel.volume_db)})"
-      aria-valuemin={VOLUME_MIN_DB}
-      aria-valuemax={VOLUME_MAX_DB}
-      aria-valuenow={channel.volume_db}
+      aria-label="Volume for {channel.id.toUpperCase()} ({formatPct(channel.volume_pct)})"
+      aria-valuemin={VOLUME_MIN_PCT}
+      aria-valuemax={VOLUME_MAX_PCT}
+      aria-valuenow={channel.volume_pct}
       onchange={handleVolumeChange}
     />
 
-    <div class="fader-readout">{formatDb(channel.volume_db)}</div>
+    <div class="fader-readout">{formatPct(channel.volume_pct)}</div>
 
     <!-- R3b: Level meter — shows real-time signal peak via levels event.
          Note: reflects real-time signal peak (from pw-record). See meter.ts. -->

@@ -241,10 +241,10 @@ pub async fn mic_suppression_backend(
 #[tauri::command]
 pub async fn set_channel_volume(
     channel: String,
-    volume_db: f32,
+    volume_pct: u8,
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
-    call(&state, Request::SetChannelVolume { channel, volume_db }).await
+    call(&state, Request::SetChannelVolume { channel, volume_pct }).await
 }
 
 #[tauri::command]
@@ -414,10 +414,10 @@ pub async fn move_stream(
 
 #[tauri::command]
 pub async fn set_master_volume(
-    volume_db: f32,
+    volume_pct: u8,
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
-    call(&state, Request::SetMasterVolume { volume_db }).await
+    call(&state, Request::SetMasterVolume { volume_pct }).await
 }
 
 #[tauri::command]

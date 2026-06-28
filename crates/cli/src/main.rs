@@ -225,13 +225,12 @@ enum ChannelCmd {
         #[command(subcommand)]
         action: ChannelOutputAction,
     },
-    /// Set the software volume for a channel in dB (-60..+6). 0 = unity.
+    /// Set the software volume for a channel (0-100 percent). 100 = unity.
     Volume {
         /// Channel id: game | chat | media.
         channel: String,
-        /// Volume in dB, e.g. -6.0 for -6 dB.
-        #[arg(allow_negative_numbers = true)]
-        db: f32,
+        /// Volume percent, 0-100. 100 = unity (full volume).
+        pct: u8,
     },
     /// Mute or unmute a channel.
     Mute {
@@ -438,10 +437,10 @@ enum StreamsAction {
 
 #[derive(Subcommand, Debug)]
 enum MasterAction {
-    /// Set the master output volume in dB (e.g. -6.0 for -6 dB).
+    /// Set the master output volume (0-100 percent). 100 = unity.
     Volume {
-        #[arg(allow_negative_numbers = true)]
-        db: f32,
+        /// Volume percent, 0-100. 100 = unity (full volume).
+        pct: u8,
     },
     /// Mute or unmute the master output (`on` to mute, `off` to unmute).
     Mute {
@@ -1188,14 +1187,14 @@ fn main() -> ExitCode {
                     }
                 }
             },
-            ChannelCmd::Volume { channel, db } => {
+            ChannelCmd::Volume { channel, pct } => {
                 let req = daemon::Request::SetChannelVolume {
                     channel: channel.clone(),
-                    volume_db: db,
+                    volume_pct: pct,
                 };
                 match daemon::send_request(&req) {
                     Ok(resp) if resp.ok => {
-                        println!("channel '{channel}' volume set to {db} dB");
+                        println!("channel '{channel}' volume set to {pct}%");
                         ExitCode::SUCCESS
                     }
                     Ok(resp) => {
@@ -1300,7 +1299,7 @@ fn main() -> ExitCode {
         },
         Command::Master { action } => {
             let req = match action {
-                MasterAction::Volume { db } => daemon::Request::SetMasterVolume { volume_db: db },
+                MasterAction::Volume { pct } => daemon::Request::SetMasterVolume { volume_pct: pct },
                 MasterAction::Mute { state } => {
                     let muted = match state.as_str() {
                         "on" => true,
@@ -2262,13 +2261,13 @@ mod tests {
     #[test]
     fn channel_volume_set() {
         let cmd =
-            parse(&["channel", "volume", "game", "-6.0"]).expect("channel volume should parse");
+            parse(&["channel", "volume", "game", "75"]).expect("channel volume should parse");
         match cmd {
             super::Command::Channel {
-                action: super::ChannelCmd::Volume { channel, db },
+                action: super::ChannelCmd::Volume { channel, pct },
             } => {
                 assert_eq!(channel, "game");
-                assert!((db - (-6.0_f32)).abs() < 0.001, "db must be -6.0, got {db}");
+                assert_eq!(pct, 75, "pct must be 75, got {pct}");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -3013,12 +3012,12 @@ mod tests {
 
     #[test]
     fn master_volume_parses() {
-        let cmd = parse(&["master", "volume", "-6"]).expect("master volume -6 should parse");
+        let cmd = parse(&["master", "volume", "80"]).expect("master volume 80 should parse");
         assert!(matches!(
             cmd,
             super::Command::Master {
-                action: super::MasterAction::Volume { db }
-            } if db == -6.0
+                action: super::MasterAction::Volume { pct: 80 }
+            }
         ));
     }
 

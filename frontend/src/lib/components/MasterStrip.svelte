@@ -31,8 +31,8 @@
   }
 
   async function handleVolumeChange(e: Event) {
-    const db = Number((e.target as HTMLInputElement).value);
-    engineState.set(await setMasterVolume(db));
+    const pct = Number((e.target as HTMLInputElement).value);
+    engineState.set(await setMasterVolume(pct));
   }
   async function handleMuteToggle() {
     engineState.set(await setMasterMute(!mixerState.master_mute));
@@ -45,9 +45,9 @@
 
 <div class="strip master" style="--accent: var(--ss-accent-master)">
   <h3 class="strip-name">MASTER</h3>
-  <input class="vol" type="range" min="-60" max="6" step="1"
-    value={mixerState.master_volume_db} oninput={handleVolumeChange} aria-label="Master volume" />
-  <span class="vol-label">{mixerState.master_volume_db.toFixed(0)} dB</span>
+  <input class="vol" type="range" min="0" max="100" step="1"
+    value={mixerState.master_volume_pct} oninput={handleVolumeChange} aria-label="Master volume" />
+  <span class="vol-label">{mixerState.master_volume_pct}%</span>
   <button class="mute" class:on={mixerState.master_mute} onclick={handleMuteToggle}
     aria-pressed={mixerState.master_mute}>{mixerState.master_mute ? "Muted" : "Mute"}</button>
 

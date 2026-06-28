@@ -176,8 +176,8 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
-        Request::SetChannelVolume { channel, volume_db } => {
-            match engine.set_channel_volume(&channel, volume_db) {
+        Request::SetChannelVolume { channel, volume_pct } => {
+            match engine.set_channel_volume(&channel, volume_pct) {
                 Ok(()) => Response::ok_with_state(engine.state()),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -235,7 +235,7 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
-        Request::SetMasterVolume { volume_db } => match engine.set_master_volume(volume_db) {
+        Request::SetMasterVolume { volume_pct } => match engine.set_master_volume(volume_pct) {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
@@ -826,6 +826,7 @@ mod tests {
                 output_device: None,
                 eq: vec![],
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             ChannelConfig {
@@ -835,6 +836,7 @@ mod tests {
                 output_device: None,
                 eq: vec![],
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
             ChannelConfig {
@@ -844,6 +846,7 @@ mod tests {
                 output_device: None,
                 eq: vec![],
                 volume_db: 0.0,
+                volume_pct: 100,
                 muted: false,
             },
         ];
@@ -858,6 +861,7 @@ mod tests {
                     mic: MicChainConfig::default(),
                     surround: arctis_config::SurroundConfig::default(),
                     master_volume_db: 0.0,
+                    master_volume_pct: 100,
                     master_mute: false,
                     chatmix_position: 4,
                     default_sink_channel: None,
@@ -869,6 +873,7 @@ mod tests {
                     mic: MicChainConfig::default(),
                     surround: arctis_config::SurroundConfig::default(),
                     master_volume_db: 0.0,
+                    master_volume_pct: 100,
                     master_mute: false,
                     chatmix_position: 4,
                     default_sink_channel: None,
@@ -2127,7 +2132,7 @@ mod tests {
             &mut engine,
             Request::SetChannelVolume {
                 channel: "game".into(),
-                volume_db: -6.0,
+                volume_pct: 75,
             },
         );
         assert!(
@@ -2137,7 +2142,7 @@ mod tests {
         );
         let state = resp.state.unwrap();
         let game = state.channels.iter().find(|c| c.id == "game").unwrap();
-        assert_eq!(game.volume_db, -6.0, "volume_db must be updated in state");
+        assert_eq!(game.volume_pct, 75, "volume_pct must be updated in state");
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -2186,7 +2191,7 @@ mod tests {
             &mut engine,
             Request::SetChannelVolume {
                 channel: "game".into(),
-                volume_db: 99.0, // out of range
+                volume_pct: 101, // out of range (u8 can hold this; engine rejects it)
             },
         );
         assert!(!resp.ok, "out-of-range volume must return ok:false");
@@ -2447,8 +2452,10 @@ mod tests {
     /// Strategy:
     ///  - Feed `list-streams` first: it calls `runner.run("pw-dump")` → `PanicRunner`
     ///    panics → `catch_unwind` catches it → Response with ok:false, "internal error".
-    ///  - Feed `get-state` second: it reads engine state without calling the runner →
-    ///    succeeds → Response with ok:true and state.
+    ///  - Feed `get-state` second: since A2, `engine.state()` also calls
+    ///    `runner.run("pw-dump")` → `PanicRunner` panics again → also caught →
+    ///    Response with ok:false. The key property under test is that the loop itself
+    ///    does NOT unwind — it serves both requests and returns `Ok(false)` at EOF.
     ///  - `serve_connection` returns `Ok(false)` (EOF) — it did NOT unwind.
     #[test]
     fn serve_connection_isolates_request_panic() {
@@ -2484,26 +2491,25 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2, "expected two response lines, got {}", lines.len());
 
-        // First response: caught panic → ok:false with "internal error" in message.
-        let err_resp: Response = serde_json::from_slice(lines[0]).unwrap();
-        assert!(!err_resp.ok, "panicking request must produce ok:false");
-        assert!(
-            err_resp
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("internal error"),
-            "error must contain 'internal error': {:?}",
-            err_resp.error
-        );
-
-        // Second response: daemon kept serving → ok:true with state present.
-        let ok_resp: Response = serde_json::from_slice(lines[1]).unwrap();
-        assert!(ok_resp.ok, "subsequent get-state must return ok:true");
-        assert!(
-            ok_resp.state.is_some(),
-            "state must be present in second response"
-        );
+        // Both responses must have ok:false (PanicRunner panics on every runner call,
+        // including the pw-dump call that engine.state() makes since A2).
+        // The key assertion is that BOTH panics were caught — serve_connection did not
+        // unwind, and produced a response for each request.
+        for (i, line) in lines.iter().enumerate() {
+            let resp: Response = serde_json::from_slice(line).unwrap();
+            assert!(
+                !resp.ok,
+                "response {i} must be ok:false (PanicRunner panics on every runner call)"
+            );
+            assert!(
+                resp.error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("internal error"),
+                "response {i} error must contain 'internal error': {:?}",
+                resp.error
+            );
+        }
     }
 
     // ── Task 7: socket_is_live tests ────────────────────────────────────────

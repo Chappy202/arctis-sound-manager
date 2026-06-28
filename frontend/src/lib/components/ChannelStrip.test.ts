@@ -8,7 +8,7 @@ const mkChannel = (output_device: string | null): ChannelSnapshot => ({
   node_name: "Arctis_Game",
   output_device,
   eq_bands: [],
-  volume_db: 0,
+  volume_pct: 100,
   muted: false,
 });
 

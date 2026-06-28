@@ -125,10 +125,10 @@ pub enum Request {
     },
     /// Return the current surround snapshot (EngineState.surround).
     SurroundStatus,
-    /// Set the software volume (dB) for a single channel. Range: -60..=+6.
+    /// Set the software volume (percent 0–100) for a single channel.
     SetChannelVolume {
         channel: String,
-        volume_db: f32,
+        volume_pct: u8,
     },
     /// Set the mute state for a single channel.
     SetChannelMute {
@@ -200,8 +200,8 @@ pub enum Request {
         stream: String,
         channel: String,
     },
-    /// Set the master output volume (dB). Same range as channel volumes.
-    SetMasterVolume { volume_db: f32 },
+    /// Set the master output volume (percent 0–100). 100 = unity.
+    SetMasterVolume { volume_pct: u8 },
     /// Set the master output mute state.
     SetMasterMute { muted: bool },
     /// Set the ChatMix position (0=chat .. 9=game).
@@ -1371,9 +1371,10 @@ mod tests {
 
     #[test]
     fn request_set_master_volume_round_trips() {
-        let req = Request::SetMasterVolume { volume_db: -6.0 };
+        let req = Request::SetMasterVolume { volume_pct: 80 };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("set-master-volume"), "{json}");
+        assert!(json.contains("volume_pct"), "wire field must be volume_pct, got: {json}");
         assert_eq!(req, serde_json::from_str::<Request>(&json).unwrap());
     }
 
@@ -1398,14 +1399,14 @@ mod tests {
     #[test]
     fn parse_set_channel_volume_wire_tag() {
         let req: Request = serde_json::from_str(
-            r#"{"cmd":"set-channel-volume","channel":"game","volume_db":-6.0}"#,
+            r#"{"cmd":"set-channel-volume","channel":"game","volume_pct":75}"#,
         )
         .unwrap();
         assert_eq!(
             req,
             Request::SetChannelVolume {
                 channel: "game".into(),
-                volume_db: -6.0,
+                volume_pct: 75,
             }
         );
     }
@@ -1428,12 +1429,16 @@ mod tests {
     fn request_set_channel_volume_round_trips() {
         let req = Request::SetChannelVolume {
             channel: "game".into(),
-            volume_db: -6.0,
+            volume_pct: 75,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
             json.contains("set-channel-volume"),
             "cmd tag must be set-channel-volume, got: {json}"
+        );
+        assert!(
+            json.contains("volume_pct"),
+            "wire field must be volume_pct, got: {json}"
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);

@@ -147,35 +147,35 @@ describe("buildDeviceSetArgs", () => {
 // buildSetChannelVolumeArgs
 // ---------------------------------------------------------------------------
 describe("buildSetChannelVolumeArgs", () => {
-  it("maps volume_db to volumeDb (camelCase for Tauri v2)", () => {
-    const args = buildSetChannelVolumeArgs("game", -6.0);
-    expect(args).toEqual({ channel: "game", volumeDb: -6.0 });
+  it("maps volume_pct to volumePct (camelCase for Tauri v2)", () => {
+    const args = buildSetChannelVolumeArgs("game", 75);
+    expect(args).toEqual({ channel: "game", volumePct: 75 });
   });
 
-  it("uses camelCase volumeDb key (not snake_case)", () => {
-    const args = buildSetChannelVolumeArgs("chat", 0.0);
-    expect(Object.keys(args)).toContain("volumeDb");
-    expect(Object.keys(args)).not.toContain("volume_db");
+  it("uses camelCase volumePct key (not snake_case)", () => {
+    const args = buildSetChannelVolumeArgs("chat", 100);
+    expect(Object.keys(args)).toContain("volumePct");
+    expect(Object.keys(args)).not.toContain("volume_pct");
   });
 
-  it("produces exactly two keys: channel and volumeDb", () => {
-    const args = buildSetChannelVolumeArgs("media", 6.0);
-    expect(Object.keys(args).sort()).toEqual(["channel", "volumeDb"]);
+  it("produces exactly two keys: channel and volumePct", () => {
+    const args = buildSetChannelVolumeArgs("media", 50);
+    expect(Object.keys(args).sort()).toEqual(["channel", "volumePct"]);
   });
 
-  it("accepts min boundary -60 dB", () => {
-    const args = buildSetChannelVolumeArgs("game", -60.0);
-    expect(args.volumeDb).toBe(-60.0);
+  it("accepts min boundary 0%", () => {
+    const args = buildSetChannelVolumeArgs("game", 0);
+    expect(args.volumePct).toBe(0);
   });
 
-  it("accepts max boundary +6 dB", () => {
-    const args = buildSetChannelVolumeArgs("game", 6.0);
-    expect(args.volumeDb).toBe(6.0);
+  it("accepts max boundary 100%", () => {
+    const args = buildSetChannelVolumeArgs("game", 100);
+    expect(args.volumePct).toBe(100);
   });
 
-  it("accepts fractional dB values", () => {
-    const args = buildSetChannelVolumeArgs("chat", -3.5);
-    expect(args.volumeDb).toBeCloseTo(-3.5);
+  it("accepts mid-range percent values", () => {
+    const args = buildSetChannelVolumeArgs("chat", 50);
+    expect(args.volumePct).toBe(50);
   });
 });
 
@@ -343,7 +343,7 @@ describe("EngineState shape (runtime guard)", () => {
     expect(typeof snapshot.device_fields).toBe("object");
   });
 
-  it("accepts a snapshot with populated channels including eq_bands, volume_db, muted", () => {
+  it("accepts a snapshot with populated channels including eq_bands, volume_pct, muted", () => {
     const snapshot = {
       active_profile: "Gaming",
       profiles: ["Default", "Gaming"],
@@ -355,7 +355,7 @@ describe("EngineState shape (runtime guard)", () => {
           eq_bands: [
             { kind: "peaking", freq_hz: 1000, q: 1.4, gain_db: 3.0 },
           ],
-          volume_db: -6.0,
+          volume_pct: 75,
           muted: false,
         },
       ],
@@ -370,7 +370,7 @@ describe("EngineState shape (runtime guard)", () => {
     expect(ch.eq_bands).toHaveLength(1);
     expect(ch.eq_bands[0].freq_hz).toBe(1000);
     expect(ch.eq_bands[0].gain_db).toBe(3.0);
-    expect(ch.volume_db).toBe(-6.0);
+    expect(ch.volume_pct).toBe(75);
     expect(ch.muted).toBe(false);
 
     expect(snapshot.routes[0]).toEqual(["discord", "chat"]);

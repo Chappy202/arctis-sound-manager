@@ -3803,6 +3803,10 @@ mod tests {
     fn set_channel_volume_pct_emits_correct_wpctl_argv() {
         // TDD A2: set_channel_volume must call wpctl set-volume <node_id> <pct/100>
         // ls_all_present() maps Arctis_Game → id "10"
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_vol_pct_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
         let cfg = make_config_no_eq_no_routes();
         let ls = ls_all_present();
         let runner = MockRunner::new()
@@ -3823,6 +3827,9 @@ mod tests {
             vec!["wpctl", "set-volume", "10", "0.5000"],
             "second call must be wpctl set-volume <id> 0.5000"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]
