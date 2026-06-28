@@ -19,6 +19,7 @@
   import EqGraph from "./EqGraph.svelte";
   import EqBandPanel from "./EqBandPanel.svelte";
   import BandList from "./BandList.svelte";
+  import Slider from "../ui/Slider.svelte";
 
   // ---------------------------------------------------------------------------
   // Channel selection
@@ -76,6 +77,68 @@
       catch (e) { console.warn("[EqPage] flatten band failed:", e); }
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // Tone controls — Bass / Treble amplifiers (curved, non-binding)
+  //
+  // Each slider is a relative amplifier: moving it applies a *weighted delta* to
+  // the low (31/62/125 Hz) or high (4k/8k/16k) points, shaped as a curve — the
+  // outermost frequency lifts most and it tapers inward. The points keep moving
+  // up/down by that delta, but they are NEVER re-levelled or read back, so each
+  // dot stays independently draggable afterward (no binding). The slider holds
+  // its own position per channel; sliding back to 0 removes the boost it added.
+  // ---------------------------------------------------------------------------
+
+  const TONE_MIN_DB = -12;
+  const TONE_MAX_DB = 12;
+  const BASS_INDICES = [0, 1, 2]; // 31 / 62 / 125 Hz
+  const TREBLE_INDICES = [7, 8, 9]; // 4k / 8k / 16k Hz
+  // Curve weights: most lift on the outer frequency, tapering toward the middle.
+  const BASS_WEIGHTS = [1.0, 0.66, 0.33]; // 31 Hz lifts most → curve from the left
+  const TREBLE_WEIGHTS = [0.33, 0.66, 1.0]; // 16 kHz lifts most → curve from the right
+
+  // Slider position per channel (the amplifier's own state — independent of the
+  // dots, so manual band edits never move it and it never re-levels the bands).
+  let bassTiltByCh = $state<Record<string, number>>({});
+  let trebleTiltByCh = $state<Record<string, number>>({});
+  const bassTilt = $derived(bassTiltByCh[channelId] ?? 0);
+  const trebleTilt = $derived(trebleTiltByCh[channelId] ?? 0);
+
+  const clampGain = (g: number) => Math.max(TONE_MIN_DB, Math.min(TONE_MAX_DB, g));
+
+  /**
+   * Apply a tone amplifier move. Computes the delta from the slider's previous
+   * position and adds `delta * weight[i]` to each target band (a curve), without
+   * ever forcing them equal. `commit=false` is the live, IPC-free drag path;
+   * `commit=true` flushes each affected band on release.
+   */
+  function applyTone(which: "bass" | "treble", newVal: number, commit: boolean) {
+    if (!channelId || bands.length === 0) return;
+    const isBass = which === "bass";
+    const prev = isBass ? bassTilt : trebleTilt;
+    const delta = newVal - prev;
+    if (isBass) bassTiltByCh = { ...bassTiltByCh, [channelId]: newVal };
+    else trebleTiltByCh = { ...trebleTiltByCh, [channelId]: newVal };
+
+    const indices = isBass ? BASS_INDICES : TREBLE_INDICES;
+    const weights = isBass ? BASS_WEIGHTS : TREBLE_WEIGHTS;
+    if (delta !== 0) {
+      pulseEditing();
+      bands = bands.map((b, i) => {
+        const pos = indices.indexOf(i);
+        return pos === -1 ? b : { ...b, gainDb: clampGain(b.gainDb + delta * weights[pos]) };
+      });
+    }
+    if (commit) {
+      for (const i of indices) {
+        if (i < bands.length) flushBand(i, bands[i]);
+      }
+    }
+  }
+  const setToneLive = (which: "bass" | "treble", v: number) => applyTone(which, v, false);
+  const commitTone = (which: "bass" | "treble", v: number) => applyTone(which, v, true);
+
+  const fmtDb = (db: number) => `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
 
   // ---------------------------------------------------------------------------
   // Derived state
@@ -247,6 +310,48 @@
     </div>
   </div>
 
+  <!-- ===== Lower row: Tone + Presets (side-by-side on wide screens) ===== -->
+  <div class="eq-lower-row">
+  <!-- ===== Tone (quick Bass / Treble shelves) ===== -->
+  <div class="tone-card">
+    <div class="card-header">
+      <h2 class="card-title">TONE</h2>
+      <span class="tone-hint">Bass lifts 31–125 Hz · Treble lifts 4–16 kHz</span>
+    </div>
+    <div class="tone-row">
+      <div class="tone-control">
+        <div class="tone-label-row">
+          <span class="tone-label">Bass</span>
+          <span class="tone-readout">{fmtDb(bassTilt)}</span>
+        </div>
+        <Slider
+          value={bassTilt}
+          min={TONE_MIN_DB}
+          max={TONE_MAX_DB}
+          step={0.5}
+          onValueChange={(v) => setToneLive("bass", v)}
+          onValueCommit={(v) => commitTone("bass", v)}
+          ariaLabel="Bass amplifier for {currentChannelLabel}"
+        />
+      </div>
+      <div class="tone-control">
+        <div class="tone-label-row">
+          <span class="tone-label">Treble</span>
+          <span class="tone-readout">{fmtDb(trebleTilt)}</span>
+        </div>
+        <Slider
+          value={trebleTilt}
+          min={TONE_MIN_DB}
+          max={TONE_MAX_DB}
+          step={0.5}
+          onValueChange={(v) => setToneLive("treble", v)}
+          onValueCommit={(v) => commitTone("treble", v)}
+          ariaLabel="Treble amplifier for {currentChannelLabel}"
+        />
+      </div>
+    </div>
+  </div>
+
   <!-- ===== EQ Presets ===== -->
   <div class="preset-card">
     <div class="card-header">
@@ -365,15 +470,18 @@
       {/if}
     </div>
   </div>
+  </div>
 </div>
 
 <style>
   .eq-page {
     display: flex;
     flex-direction: column;
-    gap: var(--ss-space-4);
-    height: 100%;
-    min-height: 0;
+    gap: var(--ss-space-5);
+    /* min-height (not height) lets the column grow past the viewport so the
+       AppShell .content-area scroll engages, instead of force-collapsing the
+       canvas card and letting its min-height graph overlap the cards below. */
+    min-height: 100%;
   }
 
   /* ===== Page header ===== */
@@ -499,6 +607,8 @@
     flex-direction: column;
     gap: var(--ss-space-2);
     min-height: 0;
+    /* Defense-in-depth: a collapsed card can never visually bleed over siblings. */
+    overflow: hidden;
   }
 
   .canvas-area {
@@ -528,8 +638,22 @@
   /* ===== Band detail row ===== */
   .eq-detail-row {
     display: flex;
-    gap: var(--ss-space-4);
+    gap: var(--ss-space-5);
     flex-wrap: wrap;
+  }
+
+  /* ===== Lower row: Tone + Presets side-by-side, stacking when narrow ===== */
+  .eq-lower-row {
+    display: flex;
+    gap: var(--ss-space-5);
+    flex-wrap: wrap;
+    align-items: flex-start;
+  }
+
+  .eq-lower-row > .tone-card,
+  .eq-lower-row > .preset-card {
+    flex: 1 1 340px;
+    min-width: 0;
   }
 
   /* ===== Band list card ===== */
@@ -604,6 +728,57 @@
   .flatten-btn:focus-visible {
     outline: 2px solid var(--ss-accent);
     outline-offset: 1px;
+  }
+
+  /* ===== Tone card ===== */
+  .tone-card {
+    background: var(--ss-surface-1);
+    border: 1px solid var(--ss-border);
+    border-radius: var(--ss-radius-md);
+    padding: var(--ss-space-4) var(--ss-space-4) var(--ss-space-3);
+    box-shadow: var(--ss-e1);
+    flex-shrink: 0;
+  }
+
+  .tone-hint {
+    margin-left: auto;
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-tertiary);
+  }
+
+  .tone-row {
+    display: flex;
+    gap: var(--ss-space-5);
+    flex-wrap: wrap;
+  }
+
+  .tone-control {
+    flex: 1;
+    min-width: 200px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--ss-space-2);
+  }
+
+  .tone-label-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--ss-space-2);
+  }
+
+  .tone-label {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-body-size);
+    color: var(--ss-text-secondary);
+  }
+
+  .tone-readout {
+    font-family: var(--ss-font-mono);
+    font-size: var(--ss-type-caption-size);
+    font-variant-numeric: tabular-nums;
+    color: var(--ss-text-tertiary);
   }
 
   /* ===== Preset card ===== */

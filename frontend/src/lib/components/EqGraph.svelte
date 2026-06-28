@@ -32,7 +32,9 @@
   ];
   const FREQ_LABELS = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
   const GAIN_LABELS = [-12, -6, 0, 6, 12];
-  const CURVE_SAMPLES = 240;
+  // 160 samples is visually indistinguishable from 240 at this width while
+  // cutting per-recompute biquad math by a third (matters during drags).
+  const CURVE_SAMPLES = 160;
   const freqAxis = logFreqAxis(CURVE_SAMPLES);
 
   // Throttled flush during drag.
@@ -218,6 +220,9 @@
   .hit:active { cursor: grabbing; }
   .hit:focus-visible { outline: none; }
   .handle:focus-within .dot, .handle.selected .dot { stroke: #fff; stroke-width: 2; }
-  .dot { stroke: rgba(255,255,255,0.6); stroke-width: 1.5; }
+  /* The visible dot is painted on top of the transparent .hit target; without
+     this it would swallow pointer events over its centre, leaving only the ring
+     around it grabbable. pointer-events:none lets the full r=18 hit target win. */
+  .dot { stroke: rgba(255,255,255,0.6); stroke-width: 1.5; pointer-events: none; }
   .dot-num { fill: #fff; font: bold 9px var(--ss-font-mono, monospace); text-anchor: middle; pointer-events: none; }
 </style>
