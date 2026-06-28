@@ -33,8 +33,7 @@
     backendAvailable,
   } from "../mic.js";
   import { findMicPresetDescription } from "./micPresetUtils.js";
-  import EqGraph from "./EqGraph.svelte";
-  import BandList from "./BandList.svelte";
+  import EqEditor from "./EqEditor.svelte";
   import LevelMeter from "./LevelMeter.svelte";
   import { type Band } from "../eq.js";
   import Switch from "../ui/Switch.svelte";
@@ -466,7 +465,7 @@
     <h2 class="section-label">Processing chain</h2>
 
     <!-- Stage cards — dimmed when master is off -->
-    <div class="controls-layout" class:controls-layout--dimmed={!masterEnabled} inert={!masterEnabled || undefined}>
+    <div class="stage-columns" class:controls-layout--dimmed={!masterEnabled} inert={!masterEnabled || undefined}>
 
       <!-- ─── GAIN card ─────────────────────────────────────────────────── -->
       {#if gainStage}
@@ -848,22 +847,13 @@
         </div>
         {#if micEqBands.length > 0}
           <div class="card-body mic-eq-body">
-            <div class="mic-eq-graph">
-              <EqGraph
-                bands={micEqBands}
-                selectedIndex={selectedBandIndex}
-                onBandChange={handleMicEqBandChange}
-                onSelect={handleSelectBand}
-                onFlush={handleMicEqFlush}
-              />
-            </div>
-            <div class="mic-eq-bands">
-              <BandList
-                bands={micEqBands}
-                selectedIndex={selectedBandIndex}
-                onSelectBand={handleSelectBand}
-              />
-            </div>
+            <EqEditor
+              bands={micEqBands}
+              selectedIndex={selectedBandIndex}
+              onBandChange={handleMicEqBandChange}
+              onSelect={handleSelectBand}
+              onFlush={handleMicEqFlush}
+            />
           </div>
         {:else}
           <div class="card-body">
@@ -992,14 +982,28 @@
     color: var(--ss-text-secondary);
   }
 
-  /* ===== Controls layout (stage cards grid) ===== */
-  .controls-layout {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-    gap: var(--ss-space-5);
-    /* Each card keeps its natural height instead of stretching to the tallest
-       in its row (which left short cards like GAIN with big empty gaps). */
-    align-items: start;
+  /* ===== Stage cards — masonry columns =====
+     The stages have very different heights (GAIN = 1 control, NOISE SUPPRESSION
+     = up to 5). A row-coupled grid leaves dead space below the short cards, so
+     we use CSS multi-column packing: each card flows to fill the columns
+     top-to-bottom with no row alignment, so there are no trailing gaps. */
+  .stage-columns {
+    column-count: 3;
+    column-gap: var(--ss-space-5);
+  }
+
+  @media (max-width: 1100px) {
+    .stage-columns { column-count: 2; }
+  }
+  @media (max-width: 720px) {
+    .stage-columns { column-count: 1; }
+  }
+
+  .stage-columns > .device-card {
+    break-inside: avoid;
+    -webkit-column-break-inside: avoid; /* WebKitGTK / Tauri webview */
+    /* column layout ignores grid gap → use margin for vertical rhythm */
+    margin-bottom: var(--ss-space-5);
   }
 
   .controls-layout--dimmed {
@@ -1314,34 +1318,10 @@
   }
 
   /* ===== Mic EQ full-width card ===== */
-  .mic-eq-card {
-    grid-column: 1 / -1;
-  }
-
+  /* Graph + band list framing now lives in the shared EqEditor component, so the
+     mic EQ and the channel EQ present identically. This card just pads it. */
   .mic-eq-body {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--ss-space-5);
     padding: var(--ss-space-4);
-    align-items: flex-start;
-  }
-
-  /* Graph: capped so it keeps a sane aspect ratio (the SVG stretches to fill,
-     so an uncapped full-width box flattens the curve). Shares the row with the
-     band list on wide screens; stacks on narrow. */
-  .mic-eq-graph {
-    flex: 1 1 440px;
-    min-width: 0;
-    max-width: 820px;
-    height: 300px;
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-sm);
-    overflow: hidden;
-  }
-
-  .mic-eq-bands {
-    flex: 1 1 240px;
-    min-width: 0;
   }
 
   /* ===== Preset picker ===== */

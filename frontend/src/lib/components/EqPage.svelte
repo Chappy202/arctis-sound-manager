@@ -16,7 +16,7 @@
   import { reconcileBands, type Band } from "../eq.js";
   import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
   import { groupPresets } from "./eqPresetUtils.js";
-  import EqGraph from "./EqGraph.svelte";
+  import EqEditor from "./EqEditor.svelte";
   import EqBandPanel from "./EqBandPanel.svelte";
   import BandList from "./BandList.svelte";
   import Slider from "../ui/Slider.svelte";
@@ -263,7 +263,7 @@
     <!-- Channel selector tabs -->
     {#if channels.length > 1}
       <div class="channel-tabs" role="tablist" aria-label="Select channel to edit">
-        {#each channels as ch}
+        {#each channels as ch (ch.id)}
           <button
             class="channel-tab"
             class:active={ch.id === channelId}
@@ -282,16 +282,16 @@
 
   <!-- ===== EQ Graph (hero) ===== -->
   <div class="eq-canvas-card">
-    <div class="canvas-area">
-      <EqGraph {channelId} {bands} selectedIndex={selectedBandIndex}
-        onBandChange={handleBandChange} onSelect={handleSelect} />
-    </div>
-    <div class="gesture-hint" aria-hidden="true">
-      <span>Drag = freq / gain</span><span class="hint-sep">·</span>
-      <span>Scroll = Q</span><span class="hint-sep">·</span>
-      <span>Dbl-click = flatten band</span><span class="hint-sep">·</span>
-      <span>Arrows = nudge · Alt+↑↓ = Q</span>
-    </div>
+    <EqEditor
+      {channelId}
+      {bands}
+      selectedIndex={selectedBandIndex}
+      onBandChange={handleBandChange}
+      onSelect={handleSelect}
+      fill
+      hints
+      bandList={false}
+    />
   </div>
 
   <!-- ===== Band detail row: list + panel ===== -->
@@ -366,7 +366,7 @@
       <div class="preset-group">
         <span class="preset-group-label">Built-in</span>
         <div class="preset-list" role="list">
-          {#each factoryPresets as preset}
+          {#each factoryPresets as preset (preset.name)}
             <div class="preset-row" role="listitem">
               <span class="preset-name" title="{preset.name} ({preset.band_count} bands)">
                 {preset.name}
@@ -393,7 +393,7 @@
       <span class="preset-group-label">Saved</span>
       {#if eqPresets.length > 0}
         <div class="preset-list" role="list">
-          {#each eqPresets as preset}
+          {#each eqPresets as preset (preset.name)}
             <div class="preset-row" role="listitem">
               <span class="preset-name" title="{preset.name} ({preset.band_count} bands)">
                 {preset.name}
@@ -609,30 +609,6 @@
     min-height: 0;
     /* Defense-in-depth: a collapsed card can never visually bleed over siblings. */
     overflow: hidden;
-  }
-
-  .canvas-area {
-    flex: 1;
-    min-height: 240px;
-    border-radius: var(--ss-radius-md);
-    overflow: hidden;
-    border: 1px solid var(--ss-border);
-    box-shadow: var(--ss-e1);
-  }
-
-  .gesture-hint {
-    display: flex;
-    align-items: center;
-    gap: var(--ss-space-2);
-    flex-wrap: wrap;
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-caption-size);
-    color: var(--ss-text-tertiary);
-    padding: 0 var(--ss-space-1);
-  }
-
-  .hint-sep {
-    color: var(--ss-border-strong);
   }
 
   /* ===== Band detail row ===== */
