@@ -15,6 +15,13 @@
 
   let { mixerState, unrouted, onClearStream, onError = () => {} }: Props = $props();
 
+  // When the headset's physical volume knob is present + configured to drive the master,
+  // it owns the master volume (read-only via the [0x07,0x25] HID frame — no write opcode).
+  // The slider then mirrors the knob and is non-interactive ("synced"), mirroring ChatMix.
+  const knobControlsMaster = $derived(
+    mixerState.device_present && mixerState.knob_controls_master,
+  );
+
   let dragOver = $state(false);
 
   function handleDragOver(e: DragEvent) {
@@ -82,9 +89,13 @@
       accent="var(--ss-accent-master)"
       label="Master volume"
       oncommit={handleMasterVolumeCommit}
+      disabled={knobControlsMaster}
       {onError}
     />
   </div>
+  {#if knobControlsMaster}
+    <span class="knob-hint">Synced to headset knob</span>
+  {/if}
 
   <!-- ===== Mute button ===== -->
   <button
@@ -151,6 +162,12 @@
   .volume-area {
     display: flex; flex-direction: row; align-items: stretch; justify-content: center;
     gap: var(--ss-space-2); flex: 1; min-height: 120px;
+  }
+
+  .knob-hint {
+    display: block; text-align: center;
+    font-family: var(--ss-font-ui); font-size: var(--ss-type-caption-size);
+    color: var(--ss-text-tertiary); margin-top: var(--ss-space-1);
   }
 
   /* ===== Mute button ===== */
