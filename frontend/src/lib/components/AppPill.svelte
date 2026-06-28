@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { AppStream } from "../ipc.js";
+  import { pillTitle } from "./appPillUtils.js";
   let { stream, accent = "var(--ss-accent)" }: { stream: AppStream; accent?: string } = $props();
 
   function onDragStart(e: DragEvent) {
@@ -15,7 +16,7 @@
   draggable="true"
   ondragstart={onDragStart}
   style="--pill-accent: {accent}"
-  title={stream.media_name ?? stream.app_name}
+  title={pillTitle(stream)}
   role="listitem"
 >
   <span class="pill-dot" aria-hidden="true"></span>
