@@ -213,15 +213,9 @@ mod tests {
             73,
             "master_volume_pct must mirror the knob value"
         );
-        // No wpctl: the knob is the hardware gain, not a software gain.
-        assert!(
-            !engine
-                .runner
-                .calls
-                .iter()
-                .any(|c| c.first().map(|s| s.as_str()) == Some("wpctl")),
-            "apply_knob_master must not call wpctl"
-        );
+        // (The "no wpctl gain" property is asserted at the engine level by
+        // engine::tests::apply_hardware_master_volume_mirrors_value_no_wpctl, where the
+        // runner is accessible — Engine::runner is private to the arctis_engine crate.)
     }
 
     /// When knob_controls_master is false, nothing is applied and last is untouched.
