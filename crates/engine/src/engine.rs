@@ -75,6 +75,14 @@ pub fn plan_reconcile(cfg: &Config) -> Result<Vec<ReconcileStep>, EngineError> {
 /// Full attenuation applied to the losing side of the ChatMix dial (dB).
 const CHATMIX_FULL_ATTEN_DB: f32 = -40.0;
 
+/// How long a `pw-dump` snapshot taken for the live volume read in `state()`
+/// stays reusable. Bounds the subprocess rate to at most one per window even
+/// when the GUI commits volume at its ~80 ms drag throttle. Kept under the
+/// 2 s GUI state-poll interval so each poll still re-reads fresh, and the
+/// VolumeSlider's reconcile-guard ignores incoming volume mid-drag, so the
+/// bounded staleness is not user-visible.
+const VOLUME_DUMP_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Map a ChatMix position 0..=9 to (game_db, chat_db) attenuations.
 /// center = 4.5 is the true midpoint of the 0..=9 range and matches the hardware
 /// Nova Pro dial mapping in `crates/cli/src/dial.rs`, so the GUI ChatMix slider and
@@ -118,6 +126,9 @@ pub struct Engine<R: CommandRunner> {
     /// Used by apply_surround to restore channels removed from the surround list (C1)
     /// and channels whose output_device is None when surround is disabled (C2).
     surround_routed: std::collections::HashSet<String>,
+    /// Cached `pw-dump` stdout for the live volume read in `state()`, with the instant it was taken.
+    /// `None` means no cache exists. Invalidated by TTL expiry only (not on volume writes).
+    volume_dump_cache: Option<(std::time::Instant, String)>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -137,6 +148,7 @@ impl<R: CommandRunner> Engine<R> {
             builtin_noisegate: false,
             pw_version: None,
             surround_routed: std::collections::HashSet::new(),
+            volume_dump_cache: None,
         }
     }
 
@@ -158,6 +170,7 @@ impl<R: CommandRunner> Engine<R> {
             builtin_noisegate: false,
             pw_version: None,
             surround_routed: std::collections::HashSet::new(),
+            volume_dump_cache: None,
         }
     }
 
@@ -167,6 +180,13 @@ impl<R: CommandRunner> Engine<R> {
     pub fn seed_pw_version(&mut self, version: (u32, u32, u32)) {
         self.pw_version = Some(version);
         self.builtin_noisegate = supports_builtin_noisegate(version);
+    }
+
+    /// Clear the `pw-dump` volume cache so the next `state()` call forces a fresh subprocess.
+    /// For tests only — avoids sleeping to expire the TTL.
+    #[cfg(test)]
+    pub fn expire_volume_cache(&mut self) {
+        self.volume_dump_cache = None;
     }
 
     /// Query (once) and cache the PipeWire version. Sets `builtin_noisegate` based on version.
@@ -232,6 +252,26 @@ impl<R: CommandRunner> Engine<R> {
         }
     }
 
+    /// Live `pw-dump` stdout for the volume read, cached for `VOLUME_DUMP_TTL`.
+    /// On a fresh cache miss runs `pw-dump`; empties to `""` on failure (callers
+    /// fall back to config `volume_pct`). Reuses the cached value within the TTL.
+    fn volume_dump(&mut self) -> String {
+        if let Some((taken, json)) = &self.volume_dump_cache {
+            if taken.elapsed() < VOLUME_DUMP_TTL {
+                return json.clone();
+            }
+        }
+        let json = self
+            .runner
+            .run("pw-dump", &[])
+            .ok()
+            .filter(|o| o.status == 0)
+            .map(|o| o.stdout.clone())
+            .unwrap_or_default();
+        self.volume_dump_cache = Some((std::time::Instant::now(), json.clone()));
+        json
+    }
+
     /// Return a flat UI-agnostic snapshot of the current engine state.
     pub fn state(&mut self) -> crate::state::EngineState {
         use crate::state::{
@@ -239,14 +279,9 @@ impl<R: CommandRunner> Engine<R> {
             MicStageSnapshot, StageName, SuppressionBackend,
         };
         // Best-effort live volume read from pw-dump (completes before any config borrow).
+        // Uses a short TTL cache to bound the subprocess rate on the hot path (e.g. drag commits).
         // On failure or empty output, falls back to persisted config values per channel.
-        let pw_dump_json: String = self
-            .runner
-            .run("pw-dump", &[])
-            .ok()
-            .filter(|o| o.status == 0)
-            .map(|o| o.stdout.clone())
-            .unwrap_or_default();
+        let pw_dump_json = self.volume_dump();
 
         let active = self.config.active().ok();
         let channels = active
@@ -3849,6 +3884,67 @@ mod tests {
         assert_eq!(
             game.volume_pct, 50,
             "state() must report live volume_pct 50 from pw-dump, not config value 80"
+        );
+    }
+
+    #[test]
+    fn state_volume_dump_cached_within_ttl() {
+        // TDD A4: two back-to-back state() calls within the TTL must share one pw-dump subprocess.
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].channels[0].volume_pct = 80;
+        let pw_dump = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+        );
+        // Queue only ONE pw-dump output; if state() calls pw-dump twice, the second
+        // call returns an empty response and volume_pct would diverge.
+        let runner = MockRunner::new().with_output(0, pw_dump, ""); // [0] pw-dump (only one queued)
+        let mut engine = Engine::new(runner, cfg);
+
+        let state1 = engine.state();
+        let state2 = engine.state(); // must hit the cache, not spawn a second pw-dump
+
+        let game1 = state1.channels.iter().find(|c| c.id == "game").unwrap();
+        let game2 = state2.channels.iter().find(|c| c.id == "game").unwrap();
+        assert_eq!(
+            game1.volume_pct, 50,
+            "first state() must report live volume_pct 50 from pw-dump"
+        );
+        assert_eq!(
+            game2.volume_pct, game1.volume_pct,
+            "second state() must return same volume_pct as first (cache hit)"
+        );
+
+        let pw_dump_calls = engine.runner.calls.iter().filter(|c| c[0] == "pw-dump").count();
+        assert_eq!(
+            pw_dump_calls, 1,
+            "exactly one pw-dump must be spawned for two back-to-back state() calls within TTL; got {pw_dump_calls}"
+        );
+    }
+
+    #[test]
+    fn state_volume_dump_re_reads_after_cache_cleared() {
+        // TDD A4: after expire_volume_cache(), state() must spawn a fresh pw-dump subprocess.
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].channels[0].volume_pct = 80;
+        let pw_dump = concat!(
+            r#"[{"type":"PipeWire:Interface:Node","id":10,"info":{"props":{"node.name":"Arctis_Game"},"#,
+            r#""params":{"Props":[{"channelVolumes":[0.5,0.5],"mute":false}]}}}]"#
+        );
+        // Queue two pw-dump outputs: one for the first state(), one for after cache expiry.
+        let runner = MockRunner::new()
+            .with_output(0, pw_dump, "") // [0] first pw-dump
+            .with_output(0, pw_dump, ""); // [1] second pw-dump after cache cleared
+        let mut engine = Engine::new(runner, cfg);
+
+        let _state1 = engine.state(); // consumes queued output [0]
+        engine.expire_volume_cache(); // force cache miss
+        let _state2 = engine.state(); // must spawn a new pw-dump, consuming output [1]
+
+        let pw_dump_calls = engine.runner.calls.iter().filter(|c| c[0] == "pw-dump").count();
+        assert_eq!(
+            pw_dump_calls, 2,
+            "two pw-dump calls expected (one per state() after cache cleared); got {pw_dump_calls}"
         );
     }
 
