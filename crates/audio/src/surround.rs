@@ -361,6 +361,214 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
     Ok(out)
 }
 
+/// Render the full standalone `pipewire -c` conf for a stereo-bypass
+/// filter-chain sink.
+///
+/// This is the fallback used when a game outputs only stereo (no upmix through
+/// the HRIR convolver). The graph passes stereo L/R through, optionally applies
+/// crossfeed, and optionally applies a per-ear output EQ.
+///
+/// # Crossfeed
+///
+/// `crossfeed` is a percentage [0, 100]. When 0, the path is pure passthrough
+/// (two `copy` nodes). When > 0, two `mixer` nodes blend a fraction of the
+/// opposite channel into each ear:
+///
+///     `cf = (crossfeed as f32 / 100.0) * 0.5`
+///
+/// Maximum crossfeed (100) gives `cf = 0.5`, which avoids clipping while still
+/// providing significant blending.
+///
+/// The PipeWire builtin `mixer` supports per-input gain controls `"Gain 1"` …
+/// `"Gain 8"` (verified: <https://docs.pipewire.org/page_module_filter_chain.html>).
+///
+/// # Output EQ
+///
+/// When `output_eq` is `Some`, per-ear `eq_l_{i}` / `eq_r_{i}` bq chains are
+/// inserted between the (passthrough or crossfeed-mixed) L/R signals and the
+/// 2-ch output, identical to the tail-EQ pattern in [`render_surround_conf_ex`].
+///
+/// Returns `AudioError::Invalid` if `output_eq` is `Some` and fails validation.
+pub fn render_stereo_bypass_conf(
+    spec: &SurroundSpec,
+    crossfeed: u8,
+    output_eq: Option<&EqModel>,
+) -> Result<String, AudioError> {
+    if let Some(eq) = output_eq {
+        eq.validate()?;
+    }
+
+    let rate = crate::eq::SAMPLE_RATE_HZ;
+    let desc = &spec.description;
+    let capture_node = spec.capture_node_name();
+    let playback_node = spec.playback_node_name();
+    let has_crossfeed = crossfeed > 0;
+    let cf = (crossfeed as f32 / 100.0) * 0.5;
+
+    let target_line = match &spec.hw_sink {
+        Some(sink) => format!("                target.object = \"{sink}\"\n"),
+        None => String::new(),
+    };
+
+    let mut out = String::new();
+
+    // ── preamble (identical shape to EQ / mic / surround confs) ─────────────
+    out.push_str("context.properties = {\n");
+    out.push_str(&format!("    default.clock.rate = {rate}\n"));
+    out.push_str(&format!("    default.clock.allowed-rates = [ {rate} ]\n"));
+    out.push_str("}\n");
+    out.push_str("context.spa-libs = {\n");
+    out.push_str("    audio.convert.* = audioconvert/libspa-audioconvert\n");
+    out.push_str("    support.*       = support/libspa-support\n");
+    out.push_str("}\n");
+    out.push_str("context.modules = [\n");
+    out.push_str("    {   name = libpipewire-module-rt\n");
+    out.push_str("        flags = [ ifexists nofail ]\n");
+    out.push_str("    }\n");
+    out.push_str("    {   name = libpipewire-module-protocol-native }\n");
+    out.push_str("    {   name = libpipewire-module-client-node }\n");
+    out.push_str("    {   name = libpipewire-module-adapter }\n");
+    out.push_str("    {   name = libpipewire-module-filter-chain\n");
+    out.push_str("        args = {\n");
+    out.push_str(&format!("            node.description = \"{desc}\"\n"));
+    out.push_str(&format!("            media.name       = \"{desc}\"\n"));
+    out.push_str("            filter.graph = {\n");
+
+    // ── nodes ─────────────────────────────────────────────────────────────────
+    out.push_str("                nodes = [\n");
+
+    // Stereo copy nodes (always present)
+    out.push_str("                    { type = builtin  label = copy  name = copyL }\n");
+    out.push_str("                    { type = builtin  label = copy  name = copyR }\n");
+
+    // Optional crossfeed mixer nodes.
+    // PipeWire mixer builtin: "Gain 1".."Gain 8" set per-input gain.
+    // copyL→mixL In 1 (gain 1.0), copyR→mixL In 2 (gain cf)
+    // copyR→mixR In 1 (gain 1.0), copyL→mixR In 2 (gain cf)
+    if has_crossfeed {
+        let cf_str = fmt_num(cf);
+        out.push_str(&format!(
+            "                    {{ type = builtin  label = mixer  name = mixL  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
+        ));
+        out.push_str(&format!(
+            "                    {{ type = builtin  label = mixer  name = mixR  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
+        ));
+    }
+
+    // Optional output EQ tail: per-ear bq chains (L first, then R).
+    // Identical pattern to render_surround_conf_ex.
+    if let Some(eq) = output_eq {
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_l_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_r_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+    }
+
+    out.push_str("                ]\n");
+
+    // ── links ─────────────────────────────────────────────────────────────────
+    out.push_str("                links = [\n");
+
+    if has_crossfeed {
+        // Crossfeed routing: each mixer receives its own channel + opposite channel
+        out.push_str("                    { output = \"copyL:Out\"  input = \"mixL:In 1\" }\n");
+        out.push_str("                    { output = \"copyR:Out\"  input = \"mixL:In 2\" }\n");
+        out.push_str("                    { output = \"copyR:Out\"  input = \"mixR:In 1\" }\n");
+        out.push_str("                    { output = \"copyL:Out\"  input = \"mixR:In 2\" }\n");
+    }
+
+    // EQ tail links: source (copy or mixer) → eq chain per ear
+    let left_src = if has_crossfeed { "mixL" } else { "copyL" };
+    let right_src = if has_crossfeed { "mixR" } else { "copyR" };
+
+    if let Some(eq) = output_eq {
+        let n = eq.bands.len();
+        // Left ear chain
+        out.push_str(&format!(
+            "                    {{ output = \"{left_src}:Out\"  input = \"eq_l_0:In\" }}\n"
+        ));
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_l_{prev}:Out\"  input = \"eq_l_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+        // Right ear chain
+        out.push_str(&format!(
+            "                    {{ output = \"{right_src}:Out\"  input = \"eq_r_0:In\" }}\n"
+        ));
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_r_{prev}:Out\"  input = \"eq_r_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+    }
+
+    out.push_str("                ]\n");
+
+    // inputs / outputs
+    out.push_str("                inputs  = [ \"copyL:In\" \"copyR:In\" ]\n");
+    match output_eq {
+        Some(eq) => {
+            let last = eq.bands.len() - 1;
+            out.push_str(&format!(
+                "                outputs = [ \"eq_l_{last}:Out\" \"eq_r_{last}:Out\" ]\n"
+            ));
+        }
+        None => {
+            if has_crossfeed {
+                out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
+            } else {
+                out.push_str("                outputs = [ \"copyL:Out\" \"copyR:Out\" ]\n");
+            }
+        }
+    }
+
+    out.push_str("            }\n");
+
+    // ── capture.props (2-ch stereo sink) ──────────────────────────────────────
+    out.push_str("            capture.props = {\n");
+    out.push_str(&format!(
+        "                node.name   = \"{capture_node}\"\n"
+    ));
+    out.push_str("                media.class = Audio/Sink\n");
+    out.push_str("                audio.channels = 2\n");
+    out.push_str("                audio.position = [ FL FR ]\n");
+    out.push_str("            }\n");
+
+    // ── playback.props (2-ch stereo output) ───────────────────────────────────
+    out.push_str("            playback.props = {\n");
+    out.push_str(&format!(
+        "                node.name   = \"{playback_node}\"\n"
+    ));
+    out.push_str("                node.passive = true\n");
+    out.push_str("                audio.channels = 2\n");
+    out.push_str("                audio.position = [ FL FR ]\n");
+    out.push_str(&target_line);
+    out.push_str("            }\n");
+
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("]\n");
+
+    Ok(out)
+}
+
 /// Render the full standalone `pipewire -c` conf for the 7.1→binaural HeSuVi
 /// surround filter-chain.
 ///
@@ -972,6 +1180,147 @@ id 40, type PipeWire:Interface:Node/3
         assert_eq!(
             via_wrapper, via_ex,
             "render_surround_conf must be an exact alias for render_surround_conf_ex(channels=8, eq=None)"
+        );
+    }
+
+    // ── render_stereo_bypass_conf tests ──────────────────────────────────────
+
+    /// Passthrough (crossfeed=0, no EQ): 2-channel FL/FR sink, no convolver nodes.
+    #[test]
+    fn stereo_bypass_passthrough_no_eq_is_2ch_no_convolver() {
+        let spec = test_spec();
+        let got = render_stereo_bypass_conf(&spec, 0, None).unwrap();
+
+        // No convolver nodes anywhere
+        assert!(
+            !got.contains("convolver"),
+            "passthrough must not have any convolver nodes"
+        );
+
+        // capture.props must be a 2-ch stereo Audio/Sink
+        let cap = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            cap.contains("media.class = Audio/Sink"),
+            "must be Audio/Sink"
+        );
+        assert!(
+            cap.contains("audio.channels = 2"),
+            "must have 2 channels"
+        );
+        assert!(
+            cap.contains("audio.position = [ FL FR ]"),
+            "must have stereo position"
+        );
+
+        // playback.props must also be 2-ch
+        let pb = got
+            .split("playback.props")
+            .nth(1)
+            .expect("playback.props section");
+        assert!(pb.contains("audio.channels = 2"), "playback must be 2-ch");
+        assert!(pb.contains("audio.position = [ FL FR ]"), "playback must be FL FR");
+        assert!(pb.contains("target.object = \"hwsink\""), "target must be set");
+
+        // Passthrough outputs come directly from copy nodes
+        assert!(
+            got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
+            "passthrough outputs must come from copy nodes"
+        );
+    }
+
+    /// crossfeed=0 with a 1-band EQ: eq_l_0/eq_r_0 nodes present, outputs from them.
+    #[test]
+    fn stereo_bypass_with_eq_applies_tail() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 500.0, 1.0, 0.0)],
+        };
+        let got = render_stereo_bypass_conf(&spec, 0, Some(&eq)).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // EQ nodes are present
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+        assert!(
+            !got.contains("\"eq_l_1\""),
+            "single-band chain must not have eq_l_1"
+        );
+        assert!(
+            !got.contains("\"eq_r_1\""),
+            "single-band chain must not have eq_r_1"
+        );
+
+        // copyL/R link directly into the EQ tail (no mixer in the path)
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"eq_l_0:In\""),
+            "copyL must link to eq_l_0"
+        );
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"eq_r_0:In\""),
+            "copyR must link to eq_r_0"
+        );
+
+        // Outputs come from the EQ nodes, not directly from copy
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "outputs must reference eq_l_0/eq_r_0"
+        );
+        assert!(
+            !got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
+            "copy outputs must not appear when EQ is present"
+        );
+    }
+
+    /// crossfeed=50 → cf=0.25: mixer nodes with correct gains, cross-links correct.
+    #[test]
+    fn stereo_bypass_crossfeed_blends_opposite_channel() {
+        let spec = test_spec();
+        // cf = (50 / 100) * 0.5 = 0.25
+        let got = render_stereo_bypass_conf(&spec, 50, None).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // Mixer nodes are present
+        assert!(got.contains("name = mixL"), "must have mixL node");
+        assert!(got.contains("name = mixR"), "must have mixR node");
+
+        // Per-input gain controls: Gain 1 = 1.0 (direct), Gain 2 = 0.25 (cross)
+        assert!(
+            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
+            "mixer must have Gain 1=1.0 and Gain 2=0.25 for crossfeed=50"
+        );
+
+        // Direct links: each channel's own copy to its mixer's In 1
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"mixL:In 1\""),
+            "copyL must feed mixL In 1 (direct)"
+        );
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"mixR:In 1\""),
+            "copyR must feed mixR In 1 (direct)"
+        );
+
+        // Cross links: opposite channel to In 2
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"mixL:In 2\""),
+            "copyR must feed mixL In 2 (crossfeed)"
+        );
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"mixR:In 2\""),
+            "copyL must feed mixR In 2 (crossfeed)"
+        );
+
+        // Outputs come from mixers (no EQ)
+        assert!(
+            got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "crossfeed outputs must be from mixers"
         );
     }
 
