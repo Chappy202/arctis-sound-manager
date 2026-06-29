@@ -398,12 +398,15 @@ pub fn render_stereo_bypass_conf(
         eq.validate()?;
     }
 
+    if crossfeed > 100 {
+        return Err(AudioError::Invalid(format!("crossfeed must be 0..=100, got {crossfeed}")));
+    }
+
     let rate = crate::eq::SAMPLE_RATE_HZ;
     let desc = &spec.description;
     let capture_node = spec.capture_node_name();
     let playback_node = spec.playback_node_name();
     let has_crossfeed = crossfeed > 0;
-    let cf = (crossfeed as f32 / 100.0) * 0.5;
 
     let target_line = match &spec.hw_sink {
         Some(sink) => format!("                target.object = \"{sink}\"\n"),
@@ -446,6 +449,7 @@ pub fn render_stereo_bypass_conf(
     // copyL→mixL In 1 (gain 1.0), copyR→mixL In 2 (gain cf)
     // copyR→mixR In 1 (gain 1.0), copyL→mixR In 2 (gain cf)
     if has_crossfeed {
+        let cf = (crossfeed as f32 / 100.0) * 0.5;
         let cf_str = fmt_num(cf);
         out.push_str(&format!(
             "                    {{ type = builtin  label = mixer  name = mixL  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
@@ -1322,6 +1326,75 @@ id 40, type PipeWire:Interface:Node/3
             got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
             "crossfeed outputs must be from mixers"
         );
+    }
+
+    /// crossfeed=50 with a 1-band EQ: mixers are present AND EQ chain composes.
+    /// Verifies that mixL/mixR link INTO the EQ tail (not copyL/copyR).
+    #[test]
+    fn stereo_bypass_crossfeed_with_eq_composes() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 2.0)],
+        };
+        let got = render_stereo_bypass_conf(&spec, 50, Some(&eq)).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // Mixer nodes are present (for crossfeed)
+        assert!(got.contains("name = mixL"), "must have mixL node for crossfeed");
+        assert!(got.contains("name = mixR"), "must have mixR node for crossfeed");
+
+        // EQ nodes are present
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+
+        // Mixer gains set for cf=0.25 (crossfeed=50)
+        assert!(
+            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
+            "mixer must have correct crossfeed gains"
+        );
+
+        // CRITICAL: mixL and mixR link to eq_l_0 and eq_r_0 (NOT copyL/copyR)
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0 when both crossfeed and EQ are present"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0 when both crossfeed and EQ are present"
+        );
+
+        // Ensure copyL/copyR do NOT link to EQ (they go to mixer instead)
+        assert!(
+            !got.contains("output = \"copyL:Out\"  input = \"eq_l_0:In\""),
+            "copyL must NOT link to eq_l_0; it goes to mixL first"
+        );
+        assert!(
+            !got.contains("output = \"copyR:Out\"  input = \"eq_r_0:In\""),
+            "copyR must NOT link to eq_r_0; it goes to mixR first"
+        );
+
+        // Outputs come from EQ, not directly from mixer
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "outputs must reference eq_l_0/eq_r_0 when EQ is present"
+        );
+    }
+
+    /// crossfeed > 100 must return an error (out of valid range 0..=100).
+    #[test]
+    fn stereo_bypass_crossfeed_over_100_errors() {
+        let spec = test_spec();
+        let err = render_stereo_bypass_conf(&spec, 200, None).unwrap_err();
+        assert!(
+            matches!(err, AudioError::Invalid(_)),
+            "crossfeed=200 must return Invalid, got {err:?}"
+        );
+        // Verify the error message mentions the constraint
+        let msg = format!("{err:?}");
+        assert!(msg.contains("0..=100"), "error must mention valid range 0..=100");
+        assert!(msg.contains("200"), "error must mention the invalid value 200");
     }
 
     // ── SurroundBackend tests (MockRunner) ────────────────────────────────────
