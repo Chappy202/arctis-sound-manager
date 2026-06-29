@@ -6086,6 +6086,7 @@ mod tests {
                     hrir: Some(hrir_stem.into()),
                     channels: vec!["game".into(), "media".into()],
                     hw_sink: None,
+                    ..Default::default()
                 },
                 master_volume_db: 0.0,
                 master_volume_pct: 100,
@@ -6378,6 +6379,7 @@ mod tests {
             hrir: Some("aa-first".into()),
             channels: vec!["game".into()],
             hw_sink: Some("alsa_output.pci".into()),
+            ..Default::default()
         };
         let mut engine = Engine::new(MockRunner::new(), cfg);
         let s = engine.state();
@@ -6609,6 +6611,7 @@ mod tests {
             hrir: Some("test-hrir".into()),
             channels: vec!["game".into(), "media".into()],
             hw_sink: None,
+            ..Default::default()
         };
 
         // Phase 1: surround_set_enabled(true) → apply_surround(enabled):
