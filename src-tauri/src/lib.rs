@@ -35,6 +35,9 @@ pub fn run() {
             commands::surround_set_hrir,
             commands::surround_set_channels,
             commands::surround_set_hw_sink,
+            commands::list_factory_profiles,
+            commands::surround_set_output_eq,
+            commands::surround_set_blocksize,
             commands::surround_import_hrirs,
             commands::surround_fetch_hrirs,
             // A8: factory profile creation

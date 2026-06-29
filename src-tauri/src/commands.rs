@@ -1,7 +1,9 @@
 use crate::error::CommandError;
 use crate::state::{DaemonState, MeterSubscribers};
 use arctis_client::{send_request_to, Request};
-use arctis_engine::{AppStream, EngineState, OutputDeviceSnapshot};
+use arctis_engine::{
+    AppStream, EngineState, EqBandSnapshot, FactoryProfileInfo, OutputDeviceSnapshot,
+};
 use std::sync::atomic::Ordering;
 use tauri::State;
 use tokio::sync::Mutex;
@@ -61,6 +63,24 @@ async fn call_streams(
         .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
     if resp.ok {
         Ok(resp.streams.unwrap_or_default())
+    } else {
+        Err(CommandError::Daemon(
+            resp.error.unwrap_or_else(|| "unknown daemon error".into()),
+        ))
+    }
+}
+
+/// Variant of `call` for ListFactoryProfiles (returns the `factory_profiles` payload).
+async fn call_factory_profiles(
+    state: &State<'_, Mutex<DaemonState>>,
+    req: Request,
+) -> Result<Vec<FactoryProfileInfo>, CommandError> {
+    let socket = state.lock().await.socket.clone();
+    let resp = tauri::async_runtime::spawn_blocking(move || send_request_to(&socket, &req))
+        .await
+        .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))??;
+    if resp.ok {
+        Ok(resp.factory_profiles.unwrap_or_default())
     } else {
         Err(CommandError::Daemon(
             resp.error.unwrap_or_else(|| "unknown daemon error".into()),
@@ -289,6 +309,29 @@ pub async fn surround_set_hw_sink(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::SurroundSetHwSink { hw_sink }).await
+}
+
+#[tauri::command]
+pub async fn list_factory_profiles(
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<Vec<FactoryProfileInfo>, CommandError> {
+    call_factory_profiles(&state, Request::ListFactoryProfiles).await
+}
+
+#[tauri::command]
+pub async fn surround_set_output_eq(
+    bands: Vec<EqBandSnapshot>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundSetOutputEq { bands }).await
+}
+
+#[tauri::command]
+pub async fn surround_set_blocksize(
+    blocksize: Option<u32>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundSetBlocksize { blocksize }).await
 }
 
 // ── A6: HRIR import / fetch commands ─────────────────────────────────────────

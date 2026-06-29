@@ -182,6 +182,30 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ListFactoryProfiles => {
+            Response::ok_with_factory_profiles(engine.list_factory_profiles())
+        }
+        Request::SurroundSetOutputEq { bands } => {
+            let cfg_bands: Vec<EqBandConfig> = bands
+                .into_iter()
+                .map(|b| EqBandConfig {
+                    kind: b.kind,
+                    freq_hz: b.freq_hz,
+                    q: b.q,
+                    gain_db: b.gain_db,
+                })
+                .collect();
+            match engine.surround_set_output_eq(cfg_bands) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::SurroundSetBlocksize { blocksize } => {
+            match engine.surround_set_blocksize(blocksize) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::SetChannelVolume { channel, volume_pct } => {
             match engine.set_channel_volume(&channel, volume_pct) {
                 Ok(()) => Response::ok_with_state(engine.state()),
@@ -1602,6 +1626,77 @@ mod tests {
         );
         let state = resp.state.expect("state must be present");
         assert_eq!(state.surround.channels, vec!["game".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_list_factory_profiles_returns_catalog() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::ListFactoryProfiles);
+        assert!(
+            resp.ok,
+            "ListFactoryProfiles must return ok:true, got: {:?}",
+            resp.error
+        );
+        let profiles = resp
+            .factory_profiles
+            .expect("factory_profiles must be present");
+        assert!(
+            profiles.iter().any(|p| p.name == "DayZ"),
+            "catalog must include DayZ, got: {:?}",
+            profiles
+        );
+    }
+
+    #[test]
+    fn handle_surround_set_output_eq_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_oeq_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetOutputEq {
+                bands: vec![arctis_engine::EqBandSnapshot {
+                    kind: "peaking".into(),
+                    freq_hz: 250.0,
+                    q: 1.0,
+                    gain_db: 3.0,
+                }],
+            },
+        );
+        assert!(
+            resp.ok,
+            "SurroundSetOutputEq must return ok:true, got: {:?}",
+            resp.error
+        );
+        assert!(resp.state.is_some(), "state must be present");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_surround_set_blocksize_updates_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_f14_bs_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let resp = handle_request(&mut engine, Request::SurroundSetBlocksize { blocksize: Some(128) });
+        assert!(
+            resp.ok,
+            "SurroundSetBlocksize must return ok:true, got: {:?}",
+            resp.error
+        );
+        assert!(resp.state.is_some(), "state must be present");
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
