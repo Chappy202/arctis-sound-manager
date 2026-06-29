@@ -26,9 +26,12 @@
     surroundSetHwSink,
     surroundImportHrirs,
     surroundFetchHrirs,
+    surroundSetOutputEq,
     profileCreateFromFactory,
     listOutputs,
+    listFactoryProfiles,
     type OutputDeviceSnapshot,
+    type FactoryProfileInfo,
   } from "../ipc.js";
   import {
     hrirDisplayName,
@@ -37,7 +40,13 @@
     buildSinkOptions,
     sinkSelectValue,
     sinkValueToHwSink,
+    groupHrirOptionsByTonality,
+    outputEqToBands,
+    bandsToOutputEq,
+    factoryProfileLabel,
+    flatOutputEq,
   } from "../surround.js";
+  import EqEditor from "./EqEditor.svelte";
   import Switch from "../ui/Switch.svelte";
   import Select from "../ui/Select.svelte";
   import type { SelectOption } from "../ui/selectUtils.js";
@@ -68,10 +77,7 @@
       ? [{ value: "", label: "(none selected)" }]
       : []),
     ...(availableHrirEntries.length > 0
-      ? availableHrirEntries.map((e) => ({
-          value: e.stem,
-          label: e.group ? `${e.group} — ${e.display}` : e.display,
-        }))
+      ? groupHrirOptionsByTonality(availableHrirEntries)
       : availableHrirs.map((stem) => ({ value: stem, label: hrirDisplayName(stem) }))),
   ]);
 
@@ -80,12 +86,25 @@
   // ---------------------------------------------------------------------------
 
   let outputs = $state<OutputDeviceSnapshot[]>([]);
+  let factoryProfiles = $state<FactoryProfileInfo[]>([]);
 
   onMount(() => {
     listOutputs().then((o) => (outputs = o)).catch(() => {});
+    listFactoryProfiles().then((f) => (factoryProfiles = f)).catch(() => {});
   });
 
   const sinkOptions = $derived(buildSinkOptions(outputs, null));
+
+  // ---------------------------------------------------------------------------
+  // Missing-HRIR prompt + post-convolution ("spatial correction") EQ state
+  // ---------------------------------------------------------------------------
+
+  const hrirMissing = $derived(surround?.hrir_missing ?? null);
+  let missingDismissed = $state(false);
+
+  const postEqBands = $derived(outputEqToBands(surround?.output_eq ?? []));
+  let postSelected = $state(0);
+  const postEnabled = $derived((surround?.output_eq ?? []).length > 0);
 
   // ---------------------------------------------------------------------------
   // Import / fetch HRIR feedback state
@@ -153,17 +172,34 @@
     }
   }
 
-  async function onCreateDayZ() {
+  async function onCreateFactory(name: string) {
     importBusy = true;
     importMsg = null;
     try {
-      await profileCreateFromFactory("DayZ").then(applyState);
-      importMsg = "DayZ profile created.";
+      await profileCreateFromFactory(name).then(applyState);
+      importMsg = `${name} profile created.`;
     } catch (err) {
       importMsg = String(err);
     } finally {
       importBusy = false;
     }
+  }
+
+  // Update one band of the post-convolution EQ; the engine returns the new state.
+  function onPostBandChange(index: number, band: import("../eq.js").Band) {
+    const next = postEqBands.map((b, i) => (i === index ? band : b));
+    surroundSetOutputEq(bandsToOutputEq(next)).then(applyState).catch((err) => {
+      console.warn("[SpatialPage] surroundSetOutputEq failed:", err);
+    });
+  }
+
+  // Toggle the post EQ: on → seed a flat 10-band curve so the editor is usable;
+  // off → clear the curve entirely (empty output_eq = no post EQ).
+  function onPostToggle(on: boolean) {
+    const bands = on ? flatOutputEq() : [];
+    surroundSetOutputEq(bands).then(applyState).catch((err) => {
+      console.warn("[SpatialPage] surroundSetOutputEq toggle failed:", err);
+    });
   }
 </script>
 
@@ -190,6 +226,19 @@
             to enable virtual surround.
           </span>
         </div>
+      </div>
+    {/if}
+
+    <!-- ===== Pinned-HRIR-missing prompt (dismissible) ===== -->
+    {#if hrirMissing && !missingDismissed}
+      <div class="banner banner--warn" role="alert">
+        <span class="banner-icon" aria-hidden="true">◎</span>
+        <div class="banner-body">
+          <span class="banner-title">{hrirMissing} not installed</span>
+          <span class="banner-desc">A bundled fallback HRIR is in use. Import your HRIRs to use the pinned profile.</span>
+        </div>
+        <button class="ss-btn" disabled={importBusy} onclick={onImportHrirs} aria-label="Import your HRIRs">Import your HRIRs</button>
+        <button class="ss-btn ss-btn--ghost" onclick={() => (missingDismissed = true)} aria-label="Dismiss">Dismiss</button>
       </div>
     {/if}
 
@@ -221,20 +270,24 @@
             </button>
           </div>
         </div>
-        <div class="control-row">
-          <span class="field-label">FACTORY PROFILES</span>
-          <div class="hrir-actions">
-            <button
-              class="ss-btn"
-              disabled={importBusy}
-              onclick={onCreateDayZ}
-              aria-label="Create DayZ factory profile (game surround + footstep EQ)"
-              title="Creates a profile tuned for DayZ (game-channel surround + footstep EQ)."
-            >
-              {importBusy ? "Working…" : "Create DayZ profile"}
-            </button>
+        {#if factoryProfiles.length > 0}
+          <div class="control-row">
+            <span class="field-label">FACTORY PROFILES</span>
+            <div class="hrir-actions">
+              {#each factoryProfiles as fp (fp.name)}
+                <button
+                  class="ss-btn"
+                  disabled={importBusy}
+                  onclick={() => onCreateFactory(fp.name)}
+                  title={`Create the ${fp.name} factory profile (${factoryProfileLabel(fp)}).`}
+                  aria-label={`Create ${fp.name} factory profile`}
+                >
+                  {importBusy ? "Working…" : `Create ${fp.name} profile`}
+                </button>
+              {/each}
+            </div>
           </div>
-        </div>
+        {/if}
         {#if importMsg}
           <div class="field-row">
             <span class="field-label--hint hrir-msg">{importMsg}</span>
@@ -245,8 +298,8 @@
             "Import" scans <code>~/.local/share/pipewire/hrir_hesuvi/profiles/</code> for
             HeSuVi 14-channel <code>.wav</code> files. "Download" is not yet available —
             import files manually for now.
-            "Create DayZ profile" creates a ready-to-use profile with game-channel surround
-            and footstep EQ pre-configured.
+            Factory profiles create ready-to-use profiles with surround and corrective EQ
+            pre-configured for a specific use case.
           </span>
         </div>
       </div>
@@ -273,6 +326,51 @@
               onCheckedChange={onMasterToggle}
               ariaLabel="Enable virtual surround"
             />
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Spatial correction (post-convolution EQ) ===== -->
+    <div
+      class="device-card device-card--live"
+      class:controls-layout--dimmed={!masterEnabled}
+      inert={!masterEnabled || undefined}
+    >
+      <div class="card-header">
+        <span class="card-icon" aria-hidden="true">▦</span>
+        <h2 class="card-title">SPATIAL CORRECTION (POST)</h2>
+        <span class="pill {postEnabled ? 'pill--live' : 'pill--coming'}">
+          {postEnabled ? "ACTIVE" : "OFF"}
+        </span>
+      </div>
+      <div class="card-body">
+        <div class="control-row">
+          <span class="field-label">ENABLE POST EQ</span>
+          <span title="Apply a corrective EQ on the binaural (post-convolution) output">
+            <Switch
+              checked={postEnabled}
+              disabled={!masterEnabled}
+              onCheckedChange={onPostToggle}
+              ariaLabel="Enable spatial correction post EQ"
+            />
+          </span>
+        </div>
+        {#if postEnabled}
+          <div class="control-row control-row--eq">
+            <EqEditor
+              bands={postEqBands}
+              selectedIndex={postSelected}
+              onBandChange={onPostBandChange}
+              onSelect={(i) => (postSelected = i)}
+              onFlush={onPostBandChange}
+            />
+          </div>
+        {/if}
+        <div class="field-row">
+          <span class="field-label--hint">
+            A single corrective EQ applied after HRIR convolution on the binaural tail.
+            Use it to tame any tonal coloration the HRIR introduces.
           </span>
         </div>
       </div>
@@ -640,6 +738,18 @@
   .ss-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  /* Ghost variant — lower-emphasis secondary action (e.g. Dismiss). */
+  .ss-btn--ghost {
+    background: transparent;
+    color: var(--ss-text-secondary);
+  }
+
+  /* EQ editor spans the full card width instead of the label/control split. */
+  .control-row--eq {
+    display: block;
+    padding: var(--ss-space-3) var(--ss-space-4);
   }
 
   .hrir-msg {
