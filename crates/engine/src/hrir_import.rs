@@ -48,12 +48,105 @@ pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
     )))
 }
 
+/// Summary of a `import_dir` run: which files were imported and which were skipped (with reasons).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+}
+
 pub fn is_importable(info: &WavInfo) -> ImportVerdict {
     match (info.channels, info.sample_rate) {
         (14, 48000) => ImportVerdict::Ready,
         (14, _) => ImportVerdict::NeedsResample,
         (c, _) => ImportVerdict::RejectChannels(c),
     }
+}
+
+/// Copy HeSuVi 14-channel WAVs from `src` into `<base_dir>/profiles/`, resampling
+/// 44.1 kHz files via ffmpeg. Returns an `ImportReport` on success; hard failures
+/// (can't create profiles dir, can't read src dir) return `Err`.
+///
+/// Per-file problems (wrong channels, unreadable file, ffmpeg failure) are recorded
+/// as `skipped` entries — they are never returned as `Err`. Idempotent: re-importing
+/// the same stem overwrites the previous copy.
+pub fn import_dir<R: arctis_audio::CommandRunner>(
+    runner: &mut R,
+    src: &Path,
+    base_dir: &Path,
+) -> Result<ImportReport, crate::error::EngineError> {
+    let profiles = base_dir.join("profiles");
+    std::fs::create_dir_all(&profiles).map_err(|e| {
+        crate::error::EngineError::BadRequest(format!("cannot create profiles dir: {e}"))
+    })?;
+
+    let mut report = ImportReport::default();
+
+    let entries = std::fs::read_dir(src).map_err(|e| {
+        crate::error::EngineError::BadRequest(format!("cannot read import dir: {e}"))
+    })?;
+
+    for ent in entries.filter_map(|e| e.ok()) {
+        let path = ent.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("wav") {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let info = match read_wav_info(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                report.skipped.push((stem, e.to_string()));
+                continue;
+            }
+        };
+        let dst = profiles.join(format!("{stem}.wav"));
+        match is_importable(&info) {
+            ImportVerdict::Ready => {
+                std::fs::copy(&path, &dst).map_err(|e| {
+                    crate::error::EngineError::BadRequest(format!("copy failed: {e}"))
+                })?;
+                report.imported.push(stem);
+            }
+            ImportVerdict::NeedsResample => {
+                let src_str = match path.to_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        report.skipped.push((stem, "non-UTF8 source path".into()));
+                        continue;
+                    }
+                };
+                let dst_str = match dst.to_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        report.skipped.push((stem, "non-UTF8 destination path".into()));
+                        continue;
+                    }
+                };
+                let out = runner.run("ffmpeg", &["-y", "-i", &src_str, "-ar", "48000", &dst_str]);
+                match out {
+                    Ok(o) if o.status == 0 => report.imported.push(stem),
+                    Ok(o) => report.skipped.push((
+                        stem,
+                        format!("ffmpeg failed (exit {}): {}", o.status, o.stderr),
+                    )),
+                    Err(e) => report
+                        .skipped
+                        .push((stem, format!("44.1kHz and ffmpeg resample unavailable: {e}"))),
+                }
+            }
+            ImportVerdict::RejectChannels(c) => {
+                report
+                    .skipped
+                    .push((stem, format!("{c}-channel WAV is not HeSuVi 14-channel")));
+            }
+        }
+    }
+
+    report.imported.sort();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -124,6 +217,22 @@ pub(crate) mod tests {
             is_importable(&read_wav_info(&p2).unwrap()),
             ImportVerdict::RejectChannels(7)
         ));
+    }
+
+    #[test]
+    fn import_copies_ready_skips_wrong_channels() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let base = d.path().join("base");
+        // a Ready 14ch/48k and a 7ch reject
+        write_wav(&src.join("04-gsx.wav"), 14, 48000);
+        write_wav(&src.join("none.wav"), 7, 48000);
+        let mut runner = arctis_audio::MockRunner::new();
+        let report = import_dir(&mut runner, &src, &base).unwrap();
+        assert!(report.imported.contains(&"04-gsx".to_string()));
+        assert!(base.join("profiles/04-gsx.wav").exists());
+        assert!(report.skipped.iter().any(|(s, _)| s == "none"));
     }
 
     #[test]
