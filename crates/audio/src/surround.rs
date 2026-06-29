@@ -372,9 +372,7 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
 ///
 /// `crossfeed` is a percentage [0, 100]. When 0, the path is pure passthrough
 /// (two `copy` nodes). When > 0, two `mixer` nodes blend a fraction of the
-/// opposite channel into each ear:
-///
-///     `cf = (crossfeed as f32 / 100.0) * 0.5`
+/// opposite channel into each ear, with gain `cf = (crossfeed as f32 / 100.0) * 0.5`.
 ///
 /// Maximum crossfeed (100) gives `cf = 0.5`, which avoids clipping while still
 /// providing significant blending.
