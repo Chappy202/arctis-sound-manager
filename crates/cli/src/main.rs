@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "asm-cli", about = "Arctis Sound Manager CLI (read-only probe)")]
+#[command(name = "asm-cli", version, about = "Arctis Sound Manager CLI (read-only probe)")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
