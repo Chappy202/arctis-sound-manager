@@ -468,17 +468,17 @@ pub fn resolve_hrir_path(
 
                     // Fallback: lexicographically first (may not be 48 kHz).
                     // Log a warning so the mismatch is visible in the console.
-                    let fallback_lex = wavs.into_iter().next().expect("wavs is non-empty");
-                    let rate_hint = crate::hrir_import::read_wav_info(&fallback_lex)
-                        .map(|i| i.sample_rate)
-                        .unwrap_or(0);
-                    eprintln!(
-                        "asm: warning — no 48 kHz HRIR found; falling back to {} \
-                         (detected rate: {} Hz). Audio quality may be degraded.",
-                        fallback_lex.display(),
-                        rate_hint
-                    );
-                    return Ok(fallback_lex);
+                    if let Some(fallback_lex) = wavs.into_iter().next() {
+                        let rate_hint = crate::hrir_import::read_wav_info(&fallback_lex)
+                            .map(|i| i.sample_rate)
+                            .unwrap_or(0);
+                        eprintln!(
+                            "asm: warning — no 48 kHz HRIR found; falling back to {} (detected rate: {} Hz). Audio quality may be degraded.",
+                            fallback_lex.display(),
+                            rate_hint
+                        );
+                        return Ok(fallback_lex);
+                    }
                 }
             }
             // Fallback: <base_dir>/hrir.wav
