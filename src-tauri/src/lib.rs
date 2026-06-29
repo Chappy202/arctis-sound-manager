@@ -64,6 +64,12 @@ pub fn run() {
             // Level-meter subscriber gate (perf)
             commands::meter_subscribe,
             commands::meter_unsubscribe,
+            // Daemon lifecycle (Task 5)
+            commands::daemon_status,
+            commands::daemon_start,
+            commands::daemon_stop,
+            commands::daemon_restart,
+            commands::daemon_set_autostart,
         ])
         .setup(|app| {
             // ── State-poll task (every 250 ms) ──────────────────────────────

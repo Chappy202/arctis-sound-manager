@@ -3,6 +3,8 @@
 //! All orchestration goes through the `DaemonEnv` seam so it is unit-testable.
 use std::path::{Path, PathBuf};
 
+extern crate libc;
+
 pub const UNIT_NAME: &str = "arctis-sound-manager.service";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -62,7 +64,7 @@ pub fn query_status(env: &impl DaemonEnv, socket: &Path, binary: Option<PathBuf>
     }
 }
 
-fn use_systemd(env: &impl DaemonEnv, home: &Path) -> bool {
+pub(crate) fn use_systemd(env: &impl DaemonEnv, home: &Path) -> bool {
     let available = env.run("systemctl", &["--user", "--version"]).map(|o| o.status == 0).unwrap_or(false);
     available && env.path_exists(&unit_path(home))
 }
@@ -146,6 +148,109 @@ pub fn disable_autostart(env: &impl DaemonEnv, _home: &Path) -> Result<(), Strin
     }
 }
 
+// ── Real I/O implementation ───────────────────────────────────────────────────
+
+/// Production implementation of `DaemonEnv` backed by std I/O, the system
+/// process spawner, and the Unix domain socket client.
+pub struct RealEnv;
+
+impl DaemonEnv for RealEnv {
+    fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOut> {
+        let out = std::process::Command::new(program).args(args).output()?;
+        Ok(CmdOut {
+            status: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    fn spawn_detached(&self, program: &str, args: &[&str]) -> std::io::Result<()> {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: setsid(2) is async-signal-safe and has no invariants that
+        // can be violated by calling it in the child immediately after fork.
+        // It detaches the child from our session so it outlives the GUI process.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let _child = cmd.spawn()?;
+        // Drop the Child handle without waiting — we don't own the daemon.
+        Ok(())
+    }
+
+    fn socket_live(&self, socket: &Path) -> bool {
+        std::os::unix::net::UnixStream::connect(socket).is_ok()
+    }
+
+    fn shutdown_ipc(&self, socket: &Path) -> bool {
+        arctis_client::send_request_to(socket, &arctis_client::Request::Shutdown)
+            .map(|r| r.ok)
+            .unwrap_or(false)
+    }
+
+    fn path_exists(&self, p: &Path) -> bool {
+        p.exists()
+    }
+
+    fn read_file(&self, p: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(p)
+    }
+
+    fn write_file_atomic(&self, p: &Path, contents: &str) -> std::io::Result<()> {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Write to a sibling temp file, then rename (atomic on the same filesystem).
+        let tmp = p.with_extension("tmp");
+        std::fs::write(&tmp, contents)?;
+        std::fs::rename(&tmp, p)
+    }
+}
+
+/// Returns the user's home directory from `$HOME`, falling back to `/`.
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// Ordered list of candidate `asm-cli` binary paths (first existing one wins).
+///
+/// Order:
+/// 1. `$ASM_CLI_BIN` override — lets the owner point directly at a dev build.
+/// 2. Sibling of the current executable (installed Tauri bundle layout).
+/// 3. `$HOME/.local/bin/asm-cli` — user install.
+/// 4. `/usr/bin/asm-cli` — system-wide RPM/deb install.
+/// 5. `<cwd>/target/release/asm-cli` — workspace dev build.
+/// 6. `<cwd>/target/debug/asm-cli` — workspace debug build.
+pub fn candidate_binaries() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("ASM_CLI_BIN") {
+        v.push(PathBuf::from(p));
+    }
+    if let Some(p) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("asm-cli")))
+    {
+        v.push(p);
+    }
+    v.push(home_dir().join(".local/bin/asm-cli"));
+    v.push(PathBuf::from("/usr/bin/asm-cli"));
+    if let Ok(cwd) = std::env::current_dir() {
+        v.push(cwd.join("target/release/asm-cli"));
+        v.push(cwd.join("target/debug/asm-cli"));
+    }
+    v
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockEnv {
@@ -188,6 +293,17 @@ impl DaemonEnv for MockEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_binaries_starts_with_env_override_when_set() {
+        // NOTE: std::env::set_var is process-global and not thread-safe; this test
+        // is marked serial in practice by running `cargo test -- --test-threads 1`
+        // if flakiness is observed under parallel test execution.
+        std::env::set_var("ASM_CLI_BIN", "/custom/asm-cli");
+        let c = candidate_binaries();
+        std::env::remove_var("ASM_CLI_BIN");
+        assert_eq!(c.first(), Some(&PathBuf::from("/custom/asm-cli")));
+    }
 
     #[test]
     fn resolve_binary_returns_first_existing_in_order() {
