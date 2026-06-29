@@ -20,3 +20,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 arctis-client = { workspace = true }
 arctis-engine = { workspace = true }
+libc = { workspace = true }

@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "arctis-client",
  "arctis-engine",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

@@ -11,11 +11,13 @@
   import { untrack } from "svelte";
   import { get } from "svelte/store";
   import { engineState } from "../stores.js";
+  import { connectionStatus } from "../stores/connection.js";
   import { currentPage } from "../stores/page.js";
   import { eqEditing, pulseEditing } from "../stores/eqEditing.js";
   import { reconcileBands, type Band } from "../eq.js";
   import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
   import { groupPresets } from "./eqPresetUtils.js";
+  import DaemonUnavailable from "./DaemonUnavailable.svelte";
   import EqEditor from "./EqEditor.svelte";
   import EqBandPanel from "./EqBandPanel.svelte";
   import BandList from "./BandList.svelte";
@@ -248,6 +250,9 @@
   }
 </script>
 
+{#if $connectionStatus !== "connected"}
+  <DaemonUnavailable />
+{:else}
 <div class="eq-page">
   <!-- ===== Page header ===== -->
   <div class="eq-header">
@@ -472,6 +477,7 @@
   </div>
   </div>
 </div>
+{/if}
 
 <style>
   .eq-page {

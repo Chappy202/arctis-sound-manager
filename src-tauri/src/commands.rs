@@ -518,6 +518,105 @@ pub async fn mic_preset_apply(
     call(&state, Request::ApplyMicPreset { name }).await
 }
 
+// ── Daemon lifecycle commands ─────────────────────────────────────────────────
+//
+// These commands do NOT use DaemonState/socket IPC — the daemon may not be
+// running yet.  They build a fresh RealEnv + resolve paths on each call.
+
+use crate::daemon_control::{self as dc, DaemonStatus};
+
+#[tauri::command]
+pub async fn daemon_status() -> Result<DaemonStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let env = dc::RealEnv;
+        let socket = arctis_client::socket_path();
+        let home = dc::home_dir();
+        let binary = dc::resolve_binary(&dc::candidate_binaries(), &|p| p.exists());
+        Ok(dc::query_status(&env, &socket, binary, &home))
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn daemon_start() -> Result<DaemonStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let env = dc::RealEnv;
+        let socket = arctis_client::socket_path();
+        let home = dc::home_dir();
+        let binary = dc::resolve_binary(&dc::candidate_binaries(), &|p| p.exists());
+        if !dc::use_systemd(&env, &home) {
+            let b = binary.clone().ok_or_else(|| {
+                CommandError::Daemon("asm-cli binary not found; set $ASM_CLI_BIN".into())
+            })?;
+            dc::start(&env, &socket, &b, &home).map_err(CommandError::Daemon)?;
+        } else {
+            dc::start(&env, &socket, std::path::Path::new("/unused"), &home)
+                .map_err(CommandError::Daemon)?;
+        }
+        Ok(dc::query_status(&env, &socket, binary, &home))
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn daemon_stop() -> Result<DaemonStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let env = dc::RealEnv;
+        let socket = arctis_client::socket_path();
+        let home = dc::home_dir();
+        let binary = dc::resolve_binary(&dc::candidate_binaries(), &|p| p.exists());
+        dc::stop(&env, &socket, &home).map_err(CommandError::Daemon)?;
+        Ok(dc::query_status(&env, &socket, binary, &home))
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn daemon_restart() -> Result<DaemonStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let env = dc::RealEnv;
+        let socket = arctis_client::socket_path();
+        let home = dc::home_dir();
+        let binary = dc::resolve_binary(&dc::candidate_binaries(), &|p| p.exists());
+        if !dc::use_systemd(&env, &home) {
+            let b = binary.clone().ok_or_else(|| {
+                CommandError::Daemon("asm-cli binary not found; set $ASM_CLI_BIN".into())
+            })?;
+            dc::restart(&env, &socket, &b, &home).map_err(CommandError::Daemon)?;
+        } else {
+            dc::restart(&env, &socket, std::path::Path::new("/unused"), &home)
+                .map_err(CommandError::Daemon)?;
+        }
+        Ok(dc::query_status(&env, &socket, binary, &home))
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn daemon_set_autostart(enabled: bool) -> Result<DaemonStatus, CommandError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let env = dc::RealEnv;
+        let socket = arctis_client::socket_path();
+        let home = dc::home_dir();
+        let binary = dc::resolve_binary(&dc::candidate_binaries(), &|p| p.exists());
+        if enabled {
+            let b = binary.clone().ok_or_else(|| {
+                CommandError::Daemon("asm-cli binary not found; set $ASM_CLI_BIN".into())
+            })?;
+            dc::install_autostart(&env, &b, &home).map_err(CommandError::Daemon)?;
+        } else {
+            dc::disable_autostart(&env, &home).map_err(CommandError::Daemon)?;
+        }
+        Ok(dc::query_status(&env, &socket, binary, &home))
+    })
+    .await
+    .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
+}
+
 // ── Level-meter subscriber gate (perf) ───────────────────────────────────────
 //
 // The UI calls `meter_subscribe` when a LevelMeter mounts and `meter_unsubscribe`

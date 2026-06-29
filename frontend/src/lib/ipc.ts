@@ -484,6 +484,46 @@ export const coexistStatus = (): Promise<CoexistReport> =>
 export const coexistDisable = (dryRun: boolean = false): Promise<CoexistDisableResult> =>
   invoke<CoexistDisableResult>("coexist_disable", { dryRun });
 
+// ── Daemon lifecycle types + commands ────────────────────────────────────────
+
+/** Maps to the `ManagedBy` serde-snake_case enum in daemon_control.rs. */
+export type ManagedBy = "systemd" | "manual" | "stopped";
+
+/** Mirror of `DaemonStatus` in src-tauri/src/daemon_control.rs. */
+export interface DaemonStatus {
+  running: boolean;
+  managed_by: ManagedBy;
+  autostart_enabled: boolean;
+  systemd_available: boolean;
+  binary_path: string | null;
+  unit_installed: boolean;
+}
+
+/** Query the daemon's current lifecycle status without side-effects. */
+export const daemonStatus = (): Promise<DaemonStatus> =>
+  invoke<DaemonStatus>("daemon_status");
+
+/** Start the daemon (via systemd or direct spawn). Returns updated status. */
+export const daemonStart = (): Promise<DaemonStatus> =>
+  invoke<DaemonStatus>("daemon_start");
+
+/** Stop the daemon (via systemd or IPC shutdown). Returns updated status. */
+export const daemonStop = (): Promise<DaemonStatus> =>
+  invoke<DaemonStatus>("daemon_stop");
+
+/** Restart the daemon. Returns updated status. */
+export const daemonRestart = (): Promise<DaemonStatus> =>
+  invoke<DaemonStatus>("daemon_restart");
+
+/**
+ * Enable or disable daemon autostart via a systemd user unit.
+ * `enabled=true` installs the unit and runs `systemctl --user enable --now`;
+ * `enabled=false` runs `systemctl --user disable --now`.
+ * Returns updated status.
+ */
+export const daemonSetAutostart = (enabled: boolean): Promise<DaemonStatus> =>
+  invoke<DaemonStatus>("daemon_set_autostart", { enabled });
+
 // ---------------------------------------------------------------------------
 // Event subscriptions
 // ---------------------------------------------------------------------------
