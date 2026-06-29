@@ -26,6 +26,7 @@
     surroundSetHwSink,
     surroundImportHrirs,
     surroundFetchHrirs,
+    profileCreateFromFactory,
     listOutputs,
     type OutputDeviceSnapshot,
   } from "../ipc.js";
@@ -149,6 +150,19 @@
       importBusy = false;
     }
   }
+
+  async function onCreateDayZ() {
+    importBusy = true;
+    importMsg = null;
+    try {
+      await profileCreateFromFactory("DayZ").then(applyState);
+      importMsg = "DayZ profile created.";
+    } catch (err) {
+      importMsg = String(err);
+    } finally {
+      importBusy = false;
+    }
+  }
 </script>
 
 <div class="spatial-page">
@@ -211,6 +225,20 @@
             </button>
           </div>
         </div>
+        <div class="control-row">
+          <span class="field-label">FACTORY PROFILES</span>
+          <div class="hrir-actions">
+            <button
+              class="ss-btn"
+              disabled={importBusy}
+              onclick={onCreateDayZ}
+              aria-label="Create DayZ factory profile (game surround + footstep EQ)"
+              title="Creates a profile tuned for DayZ (game-channel surround + footstep EQ)."
+            >
+              {importBusy ? "Working…" : "Create DayZ profile"}
+            </button>
+          </div>
+        </div>
         {#if importMsg}
           <div class="field-row">
             <span class="field-label--hint hrir-msg">{importMsg}</span>
@@ -221,6 +249,8 @@
             "Import" scans <code>~/.local/share/pipewire/hrir_hesuvi/profiles/</code> for
             HeSuVi 14-channel <code>.wav</code> files. "Download" is not yet available —
             import files manually for now.
+            "Create DayZ profile" creates a ready-to-use profile with game-channel surround
+            and footstep EQ pre-configured.
           </span>
         </div>
       </div>
