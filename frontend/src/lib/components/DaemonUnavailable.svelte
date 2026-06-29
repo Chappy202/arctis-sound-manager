@@ -76,10 +76,9 @@
     margin: 0;
   }
 
-  /* 11px literal — matches --ss-type-caption-size value; token excluded per brief */
   .du-error-detail {
     font-family: var(--ss-font-mono);
-    font-size: 11px;
+    font-size: var(--ss-type-caption-size);
     color: var(--ss-text-disabled);
     background: var(--ss-surface-input);
     border-radius: var(--ss-radius-xs);
@@ -139,10 +138,9 @@
     outline-offset: 2px;
   }
 
-  /* 11px literal — same note as .du-error-detail */
   .du-action-error {
     color: var(--ss-danger);
-    font-size: 11px;
+    font-size: var(--ss-type-caption-size);
     margin: 0;
   }
 

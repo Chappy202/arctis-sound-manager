@@ -3,8 +3,6 @@
 //! All orchestration goes through the `DaemonEnv` seam so it is unit-testable.
 use std::path::{Path, PathBuf};
 
-extern crate libc;
-
 pub const UNIT_NAME: &str = "arctis-sound-manager.service";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

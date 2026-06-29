@@ -636,10 +636,10 @@
 
   {/if}
 
-  {/if}<!-- /connectionStatus gate -->
-
   <!-- ─── DAEMON section ─────────────────────────────────────────────────── -->
   <DaemonSection />
+
+  {/if}<!-- /connectionStatus gate -->
 </div>
 
 <script lang="ts" module>

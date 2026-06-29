@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { engineState, init, destroy } from "../stores.js";
+  import { engineState, init } from "../stores.js";
   import { channelAdd, channelRemove, moveStream, clearRoute } from "../ipc.js";
   import ChannelStrip from "./ChannelStrip.svelte";
   import RouteList from "./RouteList.svelte";
@@ -76,11 +76,6 @@
       dropError = e instanceof Error ? e.message : "Failed to move app";
       console.error("[mixer] clearRoute failed:", e);
     }
-  }
-
-  function refresh() {
-    destroy();
-    init();
   }
 
   // ── F4: Add channel ───────────────────────────────────────────────────────
@@ -601,6 +596,5 @@
   .routes-body {
     padding: 0 var(--ss-space-4) var(--ss-space-4);
   }
-
 
 </style>
