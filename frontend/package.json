@@ -12,14 +12,14 @@
     "test": "vitest run"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@tauri-apps/cli": "^2.11.3",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^24.12.3",
     "svelte": "^5.55.5",
     "svelte-check": "^4.4.8",
     "typescript": "~6.0.2",
-    "vite": "^8.0.12",
+    "vite": "^7.3.6",
     "vitest": "^4.1.9"
   },
   "dependencies": {
