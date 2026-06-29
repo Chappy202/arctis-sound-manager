@@ -5,9 +5,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install system build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libudev-dev \
+            build-essential \
+            file
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --all -- --check
+      # src-tauri's bundle.externalBin requires the asm-cli sidecar to exist
+      # before the crate will build; stage it before clippy/test.
+      - name: Stage asm-cli sidecar
+        run: ./scripts/stage-sidecar.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
