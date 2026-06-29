@@ -157,15 +157,19 @@ Tauri substitutes `{{target}}`/`{{arch}}`/`{{current_version}}`; with the
 endpoint returns 200 with the manifest (update available) or the client
 compares versions and no-ops when current.
 
-**Fresh keypair (owner action, documented in `PACKAGING.md`):**
+**Fresh keypair — DONE (2026-06-29, empty passphrase):**
 ```sh
-pnpm tauri signer generate -w ~/.signing/arctis-sound-manager.key
+pnpm tauri signer generate -w ~/.signing/arctis-sound-manager.key -p ""
 ```
-- Commit the new **public** key into `tauri.conf.json` `plugins.updater.pubkey`,
-  replacing the existing one.
-- Put the **private** key + password into the two CI secrets (§4).
-- The private key never enters the repo. (No existing installs, so rotating the
-  pubkey breaks nothing.)
+- Private key at `~/.signing/arctis-sound-manager.key` (mode 600, outside repo).
+- New **public** key committed to `tauri.conf.json` `plugins.updater.pubkey`
+  (commit `4aa5f8c`), replacing the old one.
+- **Remaining owner action:** add the private key as a single CI secret
+  (empty passphrase → no password secret needed):
+  ```sh
+  gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.signing/arctis-sound-manager.key
+  ```
+- No existing installs, so rotating the pubkey breaks nothing.
 
 ---
 
@@ -259,7 +263,8 @@ the GUI re-syncs `~/.local/bin/asm-cli` if the bundled daemon version changed.
 ## 12. Deliverables checklist
 
 - [ ] `.github/workflows/release.yml` (build + sign + publish on `v*`)
-- [ ] `tauri.conf.json`: real updater endpoint + fresh committed pubkey + `externalBin`
+- [x] `tauri.conf.json`: fresh committed pubkey (`4aa5f8c`)
+- [ ] `tauri.conf.json`: real updater endpoint + `externalBin`
 - [ ] Daemon sidecar staging in the workflow + GUI `~/.local/bin` sync step (+ unit tests)
 - [ ] `asm-cli --version` flag
 - [ ] Workflow version-assert (tag == config version)
