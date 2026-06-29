@@ -42,7 +42,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://REPLACE-ME.example.com/arctis-sound-manager/{{target}}-{{arch}}/{{current_version}}"
+        "https://github.com/Chappy202/arctis-sound-manager/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2QjBGRUZEMTVDRUFBQkQKUldTOXFzNFYvZjZ3OWllNW9XVURUc0dlcGVHZ1ErM2VNMkRjOTFrUFRNcU5vNWZzNVR4L3ljNkkK"
     }
