@@ -21,6 +21,7 @@
   import Slider from "../ui/Slider.svelte";
   import ToggleGroup from "../ui/ToggleGroup.svelte";
   import type { SelectOption } from "../ui/selectUtils.js";
+  import DaemonSection from "./DaemonSection.svelte";
 
   // ---------------------------------------------------------------------------
   // View-model: map raw EngineState → typed display rows
@@ -647,6 +648,9 @@
       </div>
     </div>
   {/if}
+
+  <!-- ─── DAEMON section ─────────────────────────────────────────────────── -->
+  <DaemonSection />
 </div>
 
 <script lang="ts" module>
