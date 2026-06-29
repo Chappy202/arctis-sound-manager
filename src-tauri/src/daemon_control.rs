@@ -96,6 +96,56 @@ pub fn restart(env: &impl DaemonEnv, socket: &Path, binary: &Path, home: &Path) 
     start(env, socket, binary, home)
 }
 
+pub fn render_unit(binary_path: &Path) -> String {
+    format!(
+"[Unit]
+Description=Arctis Sound Manager daemon
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart={bin} daemon
+Restart=on-failure
+RestartSec=3s
+Environment=XDG_RUNTIME_DIR=%t
+RuntimeDirectory=arctis-sound-manager
+RuntimeDirectoryMode=0700
+
+[Install]
+WantedBy=default.target
+",
+        bin = binary_path.display()
+    )
+}
+
+pub fn install_autostart(env: &impl DaemonEnv, binary: &Path, home: &Path) -> Result<(), String> {
+    let path = unit_path(home);
+    let rendered = render_unit(binary);
+    let identical = env.read_file(&path).map(|c| c == rendered).unwrap_or(false);
+    if !identical {
+        env.write_file_atomic(&path, &rendered).map_err(|e| format!("write unit failed: {e}"))?;
+        match env.run("systemctl", &["--user", "daemon-reload"]) {
+            Ok(o) if o.status == 0 => {}
+            Ok(o) => return Err(format!("daemon-reload failed (exit {}): {}", o.status, o.stderr.trim())),
+            Err(e) => return Err(format!("daemon-reload not runnable: {e}")),
+        }
+    }
+    match env.run("systemctl", &["--user", "enable", "--now", UNIT_NAME]) {
+        Ok(o) if o.status == 0 => Ok(()),
+        Ok(o) => Err(format!("enable failed (exit {}): {}", o.status, o.stderr.trim())),
+        Err(e) => Err(format!("enable not runnable: {e}")),
+    }
+}
+
+pub fn disable_autostart(env: &impl DaemonEnv, _home: &Path) -> Result<(), String> {
+    match env.run("systemctl", &["--user", "disable", "--now", UNIT_NAME]) {
+        Ok(o) if o.status == 0 => Ok(()),
+        Ok(o) => Err(format!("disable failed (exit {}): {}", o.status, o.stderr.trim())),
+        Err(e) => Err(format!("disable not runnable: {e}")),
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockEnv {
@@ -230,5 +280,38 @@ mod tests {
         assert!(runs.iter().any(|(p, a)| p == "systemctl" && a == &vec!["--user","start","arctis-sound-manager.service"]
             .iter().map(|s| s.to_string()).collect::<Vec<_>>()));
         assert!(env.spawns.borrow().is_empty());
+    }
+
+    #[test]
+    fn render_unit_substitutes_execstart() {
+        let u = render_unit(Path::new("/usr/bin/asm-cli"));
+        assert!(u.contains("ExecStart=/usr/bin/asm-cli daemon"));
+        assert!(u.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn install_writes_then_reloads_then_enables_when_absent() {
+        let env = MockEnv::default();
+        install_autostart(&env, Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
+        // unit file written
+        assert!(env.files.borrow().contains_key(&unit_path(Path::new("/home/x"))));
+        let runs = env.runs.borrow();
+        assert!(runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"daemon-reload".to_string())));
+        assert!(runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"enable".to_string()) && a.contains(&"--now".to_string())));
+    }
+
+    #[test]
+    fn install_is_idempotent_skips_write_when_identical() {
+        let env = MockEnv::default();
+        let p = unit_path(Path::new("/home/x"));
+        let existing = render_unit(Path::new("/usr/bin/asm-cli"));
+        env.files.borrow_mut().insert(p.clone(), existing);
+        env.existing.borrow_mut().insert(p.clone());
+        // clear runs after seeding
+        install_autostart(&env, Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
+        let runs = env.runs.borrow();
+        // identical content → NO daemon-reload (no write), but enable still runs (idempotent)
+        assert!(!runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"daemon-reload".to_string())));
+        assert!(runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"enable".to_string())));
     }
 }
