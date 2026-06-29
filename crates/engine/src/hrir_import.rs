@@ -31,7 +31,7 @@ pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
         let id = &bytes[i..i + 4];
         let sz =
             u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
-        if id == b"fmt " && i + 8 + 16 <= bytes.len() {
+        if id == b"fmt " && sz >= 16 && i + 8 + sz <= bytes.len() {
             let channels = u16::from_le_bytes([bytes[i + 10], bytes[i + 11]]);
             let sample_rate =
                 u32::from_le_bytes([bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15]]);
@@ -124,5 +124,38 @@ pub(crate) mod tests {
             is_importable(&read_wav_info(&p2).unwrap()),
             ImportVerdict::RejectChannels(7)
         ));
+    }
+
+    #[test]
+    fn rejects_fmt_chunk_with_undersized_declared_size() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let d = std::env::temp_dir().join(format!(
+            "asm_hrir_test_malformed_{pid}_{nanos}",
+            pid = std::process::id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("malformed.wav");
+
+        // Craft a malformed WAV: fmt chunk declares size 4 instead of 16.
+        // Parser should reject it and return an error, not read garbage.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&28u32.to_le_bytes()); // file size - 8 = 36 - 8 = 28
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&4u32.to_le_bytes()); // WRONG: declares only 4 bytes instead of 16
+        b.extend_from_slice(&[0u8, 0u8, 0u8, 0u8]); // 4 bytes junk
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&0u32.to_le_bytes()); // data chunk size 0
+        std::fs::write(&p, b).unwrap();
+
+        // The parser should reject this file (no valid fmt chunk), not silently
+        // read garbage from overlapping chunk data.
+        let result = read_wav_info(&p);
+        assert!(result.is_err(), "Parser should reject fmt chunk with undersized declared size");
+        assert!(result.unwrap_err().to_string().contains("no fmt chunk"));
     }
 }
