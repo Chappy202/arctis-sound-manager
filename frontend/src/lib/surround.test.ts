@@ -7,7 +7,8 @@
 
 import { describe, it, expect } from "vitest";
 import { hrirDisplayName, channelChecked, toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink } from "./surround.js";
-import type { OutputDeviceSnapshot } from "./ipc.js";
+import { groupHrirOptionsByTonality, outputEqToBands, bandsToOutputEq, factoryProfileLabel, flatOutputEq } from "./surround.js";
+import type { OutputDeviceSnapshot, HrirEntrySnapshot, EqBandSnapshot, FactoryProfileInfo } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
 // hrirDisplayName
@@ -213,5 +214,58 @@ describe("sinkSelectValue / sinkValueToHwSink round-trip", () => {
   it("node_name → node_name → node_name", () => {
     const name = "alsa_output.arctis";
     expect(sinkValueToHwSink(sinkSelectValue(name))).toBe(name);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// groupHrirOptionsByTonality / output EQ mapping / factoryProfileLabel (Task 12)
+// ---------------------------------------------------------------------------
+
+describe("groupHrirOptionsByTonality", () => {
+  const entries: HrirEntrySnapshot[] = [
+    { stem: "a", display: "A", group: "G", tonality: "Roomy" },
+    { stem: "b", display: "B", group: "G", tonality: "Dry" },
+    { stem: "c", display: "C", group: "G", tonality: "Neutral" },
+  ];
+  it("orders Dry, then Neutral, then Roomy", () => {
+    const opts = groupHrirOptionsByTonality(entries);
+    const stems = opts.map((o) => o.value);
+    expect(stems).toEqual(["b", "c", "a"]);
+  });
+  it("falls back to display when group is empty", () => {
+    const opts = groupHrirOptionsByTonality([{ stem: "x", display: "X", group: "", tonality: "Dry" }]);
+    expect(opts[0].label).toBe("X");
+  });
+});
+
+describe("outputEqToBands / bandsToOutputEq round-trip", () => {
+  const snap: EqBandSnapshot[] = [{ kind: "peaking", freq_hz: 250, q: 1, gain_db: 3 }];
+  it("maps snake_case to camelCase and back", () => {
+    const bands = outputEqToBands(snap);
+    expect(bands[0]).toEqual({ kind: "peaking", freqHz: 250, q: 1, gainDb: 3 });
+    expect(bandsToOutputEq(bands)).toEqual(snap);
+  });
+});
+
+describe("factoryProfileLabel", () => {
+  it("shows name and hrir", () => {
+    const info: FactoryProfileInfo = { name: "DayZ", hrir: "04-gsx-sennheiser-gsx", mode: "hrir71" };
+    expect(factoryProfileLabel(info)).toContain("DayZ");
+  });
+  it("shows just the name when hrir is null", () => {
+    const info: FactoryProfileInfo = { name: "Plain", hrir: null, mode: "stereo_bypass" };
+    expect(factoryProfileLabel(info)).toBe("Plain");
+  });
+});
+
+describe("flatOutputEq", () => {
+  it("seeds a flat 10-band peaking curve at the canonical frequencies", () => {
+    const bands = flatOutputEq();
+    expect(bands).toHaveLength(10);
+    expect(bands.every((b) => b.kind === "peaking" && b.gain_db === 0)).toBe(true);
+    expect(bands.map((b) => b.freq_hz)).toEqual([31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]);
+  });
+  it("round-trips through outputEqToBands", () => {
+    expect(bandsToOutputEq(outputEqToBands(flatOutputEq()))).toEqual(flatOutputEq());
   });
 });

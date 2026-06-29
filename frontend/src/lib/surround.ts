@@ -5,8 +5,9 @@
  * SpatialPage.svelte is a thin view that delegates logic here.
  */
 
-import type { OutputDeviceSnapshot } from "./ipc.js";
+import type { OutputDeviceSnapshot, HrirEntrySnapshot, EqBandSnapshot, FactoryProfileInfo } from "./ipc.js";
 import type { SelectOption } from "./ui/selectUtils.js";
+import { DEFAULT_BAND_FREQS, type Band } from "./eq.js";
 
 // ---------------------------------------------------------------------------
 // Hardware-sink Select helpers
@@ -97,4 +98,57 @@ export function toggleChannel(id: string, channels: string[]): string[] {
     return channels.filter((c) => c !== id);
   }
   return [...channels, id];
+}
+
+// ---------------------------------------------------------------------------
+// HRIR tonality grouping (Task 12)
+// ---------------------------------------------------------------------------
+
+const TONALITY_ORDER = ["Dry", "Neutral", "Roomy"] as const;
+
+/** Group HRIR options by tonality (Dry → Neutral → Roomy), stable within each group. */
+export function groupHrirOptionsByTonality(entries: HrirEntrySnapshot[]): SelectOption[] {
+  const rank = (t: string): number => {
+    const i = TONALITY_ORDER.indexOf(t as (typeof TONALITY_ORDER)[number]);
+    return i === -1 ? TONALITY_ORDER.length : i;
+  };
+  return [...entries]
+    .sort((a, b) => rank(a.tonality) - rank(b.tonality))
+    .map((e) => ({
+      value: e.stem,
+      label: e.group ? `${e.group} — ${e.display}` : e.display,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Post-convolution output EQ mapping (Task 12)
+// ---------------------------------------------------------------------------
+
+/** Map engine output_eq snapshot bands to editor Band[] (snake → camel). */
+export function outputEqToBands(snap: EqBandSnapshot[]): Band[] {
+  return snap.map((b) => ({ kind: b.kind as Band["kind"], freqHz: b.freq_hz, q: b.q, gainDb: b.gain_db }));
+}
+
+/** Inverse of outputEqToBands: editor Band[] → engine output_eq snapshot bands. */
+export function bandsToOutputEq(bands: Band[]): EqBandSnapshot[] {
+  return bands.map((b) => ({ kind: b.kind, freq_hz: b.freqHz, q: b.q, gain_db: b.gainDb }));
+}
+
+/**
+ * Seed a flat 10-band peaking output-EQ curve at the canonical EQ frequencies
+ * (matches eq.ts DEFAULT_BAND_FREQS / the engine's EqModel::default_10band()).
+ * Used when the "Spatial correction (post)" toggle is switched on so the editor
+ * has manipulable bands rather than an empty curve.
+ */
+export function flatOutputEq(): EqBandSnapshot[] {
+  return DEFAULT_BAND_FREQS.map((freq) => ({ kind: "peaking", freq_hz: freq, q: 1, gain_db: 0 }));
+}
+
+// ---------------------------------------------------------------------------
+// Factory-profile labels (Task 12)
+// ---------------------------------------------------------------------------
+
+/** Human label for a factory-profile row. */
+export function factoryProfileLabel(info: FactoryProfileInfo): string {
+  return info.hrir ? `${info.name} · ${info.hrir}` : info.name;
 }

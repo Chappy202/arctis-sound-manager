@@ -94,6 +94,12 @@ export interface SurroundSnapshot {
   effective_mode?: string;
   /** Hardware-negotiated channel count from pw-dump probe, or null if not yet probed. */
   negotiated_channels?: number | null;
+  /** Pinned HRIR stem requested but not installed (fallback in use); null/absent when OK. */
+  hrir_missing?: string | null;
+  /** Explicit post-convolution EQ on the binaural tail (empty/absent = none). */
+  output_eq?: EqBandSnapshot[];
+  /** Pinned convolver blocksize, or null/absent for PipeWire default. */
+  blocksize?: number | null;
 }
 
 export interface EqPresetSnapshot {
@@ -104,6 +110,13 @@ export interface EqPresetSnapshot {
 export interface MicPresetSnapshot {
   name: string;
   description: string;
+}
+
+/** Mirror of crates/engine/src/factory_profiles.rs FactoryProfileInfo. */
+export interface FactoryProfileInfo {
+  name: string;
+  hrir: string | null;
+  mode: string;
 }
 
 export interface EngineState {
@@ -351,6 +364,18 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 /** Pin (or clear) the surround output to a specific hardware sink. */
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
   invoke<EngineState>("surround_set_hw_sink", { hwSink });
+
+/** List the static factory-profile catalog for the data-driven create-profile UI. */
+export const listFactoryProfiles = (): Promise<FactoryProfileInfo[]> =>
+  invoke<FactoryProfileInfo[]>("list_factory_profiles");
+
+/** Set the explicit post-convolution surround EQ bands. Returns updated EngineState. */
+export const surroundSetOutputEq = (bands: EqBandSnapshot[]): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_output_eq", { bands });
+
+/** Pin (or clear) the convolver blocksize. null = PipeWire default. */
+export const surroundSetBlocksize = (blocksize: number | null): Promise<EngineState> =>
+  invoke<EngineState>("surround_set_blocksize", { blocksize });
 
 // ── A6: HRIR import / fetch commands ─────────────────────────────────────────
 
