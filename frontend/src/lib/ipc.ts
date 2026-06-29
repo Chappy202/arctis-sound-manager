@@ -88,6 +88,12 @@ export interface SurroundSnapshot {
   available_hrir_entries?: HrirEntrySnapshot[];
   channels: string[];
   hw_sink: string | null;
+  /** Configured mode as lowercase string, e.g. "auto" | "hrir71" | "hrir51" | "stereo_bypass". Absent on older engines. */
+  mode?: string;
+  /** Resolved effective mode after fallback, e.g. "hrir71". Absent on older engines. */
+  effective_mode?: string;
+  /** Hardware-negotiated channel count from pw-dump probe, or null if not yet probed. */
+  negotiated_channels?: number | null;
 }
 
 export interface EqPresetSnapshot {
