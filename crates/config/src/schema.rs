@@ -308,6 +308,29 @@ pub struct RouteConfig {
 
 // ── Surround / HRIR config ────────────────────────────────────────────────────
 
+/// Selects how the virtual-surround stage processes the signal.
+/// `Default = Auto` — the engine picks the best available mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurroundMode {
+    /// Engine chooses the best available mode (default). Currently equivalent
+    /// to HRIR 7.1 if a compatible HRIR file is present, otherwise falls back
+    /// to stereo passthrough.
+    Auto,
+    /// Force 7.1-channel HRIR convolution.
+    Hrir71,
+    /// Force 5.1-channel HRIR convolution.
+    Hrir51,
+    /// Bypass the HRIR; output stereo with optional crossfeed blending.
+    StereoBypass,
+}
+
+impl Default for SurroundMode {
+    fn default() -> Self {
+        SurroundMode::Auto
+    }
+}
+
 fn default_surround_channels() -> Vec<String> {
     vec!["game".into(), "media".into()]
 }
@@ -333,6 +356,15 @@ pub struct SurroundConfig {
     /// None = follow the Arctis hardware sink discovered at runtime.
     #[serde(default)]
     pub hw_sink: Option<String>,
+    /// Surround processing mode. Defaults to `Auto`.
+    /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub mode: SurroundMode,
+    /// Crossfeed amount 0–100 (0 = no crossfeed, 100 = full blend). Only
+    /// meaningful in `StereoBypass` mode; ignored for HRIR modes.
+    /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub crossfeed: u8,
 }
 
 impl Default for SurroundConfig {
@@ -342,6 +374,8 @@ impl Default for SurroundConfig {
             hrir: None,
             channels: default_surround_channels(),
             hw_sink: None,
+            mode: SurroundMode::default(),
+            crossfeed: 0,
         }
     }
 }
@@ -764,6 +798,13 @@ impl Config {
                         stem, profile.name
                     )));
                 }
+            }
+            // crossfeed must be in 0..=100.
+            if profile.surround.crossfeed > 100 {
+                return Err(ConfigError::Invalid(format!(
+                    "surround.crossfeed {} is out of range 0..=100 in profile '{}'",
+                    profile.surround.crossfeed, profile.name
+                )));
             }
         }
 
@@ -1309,6 +1350,8 @@ description = "Chat"
             hrir: Some("00-default-asm".to_string()),
             channels: vec!["game".to_string(), "chat".to_string(), "media".to_string()],
             hw_sink: Some("alsa_output.usb_headset".to_string()),
+            mode: SurroundMode::Hrir71,
+            crossfeed: 0,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
@@ -1725,5 +1768,20 @@ volume_db = -6.0
         let toml = toml::to_string(&p).unwrap();
         let back: MicPreset = toml::from_str(&toml).unwrap();
         assert_eq!(p, back);
+    }
+
+    // ── Task B1: SurroundMode + crossfeed ─────────────────────────────────────
+
+    #[test]
+    fn surround_config_defaults_mode_auto_crossfeed_zero_and_roundtrips() {
+        let c = SurroundConfig::default();
+        assert!(matches!(c.mode, SurroundMode::Auto));
+        assert_eq!(c.crossfeed, 0);
+        let toml = toml::to_string(&c).unwrap();
+        let back: SurroundConfig = toml::from_str(&toml).unwrap();
+        assert_eq!(c, back);
+        // old config without the fields still loads
+        let old: SurroundConfig = toml::from_str("enabled = true\n").unwrap();
+        assert!(matches!(old.mode, SurroundMode::Auto));
     }
 }
