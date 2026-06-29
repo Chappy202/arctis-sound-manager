@@ -1183,23 +1183,17 @@ impl<R: CommandRunner> Engine<R> {
     ///
     /// Unknown templates return `EngineError::BadRequest`.
     pub fn create_factory_profile(&mut self, template: &str) -> Result<(), EngineError> {
-        match template.to_lowercase().as_str() {
-            "dayz" => {
-                let active = self.config.active()?.clone();
-                let p = crate::factory_profiles::dayz_profile(&active);
-                self.config.upsert_profile(p);
-                self.config.active_profile = "DayZ".into();
-                self.save_config()?;
-                self.reconcile()?;
-                self.emit(Event::ProfileCreated {
-                    name: "DayZ".into(),
-                });
-                Ok(())
-            }
-            other => Err(EngineError::BadRequest(format!(
-                "unknown factory profile template: {other}"
-            ))),
-        }
+        let spec = crate::factory_profiles::find_factory_profile(template)
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown factory profile template: {template}")))?;
+        let active = self.config.active()?.clone();
+        let p = crate::factory_profiles::apply_factory_spec(&active, spec)?;
+        let name = p.name.clone();
+        self.config.upsert_profile(p);
+        self.config.active_profile = name.clone();
+        self.save_config()?;
+        self.reconcile()?;
+        self.emit(Event::ProfileCreated { name });
+        Ok(())
     }
 
     /// Rename a profile. If it was the active profile, also updates `active_profile`.
