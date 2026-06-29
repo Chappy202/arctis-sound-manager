@@ -434,7 +434,10 @@ pub fn resolve_hrir_path(
             }
         }
         None => {
-            // Try profiles dir first (sorted lexicographically)
+            // Try profiles dir first.
+            // Prefer the first 48 kHz file (sorted lexicographically); if none
+            // is readable as 48 kHz, fall back to the lexicographically-first
+            // .wav so the pipeline degrades gracefully rather than erroring.
             if profiles_dir.is_dir() {
                 let mut wavs: Vec<PathBuf> = std::fs::read_dir(&profiles_dir)
                     .map_err(|e| {
@@ -447,8 +450,35 @@ pub fn resolve_hrir_path(
                     .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("wav"))
                     .collect();
                 wavs.sort();
-                if let Some(first) = wavs.into_iter().next() {
-                    return Ok(first);
+
+                if !wavs.is_empty() {
+                    // First pass: find a 48 kHz file.
+                    let preferred = wavs
+                        .iter()
+                        .find(|p| {
+                            crate::hrir_import::read_wav_info(p)
+                                .map(|info| info.sample_rate == 48_000)
+                                .unwrap_or(false)
+                        })
+                        .cloned();
+
+                    if let Some(p) = preferred {
+                        return Ok(p);
+                    }
+
+                    // Fallback: lexicographically first (may not be 48 kHz).
+                    // Log a warning so the mismatch is visible in the console.
+                    let fallback_lex = wavs.into_iter().next().expect("wavs is non-empty");
+                    let rate_hint = crate::hrir_import::read_wav_info(&fallback_lex)
+                        .map(|i| i.sample_rate)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "asm: warning — no 48 kHz HRIR found; falling back to {} \
+                         (detected rate: {} Hz). Audio quality may be degraded.",
+                        fallback_lex.display(),
+                        rate_hint
+                    );
+                    return Ok(fallback_lex);
                 }
             }
             // Fallback: <base_dir>/hrir.wav
@@ -1019,6 +1049,69 @@ mod tests {
         assert_eq!(spec.capture_node_name, "arctis_clean_mic.capture");
         assert_eq!(spec.capture_target, Some("alsa_input.hw_mic".to_string()));
         assert_eq!(spec.playback_node_name, "arctis_clean_mic");
+    }
+
+    // ── resolve_hrir_path 48 kHz preference tests ─────────────────────────────
+
+    fn surround_cfg_none() -> SurroundConfig {
+        SurroundConfig {
+            hrir: None,
+            ..SurroundConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_resolution_prefers_48k_over_lexicographically_first_44k() {
+        let d = tempfile::tempdir().unwrap();
+        let profiles = d.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        // 00-a.wav is lex-first but 44.1 kHz — should NOT be chosen.
+        crate::hrir_import::tests::write_wav(&profiles.join("00-a.wav"), 14, 44_100);
+        // 07-b.wav is lex-second but 48 kHz — should be chosen.
+        crate::hrir_import::tests::write_wav(&profiles.join("07-b.wav"), 14, 48_000);
+
+        let cfg = surround_cfg_none();
+        let result = resolve_hrir_path(&cfg, d.path()).unwrap();
+        assert!(
+            result.ends_with("07-b.wav"),
+            "expected 07-b.wav (48 kHz), got: {}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn default_resolution_falls_back_to_first_when_no_48k() {
+        let d = tempfile::tempdir().unwrap();
+        let profiles = d.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        // Only 44.1 kHz files — should gracefully fall back to lex-first, no error.
+        crate::hrir_import::tests::write_wav(&profiles.join("00-a.wav"), 14, 44_100);
+
+        let cfg = surround_cfg_none();
+        let result = resolve_hrir_path(&cfg, d.path()).unwrap();
+        assert!(
+            result.ends_with("00-a.wav"),
+            "expected graceful fallback to 00-a.wav, got: {}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn all_48k_default_picks_lexicographic_first() {
+        let d = tempfile::tempdir().unwrap();
+        let profiles = d.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        // Both 48 kHz — lex-first (00-a.wav) should be returned.
+        crate::hrir_import::tests::write_wav(&profiles.join("00-a.wav"), 14, 48_000);
+        crate::hrir_import::tests::write_wav(&profiles.join("07-b.wav"), 14, 48_000);
+
+        let cfg = surround_cfg_none();
+        let result = resolve_hrir_path(&cfg, d.path()).unwrap();
+        assert!(
+            result.ends_with("00-a.wav"),
+            "expected lex-first 00-a.wav when all are 48 kHz, got: {}",
+            result.display()
+        );
     }
 
     #[test]
