@@ -1178,10 +1178,11 @@ impl<R: CommandRunner> Engine<R> {
     /// Create a factory profile from a named template, make it active, persist,
     /// reconcile the graph, and emit a `ProfileCreated` event.
     ///
-    /// The template name is matched case-insensitively. Supported templates:
-    /// - `"DayZ"` — game surround on, footstep EQ, default sink = game channel.
-    ///
-    /// Unknown templates return `EngineError::BadRequest`.
+    /// Templates come from the data-driven catalog in
+    /// [`factory_profiles::factory_profiles`] and are matched case-insensitively;
+    /// the matched [`factory_profiles::FactoryProfileSpec`] is layered onto a clone
+    /// of the active profile (hardware settings preserved). Unknown templates
+    /// return `EngineError::BadRequest`.
     pub fn create_factory_profile(&mut self, template: &str) -> Result<(), EngineError> {
         let spec = crate::factory_profiles::find_factory_profile(template)
             .ok_or_else(|| EngineError::BadRequest(format!("unknown factory profile template: {template}")))?;
@@ -2848,6 +2849,19 @@ mod tests {
             dial_controls_balance: true,
             knob_controls_master: true,
         }
+    }
+
+    #[test]
+    fn create_factory_profile_unknown_template_errors() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .create_factory_profile("not-a-game")
+            .expect_err("unknown template must error");
+        assert!(
+            matches!(err, EngineError::BadRequest(_)),
+            "unknown template must be BadRequest, got: {err:?}"
+        );
     }
 
     /// Config with media pinned to "speakers" and one firefox→Arctis_Media route.
