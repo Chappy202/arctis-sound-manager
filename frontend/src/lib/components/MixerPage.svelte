@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { engineState, loadError, init, destroy } from "../stores.js";
+  import { engineState, init, destroy } from "../stores.js";
   import { channelAdd, channelRemove, moveStream, clearRoute } from "../ipc.js";
   import ChannelStrip from "./ChannelStrip.svelte";
   import RouteList from "./RouteList.svelte";
@@ -10,6 +10,8 @@
   import MicStrip from "./MicStrip.svelte";
   import ChatmixSlider from "./ChatmixSlider.svelte";
   import { orderChannels } from "./mixerLayout.js";
+  import DaemonUnavailable from "./DaemonUnavailable.svelte";
+  import { connectionStatus } from "../stores/connection.js";
 
   // init() is idempotent — safe to call here AND from AppShell.
   // Calling it here ensures the mixer works even if AppShell hasn't yet mounted.
@@ -133,28 +135,12 @@
 </script>
 
 <div class="mixer-page">
-  {#if $loadError}
-    <!-- ===== Daemon-down empty state ===== -->
-    <div class="daemon-down-card" role="alert" aria-live="assertive">
-      <div class="daemon-icon" aria-hidden="true">◉</div>
-      <h2 class="daemon-title">Daemon not running</h2>
-      <p class="daemon-desc">
-        Start it with <code class="daemon-cmd">asm-cli daemon</code> then click Retry.
-      </p>
-      <button class="retry-btn" onclick={refresh} aria-label="Retry connecting to daemon">
-        Retry
-      </button>
-    </div>
-
-  {:else if !$engineState}
-    <!-- ===== Loading state ===== -->
-    <div class="loading-state" aria-busy="true" aria-live="polite">
-      <div class="loading-spinner" aria-hidden="true"></div>
-      <p class="loading-text">Connecting to daemon…</p>
-    </div>
-
+  {#if $connectionStatus !== "connected"}
+    <DaemonUnavailable />
   {:else}
     <!-- ===== Mixer content ===== -->
+    <!-- $engineState is always non-null when connectionStatus === "connected" -->
+    {#if $engineState}
     <div class="mixer-header">
       <div class="mixer-title-row">
         <h1 class="mixer-title">MIXER</h1>
@@ -276,7 +262,8 @@
         <RouteList />
       </div>
     </details>
-  {/if}
+    {/if}<!-- /$engineState inner guard -->
+  {/if}<!-- /$connectionStatus gate -->
 </div>
 
 <style>
@@ -285,111 +272,6 @@
     flex-direction: column;
     gap: var(--ss-space-6);
     min-height: 100%;
-  }
-
-  /* ===== Daemon-down card ===== */
-  .daemon-down-card {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: var(--ss-space-4);
-    padding: var(--ss-space-12) var(--ss-space-8);
-    background: var(--ss-surface-1);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-md);
-    box-shadow: var(--ss-e1);
-    text-align: center;
-    max-width: 420px;
-    margin: var(--ss-space-8) auto;
-  }
-
-  .daemon-icon {
-    font-size: 36px;
-    color: var(--ss-danger);
-    line-height: 1;
-    opacity: 0.7;
-  }
-
-  .daemon-title {
-    font-family: var(--ss-font-display);
-    font-size: var(--ss-type-h2-size);
-    font-weight: var(--ss-type-h2-weight);
-    letter-spacing: var(--ss-type-h2-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-primary);
-    margin: 0;
-  }
-
-  .daemon-desc {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-secondary);
-    margin: 0;
-    line-height: 1.5;
-  }
-
-  .daemon-cmd {
-    font-family: var(--ss-font-mono);
-    font-size: var(--ss-type-body-size);
-    background: var(--ss-surface-input);
-    border-radius: var(--ss-radius-xs);
-    padding: 2px var(--ss-space-2);
-    color: var(--ss-accent);
-  }
-
-  .retry-btn {
-    height: var(--ss-control-h);
-    padding: 0 var(--ss-space-6);
-    background: var(--ss-gradient-primary);
-    border: none;
-    border-radius: var(--ss-radius-sm);
-    color: var(--ss-text-bright);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-button-size);
-    font-weight: var(--ss-type-button-weight);
-    letter-spacing: var(--ss-type-button-letter-spacing);
-    text-transform: uppercase;
-    cursor: pointer;
-    transition: filter var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  .retry-btn:hover {
-    filter: brightness(1.1);
-  }
-
-  .retry-btn:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  /* ===== Loading state ===== */
-  .loading-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: var(--ss-space-4);
-    padding: var(--ss-space-16) 0;
-  }
-
-  .loading-spinner {
-    width: 32px;
-    height: 32px;
-    border: 3px solid var(--ss-border-strong);
-    border-top-color: var(--ss-accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  .loading-text {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-tertiary);
-    margin: 0;
   }
 
   /* ===== Mixer header ===== */
@@ -720,10 +602,5 @@
     padding: 0 var(--ss-space-4) var(--ss-space-4);
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    .loading-spinner {
-      animation: none;
-      border-top-color: var(--ss-text-tertiary);
-    }
-  }
+
 </style>

@@ -22,6 +22,8 @@
   import ToggleGroup from "../ui/ToggleGroup.svelte";
   import type { SelectOption } from "../ui/selectUtils.js";
   import DaemonSection from "./DaemonSection.svelte";
+  import DaemonUnavailable from "./DaemonUnavailable.svelte";
+  import { connectionStatus } from "../stores/connection.js";
 
   // ---------------------------------------------------------------------------
   // View-model: map raw EngineState → typed display rows
@@ -264,18 +266,12 @@
     <p class="page-subtitle">Battery · ANC · Sidetone · Mic · Power · Firmware</p>
   </div>
 
-  <!-- Daemon not connected -->
-  {#if $loadError}
-    <div class="state-card state-card--error" role="status" aria-live="polite">
-      <div class="state-icon" aria-hidden="true">⚠</div>
-      <div class="state-body">
-        <span class="state-title">Daemon Unavailable</span>
-        <span class="state-desc">{$loadError}</span>
-      </div>
-    </div>
+  {#if $connectionStatus !== "connected"}
+    <DaemonUnavailable />
+  {:else}
 
   <!-- Daemon OK but no device -->
-  {:else if hasDaemon && !devicePresent}
+  {#if hasDaemon && !devicePresent}
     <div class="state-card state-card--no-device" role="status">
       <div class="state-icon no-device-icon" aria-hidden="true">◎</div>
       <div class="state-body">
@@ -638,16 +634,9 @@
 
     </div><!-- /controls-layout -->
 
-  <!-- Loading / null state -->
-  {:else}
-    <div class="state-card" role="status" aria-live="polite">
-      <div class="state-icon connecting-icon" aria-hidden="true">◎</div>
-      <div class="state-body">
-        <span class="state-title">Connecting to Daemon…</span>
-        <span class="state-desc">Waiting for state from the Arctis daemon.</span>
-      </div>
-    </div>
   {/if}
+
+  {/if}<!-- /connectionStatus gate -->
 
   <!-- ─── DAEMON section ─────────────────────────────────────────────────── -->
   <DaemonSection />
@@ -776,11 +765,6 @@
     box-shadow: var(--ss-e1);
   }
 
-  .state-card--error {
-    border-color: var(--ss-danger);
-    background: var(--ss-surface-1);
-  }
-
   .state-card--no-device {
     border-color: var(--ss-border-strong);
   }
@@ -795,22 +779,6 @@
 
   .no-device-icon {
     color: var(--ss-text-disabled);
-  }
-
-  .connecting-icon {
-    color: var(--ss-warning);
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.35; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .connecting-icon {
-      animation: none;
-    }
   }
 
   .state-body {
