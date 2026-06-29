@@ -12,3 +12,7 @@
 !*.key.pub
 .signing/
 /node_modules/
+
+# Local build artifacts / scratch — never commit
+*.rpm
+/openspec/
