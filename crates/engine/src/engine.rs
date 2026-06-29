@@ -6129,6 +6129,61 @@ mod tests {
     }
 
     #[test]
+    fn resolve_or_fallback_present_stem_no_missing_flag() {
+        let tmp = unique_cfg_tmp("hrir_or_fb_present");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("04-gsx-sennheiser-gsx.wav"), b"").unwrap();
+        let cfg = arctis_config::SurroundConfig { hrir: Some("04-gsx-sennheiser-gsx".into()), ..Default::default() };
+        let (path, missing) = convert::resolve_hrir_path_or_fallback(&cfg, &base).expect("resolves");
+        assert!(path.ends_with("04-gsx-sennheiser-gsx.wav"));
+        assert_eq!(missing, None, "no fallback used → no missing flag");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_or_fallback_missing_pinned_uses_bundled_and_reports_missing() {
+        let tmp = unique_cfg_tmp("hrir_or_fb_missing");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        // Pinned stem absent; bundled dry fallback present.
+        std::fs::write(profiles_dir.join(format!("{}.wav", convert::FALLBACK_HRIR_STEM)), b"").unwrap();
+        let cfg = arctis_config::SurroundConfig { hrir: Some("04-gsx-sennheiser-gsx".into()), ..Default::default() };
+        let (path, missing) = convert::resolve_hrir_path_or_fallback(&cfg, &base).expect("falls back");
+        assert!(path.ends_with(&format!("{}.wav", convert::FALLBACK_HRIR_STEM)));
+        assert_eq!(missing, Some("04-gsx-sennheiser-gsx".to_string()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_or_fallback_missing_pinned_falls_back_to_any_available() {
+        let tmp = unique_cfg_tmp("hrir_or_fb_any");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        let profiles_dir = base.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        // Neither pinned nor bundled present, but another HRIR exists.
+        std::fs::write(profiles_dir.join("99-other.wav"), b"").unwrap();
+        let cfg = arctis_config::SurroundConfig { hrir: Some("04-gsx-sennheiser-gsx".into()), ..Default::default() };
+        let (path, missing) = convert::resolve_hrir_path_or_fallback(&cfg, &base).expect("falls back to any");
+        assert!(path.ends_with("99-other.wav"));
+        assert_eq!(missing, Some("04-gsx-sennheiser-gsx".to_string()));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_or_fallback_no_hrir_at_all_errors() {
+        let tmp = unique_cfg_tmp("hrir_or_fb_none");
+        let base = tmp.join(convert::HRIR_BASE_SUBPATH);
+        std::fs::create_dir_all(&base).unwrap();
+        let cfg = arctis_config::SurroundConfig { hrir: Some("04-gsx-sennheiser-gsx".into()), ..Default::default() };
+        let result = convert::resolve_hrir_path_or_fallback(&cfg, &base);
+        assert!(matches!(result, Err(EngineError::BadRequest(_))));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn available_hrirs_returns_sorted_stems() {
         let tmp = unique_cfg_tmp("avail_hrirs");
         let base = tmp.join(convert::HRIR_BASE_SUBPATH);

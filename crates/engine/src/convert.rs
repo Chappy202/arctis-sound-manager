@@ -71,6 +71,13 @@ pub fn eq_model_for(channel: &ChannelConfig) -> Result<EqModel, EngineError> {
     Ok(EqModel { bands })
 }
 
+/// Build an `EqModel` from an explicit band curve (e.g. `SurroundConfig.output_eq`);
+/// bands are used as-is, with no default 10-band overlay (unlike `eq_model_for`).
+pub fn eq_model_from_bands(bands: &[EqBandConfig]) -> Result<EqModel, EngineError> {
+    let bands = bands.iter().map(eq_band_from_cfg).collect::<Result<Vec<_>, _>>()?;
+    Ok(EqModel { bands })
+}
+
 /// Map a `ChannelConfig` (from the config layer) to a `ChannelDef` (audio layer).
 pub fn channel_def_from_cfg(c: &ChannelConfig) -> ChannelDef {
     ChannelDef::new(&c.id, &c.node_name, &c.description, c.output_device.clone())
@@ -498,6 +505,32 @@ pub fn resolve_hrir_path(
             Err(crate::error::EngineError::BadRequest(
                 "no HRIR profiles found — install a .wav file in ~/.local/share/pipewire/hrir_hesuvi/profiles/".into()
             ))
+        }
+    }
+}
+
+/// Bundled dry HRIR used when a pinned stem is missing.
+pub const FALLBACK_HRIR_STEM: &str = "07-oal+++-openal-max";
+
+/// Resolve the HRIR path; if a pinned stem is missing, fall back to a bundled dry HRIR
+/// (then any available) and report the missing stem so the UI can prompt to import.
+/// Returns `(path, missing_stem)`. `missing_stem = Some(stem)` only when a fallback was used.
+pub fn resolve_hrir_path_or_fallback(
+    cfg: &SurroundConfig,
+    base_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, Option<String>), crate::error::EngineError> {
+    match resolve_hrir_path(cfg, base_dir) {
+        Ok(p) => Ok((p, None)),
+        Err(e) => {
+            if let Some(stem) = &cfg.hrir {
+                for fb in [Some(FALLBACK_HRIR_STEM.to_string()), None] {
+                    let fb_cfg = SurroundConfig { hrir: fb, ..cfg.clone() };
+                    if let Ok(p) = resolve_hrir_path(&fb_cfg, base_dir) {
+                        return Ok((p, Some(stem.clone())));
+                    }
+                }
+            }
+            Err(e)
         }
     }
 }
@@ -1172,5 +1205,25 @@ mod tests {
             Some("speakers"),
             "explicit channel must remain unchanged"
         );
+    }
+
+    // ── eq_model_from_bands unit tests ────────────────────────────────────────
+
+    #[test]
+    fn eq_model_from_bands_uses_bands_verbatim_no_overlay() {
+        let bands = vec![
+            arctis_config::EqBandConfig { kind: "lowshelf".into(), freq_hz: 31.0, q: 0.7, gain_db: -1.0 },
+            arctis_config::EqBandConfig { kind: "peaking".into(), freq_hz: 250.0, q: 1.0, gain_db: 3.0 },
+        ];
+        let model = super::eq_model_from_bands(&bands).expect("builds");
+        assert_eq!(model.bands.len(), 2, "no default 10-band overlay");
+        assert_eq!(model.bands[1].freq_hz, 250.0);
+        assert_eq!(model.bands[1].gain_db, 3.0);
+    }
+
+    #[test]
+    fn eq_model_from_bands_rejects_bad_kind() {
+        let bands = vec![arctis_config::EqBandConfig { kind: "notakind".into(), freq_hz: 100.0, q: 1.0, gain_db: 0.0 }];
+        assert!(super::eq_model_from_bands(&bands).is_err());
     }
 }
