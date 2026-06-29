@@ -3,25 +3,40 @@
    * SpatialPage.svelte — Virtual surround / HRIR page (F1.5).
    *
    * Thin view: all pure logic is in surround.ts (hrirDisplayName, channelChecked,
-   * toggleChannel). IPC wrappers are in ipc.ts. Mirrors MicPage.svelte idioms.
+   * toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink).
+   * IPC wrappers are in ipc.ts. Mirrors MicPage.svelte idioms.
    *
    * Controls:
    *   - Enable toggle  → surroundEnable (master gate; dims rest when off)
    *   - HRIR picker    → surroundSetHrir (dropdown; honest banner when no profiles)
    *   - Channels       → surroundSetChannels (checkbox per channel in state)
-   *   - HW sink field  → surroundSetHwSink (advanced; null = auto-detect)
+   *   - HW sink select → surroundSetHwSink (dropdown; Auto-detect = null)
+   *   - Import HRIRs   → surroundImportHrirs (pick dir via dialog)
+   *   - Download HRIRs → surroundFetchHrirs  (placeholder; surfaces informational error)
    *
    * Each call applies the returned EngineState to the store (.then(applyState)).
    */
 
+  import { onMount } from "svelte";
   import { engineState } from "../stores.js";
   import {
     surroundEnable,
     surroundSetHrir,
     surroundSetChannels,
     surroundSetHwSink,
+    surroundImportHrirs,
+    surroundFetchHrirs,
+    listOutputs,
+    type OutputDeviceSnapshot,
   } from "../ipc.js";
-  import { hrirDisplayName, channelChecked, toggleChannel } from "../surround.js";
+  import {
+    hrirDisplayName,
+    channelChecked,
+    toggleChannel,
+    buildSinkOptions,
+    sinkSelectValue,
+    sinkValueToHwSink,
+  } from "../surround.js";
   import Switch from "../ui/Switch.svelte";
   import Select from "../ui/Select.svelte";
   import type { SelectOption } from "../ui/selectUtils.js";
@@ -35,6 +50,7 @@
   const masterEnabled     = $derived(surround?.enabled ?? false);
   const currentHrir       = $derived(surround?.hrir ?? null);
   const availableHrirs    = $derived(surround?.available_hrirs ?? []);
+  const availableHrirEntries = $derived(surround?.available_hrir_entries ?? []);
   const activeChannels    = $derived(surround?.channels ?? []);
   // All channel ids known to the engine (from the channels list)
   const allChannelIds = $derived(($engineState?.channels ?? []).map((c) => c.id));
@@ -42,21 +58,38 @@
   // No HRIR profiles → honest unavailable state
   const noHrirs = $derived(availableHrirs.length === 0);
 
-  // HRIR picker options. When nothing is selected yet we prepend a placeholder
-  // entry so the trigger reads "(none selected)" instead of a blank label.
+  // HRIR picker options. Prefer rich available_hrir_entries (display + group) when
+  // available; fall back to stem-based hrirDisplayName for older engine builds.
   const hrirOptions = $derived<SelectOption[]>([
     ...(currentHrir === null && availableHrirs.length > 0
       ? [{ value: "", label: "(none selected)" }]
       : []),
-    ...availableHrirs.map((stem) => ({ value: stem, label: hrirDisplayName(stem) })),
+    ...(availableHrirEntries.length > 0
+      ? availableHrirEntries.map((e) => ({
+          value: e.stem,
+          label: e.group ? `${e.group} — ${e.display}` : e.display,
+        }))
+      : availableHrirs.map((stem) => ({ value: stem, label: hrirDisplayName(stem) }))),
   ]);
 
-  // Local mutable copy of hw_sink for the text field
-  let hwSinkDraft = $state("");
+  // ---------------------------------------------------------------------------
+  // Output device list (for the hardware-sink Select)
+  // ---------------------------------------------------------------------------
 
-  $effect(() => {
-    hwSinkDraft = surround?.hw_sink ?? "";
+  let outputs = $state<OutputDeviceSnapshot[]>([]);
+
+  onMount(() => {
+    listOutputs().then((o) => (outputs = o)).catch(() => {});
   });
+
+  const sinkOptions = $derived(buildSinkOptions(outputs, null));
+
+  // ---------------------------------------------------------------------------
+  // Import / fetch HRIR feedback state
+  // ---------------------------------------------------------------------------
+
+  let importBusy = $state(false);
+  let importMsg = $state<string | null>(null);
 
   // ---------------------------------------------------------------------------
   // Apply returned state to the store
@@ -90,18 +123,30 @@
     });
   }
 
-  function onHwSinkCommit() {
-    const value = hwSinkDraft.trim();
-    surroundSetHwSink(value.length > 0 ? value : null)
-      .then(applyState)
-      .catch((err) => {
-        console.warn("[SpatialPage] surroundSetHwSink failed:", err);
-      });
+  async function onImportHrirs() {
+    importBusy = true;
+    importMsg = null;
+    try {
+      await surroundImportHrirs(null).then(applyState);
+      importMsg = "Imported HRIR profiles.";
+    } catch (err) {
+      importMsg = String(err);
+    } finally {
+      importBusy = false;
+    }
   }
 
-  function onHwSinkKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      onHwSinkCommit();
+  async function onFetchHrirs() {
+    importBusy = true;
+    importMsg = null;
+    try {
+      await surroundFetchHrirs().then(applyState);
+    } catch (err) {
+      // The daemon returns an informational error: automatic download is not yet
+      // available. Surface it as a note rather than a crash.
+      importMsg = String(err);
+    } finally {
+      importBusy = false;
     }
   }
 </script>
@@ -137,6 +182,49 @@
         </div>
       </div>
     {/if}
+
+    <!-- ===== HRIR import / fetch actions ===== -->
+    <div class="device-card device-card--live">
+      <div class="card-header">
+        <span class="card-icon" aria-hidden="true">⤓</span>
+        <h2 class="card-title">ADD HRIR PROFILES</h2>
+      </div>
+      <div class="card-body">
+        <div class="control-row">
+          <span class="field-label">IMPORT</span>
+          <div class="hrir-actions">
+            <button
+              class="ss-btn"
+              disabled={importBusy}
+              onclick={onImportHrirs}
+              aria-label="Import HRIR profiles from default directory"
+            >
+              {importBusy ? "Working…" : "Import my HRIRs"}
+            </button>
+            <button
+              class="ss-btn"
+              disabled={importBusy}
+              onclick={onFetchHrirs}
+              aria-label="Download HeSuVi HRIR set (not yet available)"
+            >
+              {importBusy ? "Working…" : "Download HeSuVi set"}
+            </button>
+          </div>
+        </div>
+        {#if importMsg}
+          <div class="field-row">
+            <span class="field-label--hint hrir-msg">{importMsg}</span>
+          </div>
+        {/if}
+        <div class="field-row">
+          <span class="field-label--hint">
+            "Import" scans <code>~/.local/share/pipewire/hrir_hesuvi/profiles/</code> for
+            HeSuVi 14-channel <code>.wav</code> files. "Download" is not yet available —
+            import files manually for now.
+          </span>
+        </div>
+      </div>
+    </div>
 
     <!-- ===== Master enable ===== -->
     <div class="device-card device-card--live">
@@ -248,26 +336,25 @@
       <div class="card-body">
         <div class="control-row">
           <span class="field-label">HARDWARE SINK</span>
-          <div class="input-group">
-            <input
-              type="text"
-              class="ss-text-input"
-              placeholder="auto-detect"
-              value={hwSinkDraft}
-              disabled={!masterEnabled}
-              oninput={(e) => { hwSinkDraft = (e.target as HTMLInputElement).value; }}
-              onblur={onHwSinkCommit}
-              onkeydown={onHwSinkKeydown}
-              aria-label="Hardware sink (PipeWire node name, leave blank to auto-detect)"
-            />
+          <div class="select-group">
+            <div class="select-control">
+              <Select
+                options={sinkOptions}
+                value={sinkSelectValue(surround?.hw_sink)}
+                onValueChange={(v) =>
+                  surroundSetHwSink(sinkValueToHwSink(v))
+                    .then(applyState)
+                    .catch((err) => console.warn("[SpatialPage] surroundSetHwSink failed:", err))}
+                disabled={!masterEnabled}
+                ariaLabel="Hardware sink (Auto-detect or pick a device)"
+              />
+            </div>
           </div>
         </div>
         <div class="field-row">
           <span class="field-label--hint">
-            PipeWire node name for the surround output target (e.g.
-            <code>alsa_output.usb-SteelSeries_Arctis_Nova_Pro</code>).
-            Leave blank to auto-detect the Arctis hardware sink.
-            Press Enter or click away to apply.
+            PipeWire output device for the surround sink target.
+            "Auto-detect" lets the engine pick the Arctis hardware sink automatically.
           </span>
         </div>
       </div>
@@ -552,40 +639,41 @@
     flex-shrink: 0;
   }
 
-  /* ===== Text input (hw sink) ===== */
-  .input-group {
+  /* ===== HRIR import / fetch actions ===== */
+  .hrir-actions {
     display: flex;
     align-items: center;
     gap: var(--ss-space-2);
-    flex: 1;
+    flex-wrap: wrap;
     justify-content: flex-end;
   }
 
-  .ss-text-input {
-    font-family: var(--ss-font-mono);
-    font-size: var(--ss-type-body-size);
+  .ss-btn {
+    font-family: var(--ss-font-ui);
+    font-size: var(--ss-type-label-size);
+    font-weight: var(--ss-type-label-weight);
+    letter-spacing: var(--ss-type-label-letter-spacing);
     color: var(--ss-text-primary);
     background: var(--ss-surface-input);
     border: 1px solid var(--ss-border);
     border-radius: var(--ss-radius-sm);
-    padding: var(--ss-space-1) var(--ss-space-2);
-    outline: none;
-    width: 280px;
-    min-width: 0;
+    padding: var(--ss-space-1) var(--ss-space-3);
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+    min-height: var(--ss-control-h);
   }
 
-  .ss-text-input::placeholder {
-    color: var(--ss-text-disabled);
-    font-style: italic;
+  .ss-btn:hover:not(:disabled) {
+    background: var(--ss-surface-2);
+    border-color: var(--ss-accent);
   }
 
-  .ss-text-input:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: 2px;
-  }
-
-  .ss-text-input:disabled {
+  .ss-btn:disabled {
     opacity: 0.4;
     cursor: not-allowed;
+  }
+
+  .hrir-msg {
+    color: var(--ss-text-secondary);
   }
 </style>

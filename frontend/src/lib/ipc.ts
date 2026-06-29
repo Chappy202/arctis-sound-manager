@@ -72,10 +72,20 @@ export interface MicSnapshot {
   hw_mic?: string | null;
 }
 
+/** Mirror of crates/engine/src/state.rs HrirEntrySnapshot. */
+export interface HrirEntrySnapshot {
+  stem: string;
+  display: string;
+  group: string;
+  tonality: string;
+}
+
 export interface SurroundSnapshot {
   enabled: boolean;
   hrir: string | null;
   available_hrirs: string[];
+  /** Rich per-entry metadata; empty when the engine is older (serde default = []). */
+  available_hrir_entries?: HrirEntrySnapshot[];
   channels: string[];
   hw_sink: string | null;
 }

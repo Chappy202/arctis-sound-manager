@@ -5,6 +5,48 @@
  * SpatialPage.svelte is a thin view that delegates logic here.
  */
 
+import type { OutputDeviceSnapshot } from "./ipc.js";
+import type { SelectOption } from "./ui/selectUtils.js";
+
+// ---------------------------------------------------------------------------
+// Hardware-sink Select helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the dropdown option list for the hardware-sink Select.
+ *
+ * The first entry is always "Auto-detect" (value = ""), which maps to
+ * `hw_sink = null` in the engine. When `resolved` is provided (the sink name
+ * the engine auto-detected), it appears in parentheses so the user can see
+ * what the engine chose.
+ */
+export function buildSinkOptions(
+  outputs: OutputDeviceSnapshot[],
+  resolved: string | null,
+): SelectOption[] {
+  const autoLabel = resolved ? `Auto-detect (${resolved})` : "Auto-detect";
+  return [
+    { value: "", label: autoLabel },
+    ...outputs.map((o) => ({ value: o.node_name, label: o.description || o.node_name })),
+  ];
+}
+
+/**
+ * Convert `hw_sink` (possibly null/undefined from engine state) to a Select value.
+ * null/undefined → "" which corresponds to the Auto-detect entry.
+ */
+export function sinkSelectValue(hwSink: string | null | undefined): string {
+  return hwSink ?? "";
+}
+
+/**
+ * Convert a Select value back to the `hw_sink` field for `surroundSetHwSink`.
+ * "" → null (auto-detect); any non-empty string → pin to that specific sink.
+ */
+export function sinkValueToHwSink(v: string): string | null {
+  return v === "" ? null : v;
+}
+
 // ---------------------------------------------------------------------------
 // HRIR display name (strip leading NN- numeric prefix; replace dashes with spaces)
 // ---------------------------------------------------------------------------
