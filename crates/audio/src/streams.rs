@@ -20,6 +20,52 @@ pub struct ParsedStream {
     pub sink_node_name: Option<String>,
 }
 
+/// Always-on system/infrastructure streams that should never appear in the app
+/// list (matched case-insensitively against the binary OR the application name).
+/// Extend this as more system noise turns up.
+const HIDDEN_SYSTEM_STREAMS: &[&str] = &["speech-dispatcher-dummy", "speech-dispatcher"];
+
+/// Generic shell names that Electron/Chromium apps report in `application.name`
+/// (e.g. Discord, Slack, VS Code). For these the process binary is the better
+/// display name.
+const GENERIC_APP_NAMES: &[&str] = &["chromium", "chrome", "electron"];
+
+/// True if a stream is system noise that should be hidden from the mixer.
+fn is_hidden_system_stream(binary: &str, app_name: &str) -> bool {
+    HIDDEN_SYSTEM_STREAMS
+        .iter()
+        .any(|d| binary.eq_ignore_ascii_case(d) || app_name.eq_ignore_ascii_case(d))
+}
+
+/// Capitalize the first character of a single word ("discord" → "Discord");
+/// leaves an already-capitalized word unchanged.
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(f) => f.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Resolve a human-friendly app name. When `application.name` is a generic
+/// Electron/Chromium shell value, prefer the process binary (title-cased), then
+/// the media name; otherwise use `application.name` as-is.
+fn resolve_app_name(app_name: &str, binary: &str, media_name: Option<&str>) -> String {
+    let is_generic =
+        |s: &str| GENERIC_APP_NAMES.contains(&s.trim().to_ascii_lowercase().as_str());
+    if is_generic(app_name) {
+        if !binary.trim().is_empty() && !is_generic(binary) {
+            return capitalize_first(binary.trim());
+        }
+        if let Some(m) = media_name {
+            if !m.trim().is_empty() {
+                return m.trim().to_string();
+            }
+        }
+    }
+    app_name.to_string()
+}
+
 /// Parse `pw-dump` JSON into the list of application output streams, each with
 /// its currently-linked sink `node.name` (resolved via Link objects).
 ///
@@ -106,7 +152,7 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
         if binary.is_empty() {
             continue;
         }
-        let app_name = props
+        let raw_app_name = props
             .get("application.name")
             .and_then(|v| v.as_str())
             .unwrap_or(&binary)
@@ -123,6 +169,13 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
             .get("media.name")
             .and_then(|v| v.as_str())
             .map(String::from);
+        // Hide always-on system/infrastructure streams (e.g. speech-dispatcher).
+        if is_hidden_system_stream(&binary, &raw_app_name) {
+            continue;
+        }
+        // Electron/Chromium apps report a generic application.name ("Chromium");
+        // prefer the process binary so they show their real name (Discord, …).
+        let app_name = resolve_app_name(&raw_app_name, &binary, media_name.as_deref());
         streams.push(ParsedStream {
             id,
             binary,
@@ -193,6 +246,63 @@ mod tests {
     fn malformed_json_is_parse_error() {
         let err = parse_app_streams("not json").unwrap_err();
         assert!(matches!(err, AudioError::Parse { .. }));
+    }
+
+    // --- system-stream filtering + Electron app naming --------------------
+
+    /// Minimal one-node Stream/Output/Audio pw-dump with the given props.
+    fn one_stream_dump(props_json: &str) -> String {
+        format!(
+            r#"[{{"id":50,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio",{props_json}}}}}}}]"#
+        )
+    }
+
+    #[test]
+    fn hides_speech_dispatcher_dummy_stream() {
+        let dump = one_stream_dump(
+            r#""application.name":"speech-dispatcher-dummy","application.process.binary":"speech-dispatcher-dummy""#,
+        );
+        let streams = parse_app_streams(&dump).unwrap();
+        assert!(streams.is_empty(), "speech-dispatcher must be hidden: {streams:?}");
+    }
+
+    #[test]
+    fn electron_chromium_app_uses_binary_name() {
+        // Discord reports application.name="Chromium" but binary="Discord".
+        let dump = one_stream_dump(
+            r#""application.name":"Chromium","application.process.binary":"Discord""#,
+        );
+        let streams = parse_app_streams(&dump).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].app_name, "Discord");
+        assert_eq!(streams[0].binary, "Discord");
+    }
+
+    #[test]
+    fn lowercase_binary_is_capitalized_for_generic_name() {
+        let dump = one_stream_dump(
+            r#""application.name":"Chromium","application.process.binary":"slack""#,
+        );
+        let streams = parse_app_streams(&dump).unwrap();
+        assert_eq!(streams[0].app_name, "Slack");
+    }
+
+    #[test]
+    fn generic_name_falls_back_to_media_name_when_binary_also_generic() {
+        let dump = one_stream_dump(
+            r#""application.name":"Chromium","application.process.binary":"chromium","media.name":"Some Tab""#,
+        );
+        let streams = parse_app_streams(&dump).unwrap();
+        assert_eq!(streams[0].app_name, "Some Tab");
+    }
+
+    #[test]
+    fn normal_app_name_is_left_untouched() {
+        let dump = one_stream_dump(
+            r#""application.name":"Spotify","application.process.binary":"spotify""#,
+        );
+        let streams = parse_app_streams(&dump).unwrap();
+        assert_eq!(streams[0].app_name, "Spotify");
     }
 
     #[test]
