@@ -7,7 +7,9 @@
 import { writable } from "svelte/store";
 import { getState, onStateChanged, type EngineState } from "./ipc.js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { markConnected, markDisconnected } from "./stores/connection.js";
+// NOTE: connectionStatus is DERIVED from engineState + loadError (see
+// stores/connection.ts), so init() only writes those two stores — there is no
+// manual markConnected/markDisconnected to keep in sync.
 
 /** The latest EngineState from the daemon. null = not yet loaded. */
 export const engineState = writable<EngineState | null>(null);
@@ -31,24 +33,14 @@ export async function init(): Promise<void> {
   if (initialised) return;
   initialised = true;
 
-  // Subscribe first so we never miss an event that races the initial fetch.
-  try {
-    unlistenFn = await onStateChanged((state) => {
-      engineState.set(state);
-      loadError.set(null);
-      markConnected();
-    });
-  } catch (e) {
-    // Non-fatal; we'll still try the initial fetch.
-    console.warn("[stores] Failed to subscribe to state-changed events:", e);
-  }
-
-  // Initial fetch.
+  // Determine connectivity FIRST. Doing the fetch before the event subscription
+  // means a slow or hanging `onStateChanged()` can never block the connection
+  // status from resolving to "connected"/"disconnected" (the bug that left the
+  // UI stuck on a "Connecting…" spinner with no controls).
   try {
     const state = await getState();
     engineState.set(state);
     loadError.set(null);
-    markConnected();
   } catch (e) {
     const msg =
       e instanceof Error
@@ -57,7 +49,17 @@ export async function init(): Promise<void> {
           ? e
           : "Daemon unavailable";
     loadError.set(msg);
-    markDisconnected();
+  }
+
+  // Then subscribe for live updates. (At 250 ms cadence, the tiny window between
+  // the fetch and the subscription is immediately re-covered by the next event.)
+  try {
+    unlistenFn = await onStateChanged((state) => {
+      engineState.set(state);
+      loadError.set(null);
+    });
+  } catch (e) {
+    console.warn("[stores] Failed to subscribe to state-changed events:", e);
   }
 }
 
