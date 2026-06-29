@@ -2,8 +2,11 @@
 **/*.rs.bk
 *.pdb
 
-# Harness scratch / worktree storage
-.claude/
+# Harness scratch — keep project commands/skills, ignore everything else
+# (worktrees = large repo clones, plus any local settings/transcripts).
+.claude/*
+!.claude/commands/
+!.claude/skills/
 .superpowers/
 
 # Tauri updater signing private key — NEVER commit; store in CI secret TAURI_SIGNING_PRIVATE_KEY
@@ -15,4 +18,3 @@
 
 # Local build artifacts / scratch — never commit
 *.rpm
-/openspec/
