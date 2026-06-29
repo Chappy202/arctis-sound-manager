@@ -34,6 +34,8 @@ pub trait DaemonEnv {
     fn write_file_atomic(&self, p: &Path, contents: &str) -> std::io::Result<()>;
     /// Poll until the socket is no longer connectable, up to a bound. Returns true if it went down.
     fn wait_socket_down(&self, socket: &Path, attempts: u32, delay_ms: u64) -> bool;
+    /// Copy `src` to `dst` (creating parent dirs), preserving the executable bit.
+    fn copy_file(&self, src: &Path, dst: &Path) -> std::io::Result<()>;
 }
 
 /// First existing candidate (caller builds the ordered list; `exists` is injected).
@@ -223,6 +225,17 @@ impl DaemonEnv for RealEnv {
         }
         !self.socket_live(socket)
     }
+
+    fn copy_file(&self, src: &Path, dst: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        let mut perms = std::fs::metadata(dst)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dst, perms)
+    }
 }
 
 /// Returns the user's home directory from `$HOME`, falling back to `/`.
@@ -259,6 +272,47 @@ pub fn candidate_binaries() -> Vec<PathBuf> {
         v.push(cwd.join("target/debug/asm-cli"));
     }
     v
+}
+
+/// Copy the bundled daemon to a stable path when it is missing or stale.
+///
+/// `app_version` is the running GUI's version. A marker file records the
+/// version last synced; we copy when `dest` is absent OR the marker differs.
+/// Returns `Ok(true)` if a copy happened.
+pub fn sync_daemon_binary(
+    env: &impl DaemonEnv,
+    bundled: &Path,
+    dest: &Path,
+    marker: &Path,
+    app_version: &str,
+) -> std::io::Result<bool> {
+    let current = env.path_exists(dest)
+        && env.read_file(marker).map(|v| v.trim() == app_version).unwrap_or(false);
+    if current {
+        return Ok(false);
+    }
+    env.copy_file(bundled, dest)?;
+    env.write_file_atomic(marker, app_version)?;
+    Ok(true)
+}
+
+/// When running as an AppImage, copy the bundled `asm-cli` sidecar to the stable
+/// `~/.local/bin/asm-cli` path so the systemd unit's `ExecStart` survives updates.
+/// No-op for deb/rpm/dev where `asm-cli` is already at a stable path.
+pub fn maybe_sync_bundled_daemon(env: &impl DaemonEnv, app_version: &str) {
+    if std::env::var_os("APPIMAGE").is_none() {
+        return;
+    }
+    let Some(bundled) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("asm-cli")))
+    else {
+        return;
+    };
+    let home = home_dir();
+    let dest = home.join(".local/bin/asm-cli");
+    let marker = home.join(".local/share/arctis-sound-manager/daemon-version");
+    let _ = sync_daemon_binary(env, &bundled, &dest, &marker, app_version);
 }
 
 #[cfg(test)]
@@ -300,6 +354,11 @@ impl DaemonEnv for MockEnv {
     }
     fn wait_socket_down(&self, _socket: &Path, _attempts: u32, _delay_ms: u64) -> bool {
         !self.socket_live.get()
+    }
+    fn copy_file(&self, _src: &Path, dst: &Path) -> std::io::Result<()> {
+        self.existing.borrow_mut().insert(dst.to_path_buf());
+        self.files.borrow_mut().insert(dst.to_path_buf(), "<binary>".to_string());
+        Ok(())
     }
 }
 
@@ -462,5 +521,45 @@ mod tests {
         assert_eq!(spawns.len(), 1);
         assert_eq!(spawns[0].0, "/usr/bin/asm-cli");
         assert_eq!(spawns[0].1, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn sync_copies_when_dest_missing() {
+        let env = MockEnv::default();
+        let copied = sync_daemon_binary(
+            &env,
+            Path::new("/mnt/app/asm-cli"),
+            Path::new("/home/x/.local/bin/asm-cli"),
+            Path::new("/home/x/.local/share/arctis-sound-manager/daemon-version"),
+            "0.2.0",
+        ).unwrap();
+        assert!(copied);
+        // marker now records the version
+        assert_eq!(
+            env.files.borrow().get(Path::new("/home/x/.local/share/arctis-sound-manager/daemon-version")).map(|s| s.as_str()),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn sync_skips_when_marker_matches_and_dest_exists() {
+        let env = MockEnv::default();
+        let dest = PathBuf::from("/home/x/.local/bin/asm-cli");
+        let marker = PathBuf::from("/home/x/.local/share/arctis-sound-manager/daemon-version");
+        env.existing.borrow_mut().insert(dest.clone());
+        env.files.borrow_mut().insert(marker.clone(), "0.2.0".to_string());
+        let copied = sync_daemon_binary(&env, Path::new("/mnt/app/asm-cli"), &dest, &marker, "0.2.0").unwrap();
+        assert!(!copied);
+    }
+
+    #[test]
+    fn sync_recopies_when_version_changed() {
+        let env = MockEnv::default();
+        let dest = PathBuf::from("/home/x/.local/bin/asm-cli");
+        let marker = PathBuf::from("/home/x/.local/share/arctis-sound-manager/daemon-version");
+        env.existing.borrow_mut().insert(dest.clone());
+        env.files.borrow_mut().insert(marker.clone(), "0.1.0".to_string());
+        let copied = sync_daemon_binary(&env, Path::new("/mnt/app/asm-cli"), &dest, &marker, "0.2.0").unwrap();
+        assert!(copied);
     }
 }

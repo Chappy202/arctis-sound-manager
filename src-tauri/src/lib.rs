@@ -79,6 +79,12 @@ pub fn run() {
             commands::daemon_set_autostart,
         ])
         .setup(|app| {
+            // Make the bundled daemon durable across AppImage updates.
+            daemon_control::maybe_sync_bundled_daemon(
+                &daemon_control::RealEnv,
+                env!("CARGO_PKG_VERSION"),
+            );
+
             // ── State-poll task (every 250 ms) ──────────────────────────────
             // Drives near-real-time GUI updates (volume, ChatMix dial position,
             // mute). The daemon is request-response (no event push), so the UI
