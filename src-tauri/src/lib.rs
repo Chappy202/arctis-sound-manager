@@ -1,4 +1,5 @@
 mod commands;
+mod daemon_control;
 mod error;
 mod meters;
 mod state;
