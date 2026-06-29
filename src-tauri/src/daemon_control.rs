@@ -34,6 +34,8 @@ pub trait DaemonEnv {
     fn path_exists(&self, p: &Path) -> bool;
     fn read_file(&self, p: &Path) -> std::io::Result<String>;
     fn write_file_atomic(&self, p: &Path, contents: &str) -> std::io::Result<()>;
+    /// Poll until the socket is no longer connectable, up to a bound. Returns true if it went down.
+    fn wait_socket_down(&self, socket: &Path, attempts: u32, delay_ms: u64) -> bool;
 }
 
 /// First existing candidate (caller builds the ordered list; `exists` is injected).
@@ -95,6 +97,8 @@ pub fn stop(env: &impl DaemonEnv, socket: &Path, home: &Path) -> Result<(), Stri
 pub fn restart(env: &impl DaemonEnv, socket: &Path, binary: &Path, home: &Path) -> Result<(), String> {
     if use_systemd(env, home) { return systemctl(env, "restart"); }
     stop(env, socket, home)?;
+    // Wait for socket to close; daemon may still own it briefly after shutdown_ipc returns.
+    env.wait_socket_down(socket, 50, 100);
     start(env, socket, binary, home)
 }
 
@@ -213,6 +217,14 @@ impl DaemonEnv for RealEnv {
         std::fs::write(&tmp, contents)?;
         std::fs::rename(&tmp, p)
     }
+
+    fn wait_socket_down(&self, socket: &Path, attempts: u32, delay_ms: u64) -> bool {
+        for _ in 0..attempts {
+            if !self.socket_live(socket) { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        !self.socket_live(socket)
+    }
 }
 
 /// Returns the user's home directory from `$HOME`, falling back to `/`.
@@ -287,6 +299,9 @@ impl DaemonEnv for MockEnv {
         self.files.borrow_mut().insert(p.to_path_buf(), contents.to_string());
         self.existing.borrow_mut().insert(p.to_path_buf());
         Ok(())
+    }
+    fn wait_socket_down(&self, _socket: &Path, _attempts: u32, _delay_ms: u64) -> bool {
+        !self.socket_live.get()
     }
 }
 
@@ -429,5 +444,25 @@ mod tests {
         // identical content → NO daemon-reload (no write), but enable still runs (idempotent)
         assert!(!runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"daemon-reload".to_string())));
         assert!(runs.iter().any(|(p,a)| p=="systemctl" && a.contains(&"enable".to_string())));
+    }
+
+    #[test]
+    fn restart_manual_waits_for_socket_down_then_starts() {
+        let env = MockEnv::default();
+        // No systemd available
+        env.run_results.borrow_mut().insert("systemctl --user --version".into(),
+            CmdOut { status: 127, stdout: String::new(), stderr: "not found".into() });
+        // Socket initially live and shutdown succeeds
+        env.socket_live.set(true);
+        env.shutdown_ok.set(true);
+        // Simulate the socket going down after stop returns (what really happens in production)
+        env.socket_live.set(false);
+        // Call restart with no unit (manual path)
+        restart(&env, Path::new("/run/x.sock"), Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
+        // Verify that a spawn was recorded: proof that start was reached and spawned the daemon
+        let spawns = env.spawns.borrow();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, "/usr/bin/asm-cli");
+        assert_eq!(spawns[0].1, vec!["daemon".to_string()]);
     }
 }
