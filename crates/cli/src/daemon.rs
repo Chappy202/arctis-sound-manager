@@ -102,6 +102,12 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::ProfileCreateFromFactory { template } => {
+            match engine.create_factory_profile(&template) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::DeviceSet { control, value } => match engine.device_set(&control, value) {
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
@@ -2714,6 +2720,83 @@ mod tests {
         assert!(
             msg.contains("not yet available") || msg.contains("HeSuVi"),
             "error must describe the placeholder: {msg}"
+        );
+    }
+
+    // ── A8: ProfileCreateFromFactory dispatch tests ────────────────────────────
+
+    #[test]
+    fn handle_profile_create_factory_dayz_returns_ok_and_active() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_a8_pcff_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileCreateFromFactory {
+                template: "DayZ".into(),
+            },
+        );
+        assert!(resp.ok, "expected ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        assert_eq!(
+            state.active_profile, "DayZ",
+            "active profile must be DayZ after factory creation"
+        );
+        assert!(
+            state.profiles.contains(&"DayZ".to_string()),
+            "DayZ must appear in profile list"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_create_factory_dayz_case_insensitive() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_a8_pcff_ci_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = queue_reconcile_present(MockRunner::new());
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(runner, cfg);
+
+        // lowercase "dayz" must also work
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileCreateFromFactory {
+                template: "dayz".into(),
+            },
+        );
+        assert!(resp.ok, "lowercase 'dayz' must return ok:true, got: {:?}", resp.error);
+        let state = resp.state.expect("state must be present");
+        assert_eq!(state.active_profile, "DayZ");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn handle_profile_create_factory_unknown_template_returns_err() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::ProfileCreateFromFactory {
+                template: "UnknownGame9000".into(),
+            },
+        );
+        assert!(!resp.ok, "unknown template must return ok:false");
+        let msg = resp.error.expect("error must be present");
+        assert!(
+            msg.contains("unknown factory profile template") || msg.contains("UnknownGame9000"),
+            "error must describe the bad template: {msg}"
         );
     }
 }

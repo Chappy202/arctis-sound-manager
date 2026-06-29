@@ -36,6 +36,8 @@ pub fn run() {
             commands::surround_set_hw_sink,
             commands::surround_import_hrirs,
             commands::surround_fetch_hrirs,
+            // A8: factory profile creation
+            commands::profile_create_from_factory,
             // F3b: profile management
             commands::profile_rename,
             commands::profile_delete,

@@ -67,6 +67,11 @@ pub enum Request {
     ProfileNew {
         name: String,
     },
+    /// Create a factory profile from a named template and make it the active profile.
+    /// Supported templates: `"DayZ"` (game surround on, footstep EQ, default sink = game).
+    ProfileCreateFromFactory {
+        template: String,
+    },
     /// Set a single device hardware control by name (sidetone|mic_led|anc|inactive_time|...).
     /// Writes are gated by the enabled_writes allowlist (empty until Task 7 owner-validation).
     DeviceSet {
@@ -569,6 +574,36 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("profile-new"), "cmd tag must be kebab-case");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    // ── A8: ProfileCreateFromFactory wire-tag + round-trip tests ────────────────
+
+    #[test]
+    fn parse_profile_create_from_factory_wire_tag() {
+        let req: Request = serde_json::from_str(
+            r#"{"cmd":"profile-create-from-factory","template":"DayZ"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            Request::ProfileCreateFromFactory {
+                template: "DayZ".into()
+            }
+        );
+    }
+
+    #[test]
+    fn request_profile_create_from_factory_round_trips() {
+        let req = Request::ProfileCreateFromFactory {
+            template: "DayZ".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("profile-create-from-factory"),
+            "cmd tag must be profile-create-from-factory (kebab-case), got: {json}"
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

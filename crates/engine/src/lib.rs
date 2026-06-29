@@ -7,6 +7,7 @@ pub mod convert;
 pub mod device;
 pub mod engine;
 pub mod error;
+pub mod factory_profiles;
 pub mod hrir_catalog;
 pub mod hrir_import;
 pub mod presets;

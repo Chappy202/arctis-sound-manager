@@ -308,6 +308,16 @@ pub async fn surround_fetch_hrirs(
     call(&state, Request::SurroundFetchHrirs).await
 }
 
+// ── A8: Factory profile creation ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn profile_create_from_factory(
+    template: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ProfileCreateFromFactory { template }).await
+}
+
 // ── F3b: Profile management commands ─────────────────────────────────────────
 
 #[tauri::command]

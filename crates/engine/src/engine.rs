@@ -1126,6 +1126,33 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Create a factory profile from a named template, make it active, persist,
+    /// reconcile the graph, and emit a `ProfileCreated` event.
+    ///
+    /// The template name is matched case-insensitively. Supported templates:
+    /// - `"DayZ"` — game surround on, footstep EQ, default sink = game channel.
+    ///
+    /// Unknown templates return `EngineError::BadRequest`.
+    pub fn create_factory_profile(&mut self, template: &str) -> Result<(), EngineError> {
+        match template.to_lowercase().as_str() {
+            "dayz" => {
+                let active = self.config.active()?.clone();
+                let p = crate::factory_profiles::dayz_profile(&active);
+                self.config.upsert_profile(p);
+                self.config.active_profile = "DayZ".into();
+                self.save_config()?;
+                self.reconcile()?;
+                self.emit(Event::ProfileCreated {
+                    name: "DayZ".into(),
+                });
+                Ok(())
+            }
+            other => Err(EngineError::BadRequest(format!(
+                "unknown factory profile template: {other}"
+            ))),
+        }
+    }
+
     /// Rename a profile. If it was the active profile, also updates `active_profile`.
     /// Saves config and emits `ProfileRenamed`.
     pub fn rename_profile(&mut self, old: &str, new: &str) -> Result<(), EngineError> {

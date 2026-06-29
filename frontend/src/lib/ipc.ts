@@ -232,6 +232,14 @@ export const profileNew = (name: string): Promise<EngineState> =>
   invoke<EngineState>("profile_new", { name });
 
 /**
+ * Create a factory profile from a named template and make it the active profile.
+ * Supported templates: `"DayZ"` (game surround on, footstep EQ, default sink = game).
+ * Returns the updated EngineState.
+ */
+export const profileCreateFromFactory = (template: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_create_from_factory", { template });
+
+/**
  * Set (or clear) the output device for a channel.
  * Returns the updated EngineState so the caller can apply it to the store
  * immediately for snappy feedback (no need to wait for the state-changed event).
