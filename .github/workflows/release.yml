@@ -9,7 +9,10 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # ubuntu-22.04 (not -latest/24.04): 24.04's AppArmor unprivileged-userns
+    # restriction breaks linuxdeploy/appimagetool during AppImage bundling.
+    # 22.04 also links an older glibc → more portable AppImage.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
