@@ -221,11 +221,7 @@
     font-style: italic;
   }
 
-  /* ===== Collapsible details wrapper ===== */
-  .remembered {
-    /* no extra chrome — the inner card provides the surface */
-  }
-
+  /* ===== Collapsible details wrapper — no extra chrome; the inner card provides the surface ===== */
   .route-summary {
     cursor: pointer;
     font-family: var(--ss-font-ui);

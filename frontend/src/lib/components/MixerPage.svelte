@@ -250,13 +250,8 @@
       hardwareActive={$engineState.device_present && $engineState.dial_controls_balance}
       onError={(m) => (dropError = m)} />
 
-    <!-- ===== Route list — collapsible, de-emphasised ===== -->
-    <details class="routes-disclosure">
-      <summary class="routes-summary">Remembered routes</summary>
-      <div class="routes-body">
-        <RouteList />
-      </div>
-    </details>
+    <!-- ===== Route list — collapsible, de-emphasised (RouteList is its own <details>) ===== -->
+    <RouteList />
     {/if}<!-- /$engineState inner guard -->
   {/if}<!-- /$connectionStatus gate -->
 </div>
@@ -537,64 +532,6 @@
 
   .drop-error-dismiss:hover {
     background: rgba(229, 72, 77, 0.15);
-  }
-
-  /* ===== Routes — collapsible section ===== */
-  .routes-disclosure {
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-md);
-    background: var(--ss-surface-1);
-    overflow: hidden;
-  }
-
-  .routes-summary {
-    display: flex;
-    align-items: center;
-    gap: var(--ss-space-2);
-    padding: var(--ss-space-3) var(--ss-space-4);
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-caption-size);
-    font-weight: var(--ss-type-micro-weight);
-    letter-spacing: var(--ss-type-micro-letter-spacing);
-    text-transform: uppercase;
-    color: var(--ss-text-tertiary);
-    cursor: pointer;
-    user-select: none;
-    list-style: none;
-    transition: color var(--ss-dur-fast) var(--ss-ease-standard);
-  }
-
-  /* Remove default disclosure triangle in WebKit */
-  .routes-summary::-webkit-details-marker {
-    display: none;
-  }
-
-  /* Custom chevron via ::before */
-  .routes-summary::before {
-    content: "›";
-    display: inline-block;
-    font-size: 14px;
-    line-height: 1;
-    color: var(--ss-text-tertiary);
-    transition: transform var(--ss-dur-fast) var(--ss-ease-standard);
-    transform: rotate(0deg);
-  }
-
-  .routes-disclosure[open] .routes-summary::before {
-    transform: rotate(90deg);
-  }
-
-  .routes-summary:hover {
-    color: var(--ss-text-secondary);
-  }
-
-  .routes-summary:focus-visible {
-    outline: 2px solid var(--ss-accent);
-    outline-offset: -2px;
-  }
-
-  .routes-body {
-    padding: 0 var(--ss-space-4) var(--ss-space-4);
   }
 
 </style>
