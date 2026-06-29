@@ -43,7 +43,7 @@
       "endpoints": [
         "https://REPLACE-ME.example.com/arctis-sound-manager/{{target}}-{{arch}}/{{current_version}}"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZFNTU3NjQ5OTk3MEQwRTIKUldUaTBIQ1pTWFpWL29Zclp0akNuQ0lGR3JpVkdPMUw2dmRXazI5YzUydW5PZ0FtQkQwS2NXM1MK"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY2QjBGRUZEMTVDRUFBQkQKUldTOXFzNFYvZjZ3OWllNW9XVURUc0dlcGVHZ1ErM2VNMkRjOTFrUFRNcU5vNWZzNVR4L3ljNkkK"
     }
   }
 }
