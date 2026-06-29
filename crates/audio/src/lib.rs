@@ -43,4 +43,6 @@ pub use routing::{
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
 pub use sinks::{parse_default_sink_name, parse_node_volume, parse_output_sinks, OutputSink};
 pub use streams::{parse_app_streams, ParsedStream};
-pub use surround::{render_surround_conf, SurroundBackend, SurroundSpec};
+pub use surround::{
+    render_surround_conf, render_surround_conf_ex, SurroundBackend, SurroundRender, SurroundSpec,
+};
