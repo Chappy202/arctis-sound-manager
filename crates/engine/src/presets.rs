@@ -25,6 +25,8 @@ pub fn factory_eq_presets() -> Vec<EqPreset> {
             vec![ls(-2.0), pk(62.0,-1.5), pkq(125.0,1.41,-7.0), pk(250.0,-2.5), pk(500.0,0.0), pk(1000.0,2.0), pk(2000.0,3.5), pk(4000.0,5.0), pk(8000.0,2.5), hs(1.0)]),
         eqp("FPS / Footsteps (Competitive)", "Gaming · preamp -3 dB",
             vec![ls(0.0), pk(62.0,-3.0), pkq(125.0,1.41,-2.0), pk(250.0,3.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,3.0), pk(4000.0,2.0), pk(8000.0,0.0), hs(0.0)]),
+        eqp("DayZ Spatial", "Gaming · post-HRIR footsteps + air",
+            vec![ls(-1.0), pk(62.0,-3.0), pkq(125.0,1.41,-2.0), pk(250.0,3.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,3.0), pk(4000.0,2.0), pk(8000.0,1.5), hs(1.5)]),
         eqp("Immersive", "Movies · preamp -4.5 dB",
             vec![ls(4.5), pk(62.0,2.5), pkq(125.0,1.41,-5.5), pk(250.0,-1.0), pk(500.0,0.0), pk(1000.0,0.5), pk(2000.0,1.0), pk(4000.0,2.0), pk(8000.0,-2.0), hs(3.5)]),
         eqp("Vocal Clarity", "Voice · preamp -4 dB",
@@ -122,5 +124,16 @@ mod tests {
         // gentle: no band exceeds +4 dB, sub-bass cut present
         assert!(fp.bands.iter().all(|b| b.gain_db <= 4.0));
         assert!(fp.bands.iter().any(|b| b.freq_hz == 62.0 && b.gain_db < 0.0));
+    }
+
+    #[test]
+    fn dayz_spatial_preset_present_and_capped_at_plus_3() {
+        let p = factory_eq_presets();
+        let dz = p.iter().find(|p| p.name == "DayZ Spatial").expect("DayZ Spatial present");
+        assert_eq!(dz.bands.len(), 10, "DayZ Spatial must have 10 bands");
+        assert!(dz.bands.iter().all(|b| b.gain_db <= 3.0), "no band may boost beyond +3 dB");
+        // 250 Hz footstep-weight boost and 62 Hz rumble cut are the signature moves.
+        assert!(dz.bands.iter().any(|b| b.freq_hz == 250.0 && b.gain_db == 3.0));
+        assert!(dz.bands.iter().any(|b| b.freq_hz == 62.0 && b.gain_db < 0.0));
     }
 }
