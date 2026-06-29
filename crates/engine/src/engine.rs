@@ -2382,6 +2382,7 @@ impl<R: CommandRunner> Engine<R> {
         let spec = convert::surround_spec(sc);
 
         if !sc.enabled {
+            self.surround_hrir_missing = None;
             // Remove surround sink (idempotent).
             let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
             if let Err(e) = surround_be.remove() {
@@ -2427,11 +2428,13 @@ impl<R: CommandRunner> Engine<R> {
             sc.channels.first().cloned()
         };
 
-        // If the primary channel has a custom (non-empty) EQ, move it to the binaural
-        // output tail so that 7.1 spatialisation and the EQ coexist without double-applying.
+        // Post-convolution binaural EQ: prefer an explicit profile curve; otherwise fall back
+        // to relocating the primary surround channel's EQ to the tail (legacy back-compat).
         // An empty eq vec means "flat default" — we leave output_eq=None to preserve the
         // existing single-HRIR-conf behaviour for non-EQ'd profiles (back-compat).
-        let output_eq: Option<EqModel> = if let Some(ref ch_id) = primary_ch_id {
+        let output_eq: Option<EqModel> = if !sc.output_eq.is_empty() {
+            Some(convert::eq_model_from_bands(&sc.output_eq)?)
+        } else if let Some(ref ch_id) = primary_ch_id {
             if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
                 if !ch.eq.is_empty() {
                     Some(convert::eq_model_for(ch)?)
@@ -2449,15 +2452,22 @@ impl<R: CommandRunner> Engine<R> {
         // StereoBypass does not use an HRIR file — resolve only when needed.
         let effective = resolve_effective_mode(sc.mode, None);
         let hrir_path_opt: Option<std::path::PathBuf> = match effective {
-            SurroundMode::StereoBypass => None,
+            SurroundMode::StereoBypass => {
+                self.surround_hrir_missing = None;
+                None
+            }
             _ => match convert::hrir_base_dir()
-                .and_then(|base| convert::resolve_hrir_path(sc, &base))
+                .and_then(|base| convert::resolve_hrir_path_or_fallback(sc, &base))
             {
-                Ok(p) => Some(p),
+                Ok((p, missing)) => {
+                    self.surround_hrir_missing = missing;
+                    Some(p)
+                }
                 Err(e) => {
                     eprintln!(
                         "warning: apply_surround HRIR resolve failed (skipping surround): {e}"
                     );
+                    self.surround_hrir_missing = None;
                     return Ok(());
                 }
             },
@@ -2477,7 +2487,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref(), None)
+                    surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref(), sc.blocksize)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2487,7 +2497,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref(), None)
+                    surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref(), sc.blocksize)
                 }
                 SurroundMode::StereoBypass => {
                     surround_be.recreate_stereo_bypass(sc.crossfeed, output_eq.as_ref())
@@ -7881,6 +7891,96 @@ mod tests {
         assert!(
             !game_conf.contains(&gain_str_in_conf),
             "game channel sink conf must NOT contain custom gain {gain_str_in_conf} (EQ moved to tail), conf:\n{game_conf}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    /// Explicit `output_eq` is preferred over legacy channel-EQ relocation: the spawned
+    /// surround conf must carry the pinned `blocksize` and per-ear EQ tail nodes sourced
+    /// from `sc.output_eq` (the game channel here has NO custom EQ), and — since the pinned
+    /// HRIR is present — `state().surround.hrir_missing` must stay `None`.
+    #[test]
+    fn apply_surround_uses_explicit_output_eq_and_blocksize_and_clears_missing() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("t6_explicit_eq");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("g.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let mut cfg = make_config_surround_single_game_no_eq("g");
+        cfg.profiles[0].surround.blocksize = Some(128);
+        cfg.profiles[0].surround.output_eq = vec![arctis_config::EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 250.0,
+            q: 1.0,
+            gain_db: 3.0,
+        }];
+
+        let runner = queue_apply_surround_both_absent(MockRunner::new());
+        let mut engine = Engine::new(runner, cfg);
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        // HRIR present → no missing flag.
+        assert_eq!(engine.state().surround.hrir_missing, None);
+
+        // Inspect the spawned surround conf (established mechanism: find the "arctis_surround"
+        // spawn argv and read the conf file at argv[2]).
+        let surround_argv = engine
+            .runner
+            .spawned
+            .iter()
+            .find(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("arctis_surround"))
+                    .unwrap_or(false)
+            })
+            .expect("surround conf must have been spawned");
+        let conf = std::fs::read_to_string(&surround_argv[2])
+            .expect("surround conf file must exist");
+        assert!(
+            conf.contains("blocksize = 128"),
+            "surround conf must carry pinned blocksize, got:\n{conf}"
+        );
+        assert!(
+            conf.contains("\"eq_l_0\""),
+            "surround conf must carry explicit output_eq tail nodes, got:\n{conf}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    /// A pinned HRIR stem that is not installed must fall back to the bundled dry HRIR
+    /// (`07-oal+++-openal-max`) and record the missing stem in `state().surround.hrir_missing`.
+    #[test]
+    fn apply_surround_missing_pinned_hrir_falls_back_and_sets_flag() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("t6_missing_hrir");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        // Only the bundled fallback is present; the pinned stem is absent.
+        std::fs::write(profiles_dir.join("07-oal+++-openal-max.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        let cfg = make_config_surround_single_game_no_eq("04-gsx-sennheiser-gsx");
+        let runner = queue_apply_surround_both_absent(MockRunner::new());
+        let mut engine = Engine::new(runner, cfg);
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        assert_eq!(
+            engine.state().surround.hrir_missing,
+            Some("04-gsx-sennheiser-gsx".to_string())
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
