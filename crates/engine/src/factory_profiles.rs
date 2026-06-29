@@ -21,7 +21,6 @@ pub struct FactoryProfileSpec {
     pub surround_channels: &'static [&'static str],
     pub default_sink_channel: Option<&'static str>,
     pub content_eq: Option<ChannelEqSeed>,
-    pub output_eq_preset: Option<&'static str>,
 }
 
 const DAYZ: FactoryProfileSpec = FactoryProfileSpec {
@@ -31,8 +30,7 @@ const DAYZ: FactoryProfileSpec = FactoryProfileSpec {
     blocksize: Some(128),
     surround_channels: &["game"],
     default_sink_channel: Some("game"),
-    content_eq: None,
-    output_eq_preset: Some("DayZ Spatial"),
+    content_eq: Some(ChannelEqSeed { channel_id: "game", preset_name: "DayZ Spatial" }),
 };
 
 /// The catalog. DayZ is today's only entry.
@@ -84,10 +82,6 @@ pub fn apply_factory_spec(active: &Profile, spec: &FactoryProfileSpec) -> Result
     if let Some(stem) = spec.hrir_stem {
         surround.hrir = Some(stem.into());
     }
-    surround.output_eq = match spec.output_eq_preset {
-        Some(n) => preset_bands(n)?,
-        None => Vec::new(),
-    };
     profile.surround = surround;
     profile.default_sink_channel = spec.default_sink_channel.map(|s| s.to_string());
     Ok(profile)
@@ -135,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_dayz_spec_sets_surround_and_output_eq() {
+    fn apply_dayz_spec_sets_surround_and_game_channel_eq() {
         let active = make_active();
         let p = apply_factory_spec(&active, &DAYZ).unwrap();
         assert_eq!(p.name, "DayZ");
@@ -144,11 +138,17 @@ mod tests {
         assert_eq!(p.surround.hrir, Some("04-gsx-sennheiser-gsx".to_string()));
         assert_eq!(p.surround.mode, SurroundMode::Hrir71);
         assert_eq!(p.surround.blocksize, Some(128));
-        assert_eq!(p.surround.output_eq.len(), 10, "DayZ Spatial seeds 10 post bands");
         assert_eq!(p.default_sink_channel, Some("game".into()));
-        // content_eq is None for DayZ → game channel EQ stays empty.
+        // The DayZ Spatial footstep curve now lives on the GAME channel EQ
+        // (applied pre-convolution), not a separate post-convolution tail.
         let game = p.channels.iter().find(|c| c.id == "game").unwrap();
-        assert!(game.eq.is_empty(), "no pre-convolution channel EQ for DayZ");
+        let expected = crate::presets::factory_eq_presets()
+            .into_iter()
+            .find(|pr| pr.name == "DayZ Spatial")
+            .expect("DayZ Spatial preset exists")
+            .bands;
+        assert_eq!(expected.len(), 10, "DayZ Spatial is a 10-band preset");
+        assert_eq!(game.eq, expected, "game channel EQ == DayZ Spatial preset bands");
     }
 
     #[test]
@@ -200,7 +200,10 @@ mod tests {
     #[test]
     fn apply_factory_spec_unknown_preset_errors() {
         let active = make_active();
-        let bogus = FactoryProfileSpec { output_eq_preset: Some("No Such Preset"), ..DAYZ };
+        let bogus = FactoryProfileSpec {
+            content_eq: Some(ChannelEqSeed { channel_id: "game", preset_name: "No Such Preset" }),
+            ..DAYZ
+        };
         assert!(matches!(apply_factory_spec(&active, &bogus), Err(EngineError::BadRequest(_))));
     }
 }

@@ -161,9 +161,6 @@ pub struct SurroundSnapshot {
     /// `None` = the pinned/selected HRIR resolved normally. UI shows an import prompt when set.
     #[serde(default)]
     pub hrir_missing: Option<String>,
-    /// Explicit post-convolution EQ on the binaural tail. Empty = none / legacy relocation.
-    #[serde(default)]
-    pub output_eq: Vec<EqBandSnapshot>,
     /// Convolver partition size, if pinned by the profile.
     #[serde(default)]
     pub blocksize: Option<u32>,
@@ -391,20 +388,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn surround_snapshot_defaults_have_no_missing_and_empty_output_eq() {
+    fn surround_snapshot_defaults_have_no_missing_and_no_blocksize() {
         let s = SurroundSnapshot::default();
         assert_eq!(s.hrir_missing, None);
-        assert!(s.output_eq.is_empty());
         assert_eq!(s.blocksize, None);
     }
 
     #[test]
     fn surround_snapshot_old_json_defaults_new_fields() {
-        // JSON from an older engine omits the three new fields.
+        // JSON from an older engine omits the new fields.
         let json = r#"{"enabled":false,"hrir":null,"available_hrirs":[],"channels":[],"hw_sink":null}"#;
         let s: SurroundSnapshot = serde_json::from_str(json).expect("deserialize old snapshot");
         assert_eq!(s.hrir_missing, None);
-        assert!(s.output_eq.is_empty());
         assert_eq!(s.blocksize, None);
     }
 }

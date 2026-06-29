@@ -2,7 +2,7 @@ use crate::error::CommandError;
 use crate::state::{DaemonState, MeterSubscribers};
 use arctis_client::{send_request_to, Request};
 use arctis_engine::{
-    AppStream, EngineState, EqBandSnapshot, FactoryProfileInfo, OutputDeviceSnapshot,
+    AppStream, EngineState, FactoryProfileInfo, OutputDeviceSnapshot,
 };
 use std::sync::atomic::Ordering;
 use tauri::State;
@@ -316,14 +316,6 @@ pub async fn list_factory_profiles(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<Vec<FactoryProfileInfo>, CommandError> {
     call_factory_profiles(&state, Request::ListFactoryProfiles).await
-}
-
-#[tauri::command]
-pub async fn surround_set_output_eq(
-    bands: Vec<EqBandSnapshot>,
-    state: State<'_, Mutex<DaemonState>>,
-) -> Result<EngineState, CommandError> {
-    call(&state, Request::SurroundSetOutputEq { bands }).await
 }
 
 #[tauri::command]

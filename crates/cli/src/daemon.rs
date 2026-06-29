@@ -185,21 +185,6 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
         Request::ListFactoryProfiles => {
             Response::ok_with_factory_profiles(engine.list_factory_profiles())
         }
-        Request::SurroundSetOutputEq { bands } => {
-            let cfg_bands: Vec<EqBandConfig> = bands
-                .into_iter()
-                .map(|b| EqBandConfig {
-                    kind: b.kind,
-                    freq_hz: b.freq_hz,
-                    q: b.q,
-                    gain_db: b.gain_db,
-                })
-                .collect();
-            match engine.surround_set_output_eq(cfg_bands) {
-                Ok(()) => Response::ok_with_state(engine.state()),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
         Request::SurroundSetBlocksize { blocksize } => {
             match engine.surround_set_blocksize(blocksize) {
                 Ok(()) => Response::ok_with_state(engine.state()),
@@ -1650,36 +1635,6 @@ mod tests {
             "catalog must include DayZ, got: {:?}",
             profiles
         );
-    }
-
-    #[test]
-    fn handle_surround_set_output_eq_updates_state() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join(format!("asm_f14_oeq_{}", std::process::id()));
-        std::env::set_var("ASM_CONFIG_HOME", &tmp);
-
-        let cfg = two_profile_config();
-        let mut engine = Engine::new(MockRunner::new(), cfg);
-        let resp = handle_request(
-            &mut engine,
-            Request::SurroundSetOutputEq {
-                bands: vec![arctis_engine::EqBandSnapshot {
-                    kind: "peaking".into(),
-                    freq_hz: 250.0,
-                    q: 1.0,
-                    gain_db: 3.0,
-                }],
-            },
-        );
-        assert!(
-            resp.ok,
-            "SurroundSetOutputEq must return ok:true, got: {:?}",
-            resp.error
-        );
-        assert!(resp.state.is_some(), "state must be present");
-
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     #[test]

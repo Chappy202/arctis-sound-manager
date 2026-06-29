@@ -621,16 +621,6 @@ impl<R: CommandRunner> Engine<R> {
                 effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
                 negotiated_channels: None,
                 hrir_missing: surround_hrir_missing,
-                output_eq: sc
-                    .output_eq
-                    .iter()
-                    .map(|b| crate::state::EqBandSnapshot {
-                        kind: b.kind.clone(),
-                        freq_hz: b.freq_hz,
-                        q: b.q,
-                        gain_db: b.gain_db,
-                    })
-                    .collect(),
                 blocksize: sc.blocksize,
             }
         } else {
@@ -2480,34 +2470,9 @@ impl<R: CommandRunner> Engine<R> {
             return Ok(());
         }
 
-        // Determine the primary surround channel (prefers "game"; falls back to first).
-        // Used to decide which channel's EQ moves to the binaural output tail.
-        let primary_ch_id: Option<String> = if sc.channels.iter().any(|c| c == "game") {
-            Some("game".to_string())
-        } else {
-            sc.channels.first().cloned()
-        };
-
-        // Post-convolution binaural EQ: prefer an explicit profile curve; otherwise fall back
-        // to relocating the primary surround channel's EQ to the tail (legacy back-compat).
-        // An empty eq vec means "flat default" — we leave output_eq=None to preserve the
-        // existing single-HRIR-conf behaviour for non-EQ'd profiles (back-compat).
-        let output_eq: Option<EqModel> = if !sc.output_eq.is_empty() {
-            Some(convert::eq_model_from_bands(&sc.output_eq)?)
-        } else if let Some(ref ch_id) = primary_ch_id {
-            if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
-                if !ch.eq.is_empty() {
-                    Some(convert::eq_model_for(ch)?)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        // Each surround-routed channel keeps its own EQ on its channel sink, applied
+        // BEFORE convolution. There is no config-driven post-convolution tail EQ.
+        //
         // Enabled path: resolve HRIR first (only needed for HRIR modes).
         // StereoBypass does not use an HRIR file — resolve only when needed.
         let effective = resolve_effective_mode(sc.mode, None);
@@ -2547,7 +2512,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref(), sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2557,10 +2522,10 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref(), sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize)
                 }
                 SurroundMode::StereoBypass => {
-                    surround_be.recreate_stereo_bypass(sc.crossfeed, output_eq.as_ref())
+                    surround_be.recreate_stereo_bypass(sc.crossfeed, None)
                 }
             };
             match result {
@@ -2623,17 +2588,8 @@ impl<R: CommandRunner> Engine<R> {
         // Route new channels to surround.
         for ch_id in &to_route {
             if let Some(ch) = profile.channels.iter().find(|c| &c.id == ch_id) {
-                // When the primary channel's EQ has been moved to the binaural output tail
-                // (output_eq.is_some()), pass a flat model to the channel sink to avoid
-                // double-applying the EQ.  All other channels get their own EQ as normal.
-                //
-                // Note (v1 limitation): if the user edits this channel's EQ while surround is
-                // already active, a surround toggle is required to re-apply the updated tail EQ.
-                let eq_model = if Some(ch_id) == primary_ch_id.as_ref() && output_eq.is_some() {
-                    EqModel::default_10band()
-                } else {
-                    convert::eq_model_for(ch)?
-                };
+                // Each channel keeps its own EQ on its channel sink (applied pre-convolution).
+                let eq_model = convert::eq_model_for(ch)?;
                 let handle = {
                     let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
                     mgr.set_output(ch_id, Some(surround_target.clone()), &eq_model)
@@ -2748,31 +2704,6 @@ impl<R: CommandRunner> Engine<R> {
         self.emit(crate::state::Event::SurroundChannelsSet {
             channels: channels_snapshot,
         });
-        Ok(())
-    }
-
-    /// Set the explicit post-convolution surround EQ. Persists; re-applies when enabled.
-    pub fn surround_set_output_eq(
-        &mut self,
-        bands: Vec<arctis_config::EqBandConfig>,
-    ) -> Result<(), crate::error::EngineError> {
-        // Validate BEFORE persisting so out-of-bounds gains/kinds are rejected
-        // with a typed error and nothing is saved or torn down (G7).
-        convert::eq_model_from_bands(&bands)?.validate()?;
-        {
-            let name = self.config.active_profile.clone();
-            let profile = self.config.profile_mut(&name).ok_or_else(|| {
-                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
-                    name.clone(),
-                ))
-            })?;
-            profile.surround.output_eq = bands;
-        }
-        self.save_config()?;
-        if self.config.active()?.surround.enabled {
-            let profile = self.config.active()?.clone();
-            self.apply_surround(&profile)?;
-        }
         Ok(())
     }
 
@@ -6919,57 +6850,6 @@ mod tests {
     }
 
     #[test]
-    fn surround_set_output_eq_persists() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = unique_cfg_tmp("surr_set_oeq");
-        std::env::set_var("ASM_CONFIG_HOME", &tmp);
-
-        let cfg = make_config_no_eq_no_routes();
-        let mut engine = Engine::new(MockRunner::new(), cfg);
-
-        let bands = vec![arctis_config::EqBandConfig {
-            kind: "peaking".into(),
-            freq_hz: 250.0,
-            q: 1.0,
-            gain_db: 3.0,
-        }];
-        engine.surround_set_output_eq(bands.clone()).unwrap();
-        assert_eq!(engine.config.active().unwrap().surround.output_eq, bands);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("ASM_CONFIG_HOME");
-    }
-
-    #[test]
-    fn surround_set_output_eq_rejects_out_of_range_gain_and_leaves_config_unchanged() {
-        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = unique_cfg_tmp("surr_set_oeq_bad");
-        std::env::set_var("ASM_CONFIG_HOME", &tmp);
-
-        let cfg = make_config_no_eq_no_routes();
-        let mut engine = Engine::new(MockRunner::new(), cfg);
-        let before = engine.config.active().unwrap().surround.output_eq.clone();
-
-        // +99 dB is well out of the validated gain range → typed Err, nothing saved.
-        let bad = vec![arctis_config::EqBandConfig {
-            kind: "peaking".into(),
-            freq_hz: 1000.0,
-            q: 1.0,
-            gain_db: 99.0,
-        }];
-        let res = engine.surround_set_output_eq(bad);
-        assert!(matches!(res, Err(crate::error::EngineError::Audio(_))));
-        assert_eq!(
-            engine.config.active().unwrap().surround.output_eq,
-            before,
-            "config must be unchanged when validation fails"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::remove_var("ASM_CONFIG_HOME");
-    }
-
-    #[test]
     fn surround_set_blocksize_rejects_zero() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("surr_set_bs_zero");
@@ -8272,11 +8152,13 @@ mod tests {
         std::env::remove_var("HOME");
     }
 
-    /// EQ-on-binaural-output: a profile whose "game" channel has a non-empty EQ must
-    /// (a) produce a surround conf WITH eq_l_0 / eq_r_0 tail nodes, AND
-    /// (b) route the game channel sink with a FLAT EQ (no custom band gain in channel conf).
+    /// One-EQ-per-channel: a profile whose "game" channel has a non-empty EQ must
+    /// (a) produce a surround conf with NO eq_l_0 / eq_r_0 tail nodes (no config-driven
+    ///     post-convolution EQ), AND
+    /// (b) route the game channel sink WITH its own EQ (custom band gain present in the
+    ///     channel conf) — i.e. the channel EQ is applied pre-convolution.
     #[test]
-    fn apply_surround_game_eq_moves_to_binaural_tail_and_channel_sink_flat() {
+    fn apply_surround_game_eq_stays_on_channel_sink_no_tail() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("b6b_eq_tail");
         let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
@@ -8306,7 +8188,7 @@ mod tests {
             .apply_surround(&profile)
             .expect("apply_surround must succeed");
 
-        // (a) Surround conf must have EQ tail nodes.
+        // (a) Surround conf must have NO EQ tail nodes (no config-driven post-conv EQ).
         let surround_argv = engine
             .runner
             .spawned
@@ -8320,34 +8202,29 @@ mod tests {
         let surround_conf = std::fs::read_to_string(&surround_argv[2])
             .expect("surround conf file must exist");
         assert!(
-            surround_conf.contains("\"eq_l_0\""),
-            "surround conf must contain eq_l_0 tail node when game channel has custom EQ"
-        );
-        assert!(
-            surround_conf.contains("\"eq_r_0\""),
-            "surround conf must contain eq_r_0 tail node when game channel has custom EQ"
+            !surround_conf.contains("\"eq_l_0\""),
+            "surround conf must NOT contain eq_l_0 tail node (channel EQ stays pre-convolution)"
         );
 
-        // (b) Game channel sink conf must be FLAT (custom gain must NOT appear).
+        // (b) Game channel sink conf must carry its own custom gain (EQ applied pre-conv).
         // The channel conf is at {tmp_dir}/arctis_eq.Arctis_Game.conf.
         let game_conf_path = std::env::temp_dir().join("arctis_eq.Arctis_Game.conf");
         let game_conf = std::fs::read_to_string(&game_conf_path)
             .expect("game channel conf file must exist");
         assert!(
-            !game_conf.contains(&gain_str_in_conf),
-            "game channel sink conf must NOT contain custom gain {gain_str_in_conf} (EQ moved to tail), conf:\n{game_conf}"
+            game_conf.contains(&gain_str_in_conf),
+            "game channel sink conf MUST contain custom gain {gain_str_in_conf} (EQ pre-convolution), conf:\n{game_conf}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("HOME");
     }
 
-    /// Explicit `output_eq` is preferred over legacy channel-EQ relocation: the spawned
-    /// surround conf must carry the pinned `blocksize` and per-ear EQ tail nodes sourced
-    /// from `sc.output_eq` (the game channel here has NO custom EQ), and — since the pinned
-    /// HRIR is present — `state().surround.hrir_missing` must stay `None`.
+    /// A pinned `blocksize` must be carried into the spawned surround conf, and — since the
+    /// pinned HRIR is present — `state().surround.hrir_missing` must stay `None`. There is
+    /// no config-driven post-convolution EQ tail.
     #[test]
-    fn apply_surround_uses_explicit_output_eq_and_blocksize_and_clears_missing() {
+    fn apply_surround_carries_blocksize_and_clears_missing_no_tail() {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("t6_explicit_eq");
         let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
@@ -8357,12 +8234,6 @@ mod tests {
 
         let mut cfg = make_config_surround_single_game_no_eq("g");
         cfg.profiles[0].surround.blocksize = Some(128);
-        cfg.profiles[0].surround.output_eq = vec![arctis_config::EqBandConfig {
-            kind: "peaking".into(),
-            freq_hz: 250.0,
-            q: 1.0,
-            gain_db: 3.0,
-        }];
 
         let runner = queue_apply_surround_both_absent(MockRunner::new());
         let mut engine = Engine::new(runner, cfg);
@@ -8394,8 +8265,8 @@ mod tests {
             "surround conf must carry pinned blocksize, got:\n{conf}"
         );
         assert!(
-            conf.contains("\"eq_l_0\""),
-            "surround conf must carry explicit output_eq tail nodes, got:\n{conf}"
+            !conf.contains("\"eq_l_0\""),
+            "surround conf must NOT carry an EQ tail (no config-driven post-conv EQ), got:\n{conf}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

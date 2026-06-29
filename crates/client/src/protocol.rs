@@ -231,8 +231,6 @@ pub enum Request {
     /// List the static factory-profile catalog (name + hrir + mode). Returns
     /// `Response.factory_profiles`.
     ListFactoryProfiles,
-    /// Set the explicit post-convolution surround EQ on the active profile's binaural tail.
-    SurroundSetOutputEq { bands: Vec<arctis_engine::EqBandSnapshot> },
     /// Pin (or clear) the convolver blocksize on the active profile's surround.
     SurroundSetBlocksize { blocksize: Option<u32> },
 }
@@ -640,7 +638,7 @@ mod tests {
         assert_eq!(req, back);
     }
 
-    // ── Task 9: ListFactoryProfiles + SurroundSetOutputEq/Blocksize ─────────────
+    // ── Task 9: ListFactoryProfiles + SurroundSetBlocksize ──────────────────────
 
     #[test]
     fn list_factory_profiles_wire_tag() {
@@ -649,22 +647,6 @@ mod tests {
         assert!(json.contains("\"cmd\":\"list-factory-profiles\""));
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Request::ListFactoryProfiles);
-    }
-
-    #[test]
-    fn surround_set_output_eq_round_trips() {
-        let req = Request::SurroundSetOutputEq {
-            bands: vec![arctis_engine::EqBandSnapshot {
-                kind: "peaking".into(),
-                freq_hz: 250.0,
-                q: 1.0,
-                gain_db: 3.0,
-            }],
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"cmd\":\"surround-set-output-eq\""));
-        let back: Request = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, req);
     }
 
     #[test]
