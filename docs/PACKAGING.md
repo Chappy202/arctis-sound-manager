@@ -56,8 +56,9 @@ sign the updater artifact.
 ## Building a release — OWNER-ONLY
 
 ```sh
-cd frontend/
+# from the repo root (where src-tauri/ is a subfolder)
 pnpm install
+pnpm --dir frontend install
 TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.signing/arctis-sound-manager.key)" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
 pnpm tauri build
@@ -131,11 +132,14 @@ TLS is enforced in production mode — HTTP is rejected.
 ## How the auto-updater works
 
 1. On app startup, the frontend calls `checkForUpdate()` (from `src/lib/updater.ts`).
-2. The Tauri updater plugin queries the configured endpoint, passing
-   `{{target}}`, `{{arch}}`, and `{{current_version}}` as URL path segments.
-3. If the server returns a newer version + a `latest.json` with a valid
-   minisign signature (verified against `plugins.updater.pubkey`), the update
-   info is surfaced to the user via a banner in the UI.
+2. The Tauri updater plugin fetches the static endpoint
+   `https://github.com/Chappy202/arctis-sound-manager/releases/latest/download/latest.json`,
+   which always returns the newest published `latest.json`.  The plugin then
+   compares the `version` field in that manifest against the running app's
+   version client-side and surfaces an update banner when a newer version is found.
+3. If a newer version is available, the update info is surfaced to the user via
+   a banner in the UI.  The minisign signature in `latest.json` is verified
+   against `plugins.updater.pubkey` before anything is downloaded.
 4. The user clicks "Install & Relaunch" — the AppImage `.tar.gz` is downloaded,
    signature verified against the committed public key, installed, and the app
    relaunches.
@@ -157,6 +161,17 @@ release workflow.
 For AppImage installs the GUI performs the copy on launch so that the systemd `ExecStart` path
 (`%h/.local/bin/asm-cli`) remains valid across in-app updates (the AppImage is replaced in place,
 but the extracted binary at `~/.local/bin/asm-cli` is refreshed automatically).
+
+**Post-update daemon restart:** after an in-app update the new `asm-cli` is written to
+`~/.local/bin/asm-cli` on the next GUI launch, but the already-running daemon keeps the old code
+until it is restarted:
+
+```sh
+systemctl --user restart arctis-sound-manager.service
+```
+
+Or it picks up the new binary automatically on next machine boot.  A future version may
+auto-restart the daemon after a successful re-sync; for now, a manual restart is required.
 
 ---
 

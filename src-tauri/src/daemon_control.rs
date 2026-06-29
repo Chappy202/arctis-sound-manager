@@ -231,6 +231,11 @@ impl DaemonEnv for RealEnv {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Unlink any existing dst first: std::fs::copy opens it O_TRUNC, which
+        // fails with ETXTBSY if the old daemon is currently running from this
+        // path (the post-update case). Unlinking is safe on Linux — the running
+        // process keeps its open inode; the new copy is a fresh inode.
+        let _ = std::fs::remove_file(dst);
         std::fs::copy(src, dst)?;
         let mut perms = std::fs::metadata(dst)?.permissions();
         perms.set_mode(0o755);
@@ -245,33 +250,60 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// Ordered list of candidate `asm-cli` binary paths (first existing one wins).
+/// Pure builder for the ordered candidate list — all environment inputs are
+/// injected so it can be unit-tested without touching process-global env.
 ///
-/// Order:
-/// 1. `$ASM_CLI_BIN` override — lets the owner point directly at a dev build.
-/// 2. Sibling of the current executable (installed Tauri bundle layout).
-/// 3. `$HOME/.local/bin/asm-cli` — user install.
-/// 4. `/usr/bin/asm-cli` — system-wide RPM/deb install.
-/// 5. `<cwd>/target/release/asm-cli` — workspace dev build.
-/// 6. `<cwd>/target/debug/asm-cli` — workspace debug build.
-pub fn candidate_binaries() -> Vec<PathBuf> {
+/// `exe_sibling` is the sidecar path next to the running GUI binary (or None).
+/// Under AppImage it points into the ephemeral FUSE mount, so it is dropped.
+fn build_candidate_binaries(
+    env_override: Option<String>,
+    is_appimage: bool,
+    exe_sibling: Option<PathBuf>,
+    home: &Path,
+    cwd: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = Vec::new();
-    if let Ok(p) = std::env::var("ASM_CLI_BIN") {
+    if let Some(p) = env_override {
         v.push(PathBuf::from(p));
     }
-    if let Some(p) = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join("asm-cli")))
-    {
-        v.push(p);
+    // Skip the current-exe sibling under AppImage: it lives in /tmp/.mount_*,
+    // which is ephemeral and would poison the systemd ExecStart. The synced
+    // ~/.local/bin/asm-cli copy is the durable target there.
+    if !is_appimage {
+        if let Some(p) = exe_sibling {
+            v.push(p);
+        }
     }
-    v.push(home_dir().join(".local/bin/asm-cli"));
+    v.push(home.join(".local/bin/asm-cli"));
     v.push(PathBuf::from("/usr/bin/asm-cli"));
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Some(cwd) = cwd {
         v.push(cwd.join("target/release/asm-cli"));
         v.push(cwd.join("target/debug/asm-cli"));
     }
     v
+}
+
+/// Ordered list of candidate `asm-cli` binary paths (first existing one wins).
+///
+/// Order:
+/// 1. `$ASM_CLI_BIN` override — lets the owner point directly at a dev build.
+/// 2. Sibling of the current executable (installed Tauri bundle layout) — skipped
+///    under AppImage where the sibling lives in the ephemeral FUSE mount.
+/// 3. `$HOME/.local/bin/asm-cli` — user install / AppImage stable copy.
+/// 4. `/usr/bin/asm-cli` — system-wide RPM/deb install.
+/// 5. `<cwd>/target/release/asm-cli` — workspace dev build.
+/// 6. `<cwd>/target/debug/asm-cli` — workspace debug build.
+pub fn candidate_binaries() -> Vec<PathBuf> {
+    let exe_sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("asm-cli")));
+    build_candidate_binaries(
+        std::env::var("ASM_CLI_BIN").ok(),
+        std::env::var_os("APPIMAGE").is_some(),
+        exe_sibling,
+        &home_dir(),
+        std::env::current_dir().ok(),
+    )
 }
 
 /// Copy the bundled daemon to a stable path when it is missing or stale.
@@ -375,6 +407,46 @@ mod tests {
         let c = candidate_binaries();
         std::env::remove_var("ASM_CLI_BIN");
         assert_eq!(c.first(), Some(&PathBuf::from("/custom/asm-cli")));
+    }
+
+    #[test]
+    fn build_candidates_includes_exe_sibling_when_not_appimage() {
+        let v = build_candidate_binaries(
+            None,
+            false,
+            Some(PathBuf::from("/opt/app/asm-cli")),
+            Path::new("/home/x"),
+            None,
+        );
+        assert_eq!(v.first(), Some(&PathBuf::from("/opt/app/asm-cli")));
+        assert!(v.contains(&PathBuf::from("/home/x/.local/bin/asm-cli")));
+    }
+
+    #[test]
+    fn build_candidates_drops_exe_sibling_under_appimage() {
+        let sibling = PathBuf::from("/tmp/.mount_abc/usr/bin/asm-cli");
+        let v = build_candidate_binaries(
+            None,
+            true,
+            Some(sibling.clone()),
+            Path::new("/home/x"),
+            None,
+        );
+        assert!(!v.contains(&sibling), "ephemeral mount path must not be a candidate under AppImage");
+        // ~/.local/bin is the first real candidate under AppImage
+        assert_eq!(v.first(), Some(&PathBuf::from("/home/x/.local/bin/asm-cli")));
+    }
+
+    #[test]
+    fn build_candidates_env_override_wins_even_under_appimage() {
+        let v = build_candidate_binaries(
+            Some("/custom/asm-cli".to_string()),
+            true,
+            Some(PathBuf::from("/tmp/.mount_abc/usr/bin/asm-cli")),
+            Path::new("/home/x"),
+            None,
+        );
+        assert_eq!(v.first(), Some(&PathBuf::from("/custom/asm-cli")));
     }
 
     #[test]
