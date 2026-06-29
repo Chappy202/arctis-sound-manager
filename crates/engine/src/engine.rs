@@ -117,6 +117,32 @@ fn chatmix_to_volumes(position: i64) -> (f32, f32) {
     }
 }
 
+/// Build `Vec<HrirEntrySnapshot>` from the HRIR profiles directory under `base_dir`.
+///
+/// For each `.wav` stem found by `convert::available_hrirs`, looks up the catalog entry
+/// (if any) to populate `display`, `group`, and `tonality`. Unknown stems get a
+/// humanised display name (via `hrir_catalog::display_name`), an empty group, and
+/// `"Neutral"` tonality.
+pub(crate) fn hrir_entries_for(base_dir: &std::path::Path) -> Vec<crate::state::HrirEntrySnapshot> {
+    convert::available_hrirs(base_dir)
+        .into_iter()
+        .map(|stem| {
+            let tonality = crate::hrir_catalog::entry_for(&stem)
+                .map(|e| format!("{:?}", e.tonality))
+                .unwrap_or_else(|| "Neutral".into());
+            let group = crate::hrir_catalog::entry_for(&stem)
+                .map(|e| e.group.to_string())
+                .unwrap_or_default();
+            crate::state::HrirEntrySnapshot {
+                display: crate::hrir_catalog::display_name(&stem),
+                group,
+                tonality,
+                stem,
+            }
+        })
+        .collect()
+}
+
 pub struct Engine<R: CommandRunner> {
     runner: R,
     config: Config,
@@ -543,12 +569,18 @@ impl<R: CommandRunner> Engine<R> {
 
         let surround = if let Ok(p) = self.config.active() {
             let sc = &p.surround;
+            let (available_hrirs, available_hrir_entries) = convert::hrir_base_dir()
+                .map(|base| {
+                    let hrirs = convert::available_hrirs(&base);
+                    let entries = hrir_entries_for(&base);
+                    (hrirs, entries)
+                })
+                .unwrap_or_default();
             crate::state::SurroundSnapshot {
                 enabled: sc.enabled,
                 hrir: sc.hrir.clone(),
-                available_hrirs: convert::hrir_base_dir()
-                    .map(|base| convert::available_hrirs(&base))
-                    .unwrap_or_default(),
+                available_hrirs,
+                available_hrir_entries,
                 channels: sc.channels.clone(),
                 hw_sink: sc.hw_sink.clone(),
             }
@@ -6270,6 +6302,20 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn surround_snapshot_includes_display_entries_for_available_hrirs() {
+        let base = unique_cfg_tmp("hrir_entries");
+        let profiles = base.join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(profiles.join("04-gsx-sennheiser-gsx.wav"), b"RIFF").unwrap();
+        let entries = crate::engine::hrir_entries_for(&base);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].stem, "04-gsx-sennheiser-gsx");
+        assert_eq!(entries[0].display, "Sennheiser GSX");
+        assert_eq!(entries[0].group, "Sennheiser");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ─────────────────────────────────────────────

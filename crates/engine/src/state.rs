@@ -124,12 +124,25 @@ pub struct MicSnapshot {
     pub volume_pct: u8,
 }
 
+/// Richer catalog entry for one available HRIR: stem, human-readable display name,
+/// vendor group, and tonality string.  Surfaces in `SurroundSnapshot` so the UI
+/// can render a grouped picker without a separate catalog call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HrirEntrySnapshot {
+    pub stem: String,
+    pub display: String,
+    pub group: String,
+    pub tonality: String,
+}
+
 /// Full surround snapshot returned in `EngineState`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SurroundSnapshot {
     pub enabled: bool,
     pub hrir: Option<String>,
     pub available_hrirs: Vec<String>,
+    #[serde(default)]
+    pub available_hrir_entries: Vec<HrirEntrySnapshot>,
     pub channels: Vec<String>,
     pub hw_sink: Option<String>,
 }
