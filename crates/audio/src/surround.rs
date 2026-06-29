@@ -747,6 +747,7 @@ id 40, type PipeWire:Interface:Node/3
 
     /// 8-channel render with a 2-band EqModel must insert per-ear bq nodes
     /// linked after the mixers, with the graph output coming from the last EQ nodes.
+    /// STRENGTHENED: asserts the actual control value formatting, not just node presence.
     #[test]
     fn render_with_output_eq_inserts_per_ear_bq_nodes_after_mixers() {
         let spec = test_spec();
@@ -773,6 +774,17 @@ id 40, type PipeWire:Interface:Node/3
         assert!(got.contains("\"eq_l_1\""), "must have eq_l_1 node");
         assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
         assert!(got.contains("\"eq_r_1\""), "must have eq_r_1 node");
+
+        // STRENGTHENED: Assert actual control value formatting for peaking band (eq_l_0).
+        // fmt_num formats: whole numbers with .1 (200.0), decimals as-is (1.0, 3.0).
+        assert!(
+            got.contains("\"Freq\" = 200.0  \"Q\" = 1.0  \"Gain\" = 3.0"),
+            "eq_l_0 must have exact peaking band controls: Freq=200.0, Q=1.0, Gain=3.0"
+        );
+        assert!(
+            got.contains("\"Freq\" = 8000.0  \"Q\" = 0.7  \"Gain\" = -2.0"),
+            "eq_l_1 must have exact highshelf band controls: Freq=8000.0, Q=0.7, Gain=-2.0"
+        );
 
         // Mixer → EQ links must be present
         assert!(
@@ -808,6 +820,139 @@ id 40, type PipeWire:Interface:Node/3
         assert!(got.contains("audio.channels = 8"));
         let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
         assert_eq!(conv_count, 16, "7.1 with EQ must still have 16 convolver nodes");
+    }
+
+    /// 5.1 (6-channel) with output EQ must combine both features:
+    /// 6-ch capture.props AND per-ear EQ nodes after mixers with EQ outputs.
+    #[test]
+    fn render_5_1_with_output_eq_combines_both() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![
+                EqBand::new(BandKind::Peaking, 1000.0, 1.5, 2.0),
+                EqBand::new(BandKind::LowShelf, 100.0, 0.9, -1.5),
+            ],
+        };
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 6,
+            output_eq: Some(&eq),
+        })
+        .unwrap();
+
+        // 5.1: capture must be 6-ch
+        let cap = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            cap.contains("audio.channels = 6"),
+            "5.1 with EQ must emit 6-ch capture"
+        );
+        assert!(
+            cap.contains("audio.position = [ FL FR FC LFE RL RR ]"),
+            "5.1 with EQ must use 5.1 position"
+        );
+
+        // No SL/SR nodes in 5.1
+        assert!(
+            !got.contains("copySL"),
+            "5.1 with EQ must not emit copySL"
+        );
+        assert!(
+            !got.contains("convSL"),
+            "5.1 with EQ must not emit convSL"
+        );
+
+        // EQ nodes present: 2-band chain per ear
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0");
+        assert!(got.contains("\"eq_l_1\""), "must have eq_l_1");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0");
+        assert!(got.contains("\"eq_r_1\""), "must have eq_r_1");
+
+        // Mixer → EQ_0 links
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0"
+        );
+
+        // Outputs reference last EQ nodes
+        assert!(
+            got.contains("outputs = [ \"eq_l_1:Out\" \"eq_r_1:Out\" ]"),
+            "5.1 with EQ outputs must reference eq_l_1/eq_r_1"
+        );
+
+        // Only 12 convolvers for 5.1
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 12, "5.1 with EQ must have 12 convolver nodes");
+    }
+
+    /// Render with a 1-band EqModel must create a degenerate chain (no internal links).
+    /// outputs must reference eq_l_0:Out / eq_r_0:Out (no eq_l_1, etc.).
+    #[test]
+    fn render_with_single_band_eq_degenerate_chain() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 500.0, 1.0, 0.0)],
+        };
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: Some(&eq),
+        })
+        .unwrap();
+
+        // Only eq_l_0 and eq_r_0 nodes exist (no eq_l_1, eq_r_1, etc.)
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+        assert!(
+            !got.contains("\"eq_l_1\""),
+            "degenerate 1-band chain must not have eq_l_1"
+        );
+        assert!(
+            !got.contains("\"eq_r_1\""),
+            "degenerate 1-band chain must not have eq_r_1"
+        );
+
+        // Mixer directly links to the single EQ node
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0 in degenerate chain"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0 in degenerate chain"
+        );
+
+        // No intra-EQ links (no eq_l_0 → eq_l_1)
+        assert!(
+            !got.contains("output = \"eq_l_0:Out\"  input = \"eq_l_1:In\""),
+            "degenerate chain must not have internal EQ links"
+        );
+
+        // Outputs reference the sole EQ nodes
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "degenerate 1-band outputs must reference eq_l_0/eq_r_0"
+        );
+
+        // Control values present and correct (0.0 dB formatted as "0.0")
+        assert!(
+            got.contains("\"Freq\" = 500.0  \"Q\" = 1.0  \"Gain\" = 0.0"),
+            "single band must have exact control values: Freq=500.0, Q=1.0, Gain=0.0"
+        );
+
+        // Still 7.1: 8-ch capture, 16 convolvers
+        assert!(got.contains("audio.channels = 8"));
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 16, "7.1 with 1-band EQ must still have 16 convolver nodes");
     }
 
     /// render_surround_conf must produce identical output to render_surround_conf_ex
