@@ -5,7 +5,7 @@ use arctis_audio::{
     RouteRule, Router, StageKind, SurroundBackend, DEEPFILTER_PLUGIN_BASENAME,
     RNNOISE_PLUGIN_BASENAME,
 };
-use arctis_config::{Config, EqBandConfig};
+use arctis_config::{Config, EqBandConfig, SurroundMode};
 use arctis_domain::{
     db_to_volume_pct, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
     MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
@@ -114,6 +114,23 @@ fn chatmix_to_volumes(position: i64) -> (f32, f32) {
     } else {
         let t = (center - p) / center; // 0..1
         (CHATMIX_FULL_ATTEN_DB * t, 0.0)
+    }
+}
+
+/// Map a configured surround mode + negotiated channel count to the effective render mode.
+/// `Auto` adapts to the available channel count; explicit modes pass through unchanged.
+/// Never produces a mode that upmixes (no "upmix" mode exists by construction).
+pub fn resolve_effective_mode(cfg_mode: SurroundMode, negotiated: Option<u8>) -> SurroundMode {
+    use SurroundMode::*;
+    match cfg_mode {
+        Auto => match negotiated {
+            Some(8) => Hrir71,
+            Some(6) => Hrir51,
+            Some(2) => StereoBypass,
+            Some(_) => Hrir71, // any other count (incl. unusual) → treat as full HRIR
+            None => Hrir71,    // not yet probed → optimistic
+        },
+        explicit => explicit, // explicit non-Auto choice passes through unchanged
     }
 }
 
@@ -2847,6 +2864,20 @@ mod tests {
         cfg.active_profile = "nonexistent".into();
         let result = plan_reconcile(&cfg);
         assert!(result.is_err());
+    }
+
+    // ─────────────────────────────────────────────
+    // Surround mode fallback tests
+    // ─────────────────────────────────────────────
+
+    #[test]
+    fn auto_mode_maps_negotiated_channels_to_path() {
+        use SurroundMode::*;
+        assert!(matches!(resolve_effective_mode(Auto, Some(8)), Hrir71));
+        assert!(matches!(resolve_effective_mode(Auto, Some(6)), Hrir51));
+        assert!(matches!(resolve_effective_mode(Auto, Some(2)), StereoBypass));
+        assert!(matches!(resolve_effective_mode(StereoBypass, Some(8)), StereoBypass));
+        assert!(matches!(resolve_effective_mode(Auto, None), Hrir71));
     }
 
     // ─────────────────────────────────────────────
