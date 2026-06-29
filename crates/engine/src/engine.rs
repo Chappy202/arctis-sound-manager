@@ -1752,7 +1752,10 @@ impl<R: CommandRunner> Engine<R> {
     }
 
     /// Set (or clear) which channel's sink is the system default output. When set,
-    /// runs `wpctl set-default` on that sink. Persists + emits.
+    /// uses `pw-metadata -n default 0 default.configured.audio.sink {"name":"<node.name>"}`
+    /// to set the default by name (robust across restarts; `wpctl set-default` requires a
+    /// numeric node-id which is ephemeral and would error with "is not a valid number").
+    /// Persists + emits.
     pub fn set_default_sink_channel(
         &mut self,
         channel: Option<String>,
@@ -1782,10 +1785,15 @@ impl<R: CommandRunner> Engine<R> {
         }
         self.save_config()?;
         if let Some(sink_name) = sink {
-            let out = self.runner.run("wpctl", &["set-default", &sink_name])?;
+            // pw-metadata accepts node names; wpctl set-default requires a numeric id.
+            let val = format!("{{\"name\":\"{sink_name}\"}}");
+            let out = self.runner.run(
+                "pw-metadata",
+                &["-n", "default", "0", "default.configured.audio.sink", &val],
+            )?;
             if out.status != 0 {
                 return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
-                    program: "wpctl".into(),
+                    program: "pw-metadata".into(),
                     status: out.status,
                     stderr: out.stderr,
                 }));
@@ -8527,6 +8535,112 @@ mod tests {
             st.surround.effective_mode, "stereo_bypass",
             "effective_mode must be 'stereo_bypass' when mode=StereoBypass, got: {:?}",
             st.surround.effective_mode
+        );
+    }
+
+    // ── fix/routing: set_default_sink_channel uses pw-metadata, not wpctl set-default ──
+
+    /// Enabling the default-output channel must call pw-metadata with a name-based JSON
+    /// value, NOT wpctl set-default (which requires a numeric id and errors with
+    /// "is not a valid number").
+    #[test]
+    fn set_default_sink_channel_calls_pw_metadata_not_wpctl() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("def_sink_pwmeta");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        // Only one subprocess call: pw-metadata (no pw-cli ls needed — name is resolved
+        // directly from the in-memory config, no node-id lookup required).
+        let runner = MockRunner::new().with_output(0, "", ""); // pw-metadata success
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .set_default_sink_channel(Some("game".into()))
+            .expect("set_default_sink_channel must succeed");
+
+        let calls = &engine.runner.calls;
+        // There must be exactly one subprocess call.
+        assert_eq!(calls.len(), 1, "expected 1 subprocess call, got: {calls:?}");
+
+        // It must be pw-metadata, NOT wpctl.
+        assert_ne!(
+            calls[0].first().map(|s| s.as_str()),
+            Some("wpctl"),
+            "must NOT call wpctl (set-default requires numeric id), calls: {calls:?}"
+        );
+        assert_eq!(
+            calls[0].first().map(|s| s.as_str()),
+            Some("pw-metadata"),
+            "must call pw-metadata, calls: {calls:?}"
+        );
+
+        // Full argv must match the name-based form.
+        assert_eq!(
+            calls[0],
+            vec![
+                "pw-metadata",
+                "-n",
+                "default",
+                "0",
+                "default.configured.audio.sink",
+                "{\"name\":\"Arctis_Game\"}",
+            ],
+            "pw-metadata argv mismatch"
+        );
+
+        // Config must be persisted with the chosen channel.
+        let saved = std::fs::read_to_string(tmp.join("config.toml"))
+            .expect("config.toml must exist after set_default_sink_channel");
+        assert!(
+            saved.contains("default_sink_channel"),
+            "config.toml must contain default_sink_channel, got:\n{saved}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Clearing the default-output channel (None) must NOT call any subprocess — it only
+    /// persists the cleared preference and emits the event.
+    #[test]
+    fn set_default_sink_channel_none_no_subprocess() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("def_sink_none");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let runner = MockRunner::new(); // no outputs queued — any call would panic/fail
+        let mut engine = Engine::new(runner, cfg);
+        engine
+            .set_default_sink_channel(None)
+            .expect("clearing default sink channel must succeed");
+
+        assert!(
+            engine.runner.calls.is_empty(),
+            "clearing default must NOT call any subprocess, calls: {:?}",
+            engine.runner.calls
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Providing an unknown channel id must return BadRequest without any subprocess call.
+    #[test]
+    fn set_default_sink_channel_unknown_channel_bad_request() {
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let err = engine
+            .set_default_sink_channel(Some("nonexistent".into()))
+            .expect_err("unknown channel must error");
+        assert!(
+            matches!(err, EngineError::BadRequest(_)),
+            "unknown channel must be BadRequest, got: {err:?}"
+        );
+        assert!(
+            engine.runner.calls.is_empty(),
+            "no subprocess call must be made for a bad channel id, calls: {:?}",
+            engine.runner.calls
         );
     }
 }
