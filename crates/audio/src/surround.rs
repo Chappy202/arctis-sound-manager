@@ -657,6 +657,23 @@ impl<R: CommandRunner> SurroundBackend<R> {
         )))
     }
 
+    /// Write `conf` to the on-disk conf file and spawn `pipewire -c <path>`.
+    ///
+    /// Shared write+spawn logic extracted to satisfy G1 (no duplication).
+    fn spawn_conf(&mut self, conf: String) -> Result<ConfHandle, AudioError> {
+        let path = self.conf_path();
+        std::fs::write(&path, conf).map_err(|e| AudioError::Spawn {
+            program: "write-conf".to_string(),
+            source_msg: e.to_string(),
+        })?;
+        let path_str = path.to_string_lossy().into_owned();
+        let token = self.runner.spawn_owned("pipewire", &["-c", &path_str])?;
+        Ok(ConfHandle {
+            conf_path: path,
+            child: Some(token),
+        })
+    }
+
     /// Create the surround sink idempotently.
     ///
     /// Returns a `ConfHandle` with `child = Some(token)` when a new `pipewire -c`
@@ -670,16 +687,7 @@ impl<R: CommandRunner> SurroundBackend<R> {
             });
         }
         let conf = render_surround_conf(&self.spec, hrir_path)?;
-        std::fs::write(&path, conf).map_err(|e| AudioError::Spawn {
-            program: "write-conf".to_string(),
-            source_msg: e.to_string(),
-        })?;
-        let path_str = path.to_string_lossy().into_owned();
-        let token = self.runner.spawn_owned("pipewire", &["-c", &path_str])?;
-        Ok(ConfHandle {
-            conf_path: path,
-            child: Some(token),
-        })
+        self.spawn_conf(conf)
     }
 
     /// Remove the surround sink idempotently.
@@ -702,6 +710,41 @@ impl<R: CommandRunner> SurroundBackend<R> {
     pub fn recreate(&mut self, hrir_path: &Path) -> Result<ConfHandle, AudioError> {
         self.remove()?;
         self.create(hrir_path)
+    }
+
+    /// Teardown then recreate with explicit channel count and optional output EQ.
+    ///
+    /// `channels` must be `6` (5.1) or `8` (7.1); see [`render_surround_conf_ex`].
+    /// Use this when switching surround topology at runtime — always tears down the
+    /// existing sink before spawning the new one.
+    pub fn recreate_ex(
+        &mut self,
+        hrir_path: &Path,
+        channels: u8,
+        output_eq: Option<&EqModel>,
+    ) -> Result<ConfHandle, AudioError> {
+        self.remove()?;
+        let conf = render_surround_conf_ex(&SurroundRender {
+            spec: &self.spec,
+            hrir_path,
+            channels,
+            output_eq,
+        })?;
+        self.spawn_conf(conf)
+    }
+
+    /// Teardown then recreate as a stereo-bypass sink (no HRIR convolver).
+    ///
+    /// `crossfeed` is [0, 100]; see [`render_stereo_bypass_conf`].
+    /// Use this when the source is already stereo and no upmix is wanted.
+    pub fn recreate_stereo_bypass(
+        &mut self,
+        crossfeed: u8,
+        output_eq: Option<&EqModel>,
+    ) -> Result<ConfHandle, AudioError> {
+        self.remove()?;
+        let conf = render_stereo_bypass_conf(&self.spec, crossfeed, output_eq)?;
+        self.spawn_conf(conf)
     }
 
     /// Resolve the filter-chain node id for the capture (sink) node.
@@ -1486,6 +1529,109 @@ id 40, type PipeWire:Interface:Node/3
         assert!(
             handle.child.is_some(),
             "recreate must surface new child token"
+        );
+    }
+
+    // ── recreate_ex / recreate_stereo_bypass tests ───────────────────────────
+    //
+    // Each test uses a unique node_name_base to avoid file-system races when
+    // tests run in parallel (all would otherwise share the same conf path).
+
+    #[test]
+    fn recreate_ex_8ch_with_eq_writes_conf_with_eq_and_spawns() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_8ch_eq".into(),
+            description: "Test 8ch EQ".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent (early return, no destroy)
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let hrir = PathBuf::from("/test/hrir.wav");
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 3.0)],
+        };
+        let handle = be.recreate_ex(&hrir, 8, Some(&eq)).unwrap();
+
+        // (a) one spawn_owned("pipewire", ["-c", <conf_path>]) recorded
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert_eq!(spawned[0][0], "pipewire");
+        assert_eq!(spawned[0][1], "-c");
+        assert!(
+            spawned[0][2].ends_with("test_surr_8ch_eq.conf"),
+            "conf path ends with test_surr_8ch_eq.conf, got: {}",
+            spawned[0][2]
+        );
+        assert!(handle.child.is_some(), "child token must be present");
+
+        // (b) conf file contains EQ nodes and 8-channel capture
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("\"eq_l_0\""),
+            "conf must contain eq_l_0 node (EQ tail present)"
+        );
+        assert!(
+            conf.contains("\"eq_r_0\""),
+            "conf must contain eq_r_0 node (EQ tail present)"
+        );
+        assert!(
+            conf.contains("audio.channels = 8"),
+            "conf must have 8-channel capture props"
+        );
+    }
+
+    #[test]
+    fn recreate_ex_6ch_writes_5_1_conf() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_6ch".into(),
+            description: "Test 6ch".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let hrir = PathBuf::from("/test/hrir.wav");
+        let handle = be.recreate_ex(&hrir, 6, None).unwrap();
+
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert!(handle.child.is_some(), "child token must be present");
+
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("audio.channels = 6"),
+            "5.1 conf must have 6-channel capture props"
+        );
+    }
+
+    #[test]
+    fn recreate_stereo_bypass_writes_2ch_no_convolver() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_bypass".into(),
+            description: "Test bypass".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be.recreate_stereo_bypass(0, None).unwrap();
+
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert!(handle.child.is_some(), "child token must be present");
+
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("audio.channels = 2"),
+            "stereo bypass must have 2-channel capture props"
+        );
+        assert!(
+            !conf.contains("convolver"),
+            "stereo bypass must not contain any convolver node"
         );
     }
 }
