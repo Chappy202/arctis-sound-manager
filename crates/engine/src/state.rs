@@ -124,14 +124,39 @@ pub struct MicSnapshot {
     pub volume_pct: u8,
 }
 
+/// Richer catalog entry for one available HRIR: stem, human-readable display name,
+/// vendor group, and tonality string.  Surfaces in `SurroundSnapshot` so the UI
+/// can render a grouped picker without a separate catalog call.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HrirEntrySnapshot {
+    pub stem: String,
+    pub display: String,
+    pub group: String,
+    pub tonality: String,
+}
+
 /// Full surround snapshot returned in `EngineState`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SurroundSnapshot {
     pub enabled: bool,
     pub hrir: Option<String>,
     pub available_hrirs: Vec<String>,
+    #[serde(default)]
+    pub available_hrir_entries: Vec<HrirEntrySnapshot>,
     pub channels: Vec<String>,
     pub hw_sink: Option<String>,
+    /// Configured surround mode as a lowercase string (e.g. `"auto"`, `"hrir71"`, `"stereo_bypass"`).
+    /// Old engine versions omit this field; serde default = `""`.
+    #[serde(default)]
+    pub mode: String,
+    /// Resolved effective mode after applying fallback logic, as a lowercase string.
+    /// Old engine versions omit this field; serde default = `""`.
+    #[serde(default)]
+    pub effective_mode: String,
+    /// Hardware-negotiated channel count (from pw-dump probe), if available.
+    /// `None` = not yet probed. Old engine versions omit this field.
+    #[serde(default)]
+    pub negotiated_channels: Option<u8>,
 }
 
 /// Lightweight summary of one EQ preset for the state snapshot.

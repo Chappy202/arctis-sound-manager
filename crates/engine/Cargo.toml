@@ -15,3 +15,4 @@ toml = { workspace = true }
 
 [dev-dependencies]
 arctis-device = { path = "../device", features = ["testing-utils"] }
+tempfile = "3"

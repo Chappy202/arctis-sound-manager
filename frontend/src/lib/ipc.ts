@@ -72,12 +72,28 @@ export interface MicSnapshot {
   hw_mic?: string | null;
 }
 
+/** Mirror of crates/engine/src/state.rs HrirEntrySnapshot. */
+export interface HrirEntrySnapshot {
+  stem: string;
+  display: string;
+  group: string;
+  tonality: string;
+}
+
 export interface SurroundSnapshot {
   enabled: boolean;
   hrir: string | null;
   available_hrirs: string[];
+  /** Rich per-entry metadata; empty when the engine is older (serde default = []). */
+  available_hrir_entries?: HrirEntrySnapshot[];
   channels: string[];
   hw_sink: string | null;
+  /** Configured mode as lowercase string, e.g. "auto" | "hrir71" | "hrir51" | "stereo_bypass". Absent on older engines. */
+  mode?: string;
+  /** Resolved effective mode after fallback, e.g. "hrir71". Absent on older engines. */
+  effective_mode?: string;
+  /** Hardware-negotiated channel count from pw-dump probe, or null if not yet probed. */
+  negotiated_channels?: number | null;
 }
 
 export interface EqPresetSnapshot {
@@ -232,6 +248,14 @@ export const profileNew = (name: string): Promise<EngineState> =>
   invoke<EngineState>("profile_new", { name });
 
 /**
+ * Create a factory profile from a named template and make it the active profile.
+ * Supported templates: `"DayZ"` (game surround on, footstep EQ, default sink = game).
+ * Returns the updated EngineState.
+ */
+export const profileCreateFromFactory = (template: string): Promise<EngineState> =>
+  invoke<EngineState>("profile_create_from_factory", { template });
+
+/**
  * Set (or clear) the output device for a channel.
  * Returns the updated EngineState so the caller can apply it to the store
  * immediately for snappy feedback (no need to wait for the state-changed event).
@@ -327,6 +351,16 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 /** Pin (or clear) the surround output to a specific hardware sink. */
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
   invoke<EngineState>("surround_set_hw_sink", { hwSink });
+
+// ── A6: HRIR import / fetch commands ─────────────────────────────────────────
+
+/** Import HeSuVi 14-channel WAVs from `dir` (null = use default path) into the HRIR profiles dir. */
+export const surroundImportHrirs = (dir: string | null): Promise<EngineState> =>
+  invoke<EngineState>("surround_import_hrirs", { dir });
+
+/** Placeholder: automatic HeSuVi download (not yet available — returns an error from the daemon). */
+export const surroundFetchHrirs = (): Promise<EngineState> =>
+  invoke<EngineState>("surround_fetch_hrirs", {});
 
 // ── F3b: Profile management commands ─────────────────────────────────────────
 

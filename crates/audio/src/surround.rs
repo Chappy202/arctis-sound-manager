@@ -1,4 +1,5 @@
 use crate::backend::{parse_node_id, ConfHandle};
+use crate::eq::EqModel;
 use crate::error::AudioError;
 use crate::runner::CommandRunner;
 use std::path::Path;
@@ -31,38 +32,77 @@ impl SurroundSpec {
     }
 }
 
+// ─── SurroundRender ───────────────────────────────────────────────────────────
+
+/// Parameters for the extended surround conf renderer.
+///
+/// Pass to [`render_surround_conf_ex`] to render a filter-chain conf with
+/// 5.1 (6-channel) or 7.1 (8-channel) input, and an optional per-ear
+/// output EQ on the binaural tail.
+pub struct SurroundRender<'a> {
+    pub spec: &'a SurroundSpec,
+    pub hrir_path: &'a Path,
+    /// Number of input channels: `6` (5.1) or `8` (7.1).
+    pub channels: u8,
+    /// Optional EQ applied to the binaural (2-ch) output after convolution.
+    /// When `Some`, per-ear bq nodes are inserted between the mixers and the
+    /// 2-channel output.
+    pub output_eq: Option<&'a EqModel>,
+}
+
 // ─── Conf renderer ────────────────────────────────────────────────────────────
 
-/// Render the full standalone `pipewire -c` conf for the 7.1→binaural HeSuVi
-/// surround filter-chain.
+/// Format a float value the way PipeWire filter-chain confs expect: always
+/// emit a decimal point for whole numbers so PipeWire parses them as floats.
+fn fmt_num(v: f32) -> String {
+    if v.fract() == 0.0 {
+        format!("{:.1}", v)
+    } else {
+        // Trim to a stable short form (no scientific notation for our ranges).
+        format!("{v}")
+    }
+}
+
+/// Render the full standalone `pipewire -c` conf for the surround filter-chain.
 ///
-/// The graph topology is reproduced verbatim from
-/// `/usr/share/pipewire/filter-chain/sink-virtual-surround-7.1-hesuvi.conf`,
-/// including the FL→convFL_L/convFL_R, FR→convFR_R/convFR_L asymmetry and the
-/// `mixL/mixR:In 1..8` numbering. Our node names replace the shipped ones.
+/// Extended version: supports 5.1 (6-channel) and 7.1 (8-channel) input,
+/// and an optional per-ear output EQ on the binaural tail.
 ///
-/// Unlike the EQ/mic renderers the surround graph is a DAG (fan-out / fan-in),
-/// so we do NOT route through `render_chain_conf` / `FilterNode` — this
-/// function owns the full template.
+/// Graph topology:
+/// - 6 or 8 `copy` nodes (input duplicators)
+/// - 12 or 16 `convolver` nodes (HeSuVi HRIR channels)
+/// - `mixL` / `mixR` mixer nodes
+/// - *(optional)* per-ear `eq_l_{i}` / `eq_r_{i}` bq chains after the mixers
+/// - 8-ch (7.1) or 6-ch (5.1) `capture.props` (Audio/Sink)
+/// - 2-ch `playback.props` (`[ FL FR ]`)
 ///
-/// Prepends the same standalone preamble (`context.properties`,
-/// `context.spa-libs`, `context.modules` support set) that our EQ and mic
-/// confs emit, so the conf can be launched with `pipewire -c <path>`.
-///
-/// Returns `AudioError::Invalid` if `hrir_path` is empty.
-pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<String, AudioError> {
-    let hrir_str = hrir_path.to_str().unwrap_or("").trim();
+/// Returns `AudioError::Invalid` if:
+/// - `hrir_path` is empty
+/// - `channels` is not 6 or 8
+/// - `output_eq` is `Some` and fails validation
+pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioError> {
+    let hrir_str = r.hrir_path.to_str().unwrap_or("").trim();
     if hrir_str.is_empty() {
         return Err(AudioError::Invalid("hrir_path must not be empty".into()));
     }
+    if r.channels != 6 && r.channels != 8 {
+        return Err(AudioError::Invalid(format!(
+            "channels must be 6 or 8, got {}",
+            r.channels
+        )));
+    }
+    if let Some(eq) = r.output_eq {
+        eq.validate()?;
+    }
 
+    let is_51 = r.channels == 6;
     let rate = crate::eq::SAMPLE_RATE_HZ;
-    let desc = &spec.description;
-    let capture_node = spec.capture_node_name();
-    let playback_node = spec.playback_node_name();
+    let desc = &r.spec.description;
+    let capture_node = r.spec.capture_node_name();
+    let playback_node = r.spec.playback_node_name();
 
     // ── playback.props: optional target.object ────────────────────────────────
-    let target_line = match &spec.hw_sink {
+    let target_line = match &r.spec.hw_sink {
         Some(sink) => format!("                target.object = \"{sink}\"\n"),
         None => String::new(),
     };
@@ -94,18 +134,36 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
     // ── nodes ─────────────────────────────────────────────────────────────────
     out.push_str("                nodes = [\n");
 
-    // 8 copy nodes (duplicate inputs)
+    // Copy nodes: FL FR FC RL RR [SL SR if 7.1] LFE
     out.push_str("                    { type = builtin  label = copy  name = copyFL  }\n");
     out.push_str("                    { type = builtin  label = copy  name = copyFR  }\n");
     out.push_str("                    { type = builtin  label = copy  name = copyFC  }\n");
     out.push_str("                    { type = builtin  label = copy  name = copyRL  }\n");
     out.push_str("                    { type = builtin  label = copy  name = copyRR  }\n");
-    out.push_str("                    { type = builtin  label = copy  name = copySL  }\n");
-    out.push_str("                    { type = builtin  label = copy  name = copySR  }\n");
+    if !is_51 {
+        out.push_str("                    { type = builtin  label = copy  name = copySL  }\n");
+        out.push_str("                    { type = builtin  label = copy  name = copySR  }\n");
+    }
     out.push_str("                    { type = builtin  label = copy  name = copyLFE }\n");
 
-    // 14 convolver nodes (HeSuVi 14-channel WAV mapping)
-    let convs: &[(&str, u32)] = &[
+    // Convolver nodes (HeSuVi 14-channel WAV mapping).
+    // 7.1: 16 nodes including SL/SR channels; 5.1: 12 nodes (SL/SR omitted).
+    let convs_51: &[(&str, u32)] = &[
+        ("convFL_L", 0),
+        ("convFL_R", 1),
+        ("convRL_L", 4),
+        ("convRL_R", 5),
+        ("convFC_L", 6),
+        ("convFR_R", 7),
+        ("convFR_L", 8),
+        ("convRR_R", 11),
+        ("convRR_L", 12),
+        ("convFC_R", 13),
+        // LFE treated as FC (channels 6 and 13)
+        ("convLFE_L", 6),
+        ("convLFE_R", 13),
+    ];
+    let convs_71: &[(&str, u32)] = &[
         ("convFL_L", 0),
         ("convFL_R", 1),
         ("convSL_L", 2),
@@ -124,77 +182,168 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
         ("convLFE_L", 6),
         ("convLFE_R", 13),
     ];
+    let convs: &[(&str, u32)] = if is_51 { convs_51 } else { convs_71 };
     for (name, ch) in convs {
         out.push_str(&format!(
             "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch} }} }}\n"
         ));
     }
 
-    // 2 mixer nodes (stereo output)
+    // Mixer nodes
     out.push_str("                    { type = builtin  label = mixer  name = mixL }\n");
     out.push_str("                    { type = builtin  label = mixer  name = mixR }\n");
+
+    // Optional output EQ nodes: per-ear bq chains (L first, then R)
+    if let Some(eq) = r.output_eq {
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_l_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_r_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+    }
 
     out.push_str("                ]\n");
 
     // ── links ─────────────────────────────────────────────────────────────────
     out.push_str("                links = [\n");
 
-    // copy → conv fan-out (verbatim from shipped conf)
+    // copy → conv fan-out
+    // Verbatim order from shipped conf; SL/SR links omitted for 5.1.
     out.push_str("                    { output = \"copyFL:Out\"   input = \"convFL_L:In\"  }\n");
     out.push_str("                    { output = \"copyFL:Out\"   input = \"convFL_R:In\"  }\n");
-    out.push_str("                    { output = \"copySL:Out\"   input = \"convSL_L:In\"  }\n");
-    out.push_str("                    { output = \"copySL:Out\"   input = \"convSL_R:In\"  }\n");
+    if !is_51 {
+        out.push_str(
+            "                    { output = \"copySL:Out\"   input = \"convSL_L:In\"  }\n",
+        );
+        out.push_str(
+            "                    { output = \"copySL:Out\"   input = \"convSL_R:In\"  }\n",
+        );
+    }
     out.push_str("                    { output = \"copyRL:Out\"   input = \"convRL_L:In\"  }\n");
     out.push_str("                    { output = \"copyRL:Out\"   input = \"convRL_R:In\"  }\n");
     out.push_str("                    { output = \"copyFC:Out\"   input = \"convFC_L:In\"  }\n");
     out.push_str("                    { output = \"copyFR:Out\"   input = \"convFR_R:In\"  }\n");
     out.push_str("                    { output = \"copyFR:Out\"   input = \"convFR_L:In\"  }\n");
-    out.push_str("                    { output = \"copySR:Out\"   input = \"convSR_R:In\"  }\n");
-    out.push_str("                    { output = \"copySR:Out\"   input = \"convSR_L:In\"  }\n");
+    if !is_51 {
+        out.push_str(
+            "                    { output = \"copySR:Out\"   input = \"convSR_R:In\"  }\n",
+        );
+        out.push_str(
+            "                    { output = \"copySR:Out\"   input = \"convSR_L:In\"  }\n",
+        );
+    }
     out.push_str("                    { output = \"copyRR:Out\"   input = \"convRR_R:In\"  }\n");
     out.push_str("                    { output = \"copyRR:Out\"   input = \"convRR_L:In\"  }\n");
     out.push_str("                    { output = \"copyFC:Out\"   input = \"convFC_R:In\"  }\n");
     out.push_str("                    { output = \"copyLFE:Out\"  input = \"convLFE_L:In\" }\n");
     out.push_str("                    { output = \"copyLFE:Out\"  input = \"convLFE_R:In\" }\n");
 
-    // conv → mixer fan-in (verbatim from shipped conf, including FL→mixL In5 asymmetry)
+    // conv → mixer fan-in
+    // Verbatim order from shipped conf (including FL→mixL In5 asymmetry).
+    // SL (In 2) and SR (In 6) links omitted for 5.1.
     out.push_str("                    { output = \"convFL_L:Out\"   input = \"mixL:In 1\" }\n");
     out.push_str("                    { output = \"convFL_R:Out\"   input = \"mixR:In 1\" }\n");
-    out.push_str("                    { output = \"convSL_L:Out\"   input = \"mixL:In 2\" }\n");
-    out.push_str("                    { output = \"convSL_R:Out\"   input = \"mixR:In 2\" }\n");
+    if !is_51 {
+        out.push_str(
+            "                    { output = \"convSL_L:Out\"   input = \"mixL:In 2\" }\n",
+        );
+        out.push_str(
+            "                    { output = \"convSL_R:Out\"   input = \"mixR:In 2\" }\n",
+        );
+    }
     out.push_str("                    { output = \"convRL_L:Out\"   input = \"mixL:In 3\" }\n");
     out.push_str("                    { output = \"convRL_R:Out\"   input = \"mixR:In 3\" }\n");
     out.push_str("                    { output = \"convFC_L:Out\"   input = \"mixL:In 4\" }\n");
     out.push_str("                    { output = \"convFC_R:Out\"   input = \"mixR:In 4\" }\n");
     out.push_str("                    { output = \"convFR_R:Out\"   input = \"mixR:In 5\" }\n");
     out.push_str("                    { output = \"convFR_L:Out\"   input = \"mixL:In 5\" }\n");
-    out.push_str("                    { output = \"convSR_R:Out\"   input = \"mixR:In 6\" }\n");
-    out.push_str("                    { output = \"convSR_L:Out\"   input = \"mixL:In 6\" }\n");
+    if !is_51 {
+        out.push_str(
+            "                    { output = \"convSR_R:Out\"   input = \"mixR:In 6\" }\n",
+        );
+        out.push_str(
+            "                    { output = \"convSR_L:Out\"   input = \"mixL:In 6\" }\n",
+        );
+    }
     out.push_str("                    { output = \"convRR_R:Out\"   input = \"mixR:In 7\" }\n");
     out.push_str("                    { output = \"convRR_L:Out\"   input = \"mixL:In 7\" }\n");
     out.push_str("                    { output = \"convLFE_R:Out\"  input = \"mixR:In 8\" }\n");
     out.push_str("                    { output = \"convLFE_L:Out\"  input = \"mixL:In 8\" }\n");
 
+    // mixer → EQ tail links (present only when output_eq is Some)
+    if let Some(eq) = r.output_eq {
+        let n = eq.bands.len();
+        // Left ear chain
+        out.push_str("                    { output = \"mixL:Out\"  input = \"eq_l_0:In\" }\n");
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_l_{prev}:Out\"  input = \"eq_l_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+        // Right ear chain
+        out.push_str("                    { output = \"mixR:Out\"  input = \"eq_r_0:In\" }\n");
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_r_{prev}:Out\"  input = \"eq_r_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+    }
+
     out.push_str("                ]\n");
 
-    // inputs / outputs (verbatim order from shipped conf, including the trailing
-    // commas before copySL and copySR that appear in the reference file)
-    out.push_str("                inputs  = [ \"copyFL:In\" \"copyFR:In\" \"copyFC:In\" \"copyLFE:In\" \"copyRL:In\" \"copyRR:In\", \"copySL:In\", \"copySR:In\" ]\n");
-    out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
+    // inputs / outputs
+    // 7.1: verbatim order from shipped conf, including the trailing commas
+    // before copySL and copySR that appear in the reference file.
+    if is_51 {
+        out.push_str("                inputs  = [ \"copyFL:In\" \"copyFR:In\" \"copyFC:In\" \"copyLFE:In\" \"copyRL:In\" \"copyRR:In\" ]\n");
+    } else {
+        out.push_str("                inputs  = [ \"copyFL:In\" \"copyFR:In\" \"copyFC:In\" \"copyLFE:In\" \"copyRL:In\" \"copyRR:In\", \"copySL:In\", \"copySR:In\" ]\n");
+    }
+    match r.output_eq {
+        Some(eq) => {
+            let last = eq.bands.len() - 1;
+            out.push_str(&format!(
+                "                outputs = [ \"eq_l_{last}:Out\" \"eq_r_{last}:Out\" ]\n"
+            ));
+        }
+        None => {
+            out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
+        }
+    }
 
     out.push_str("            }\n");
 
-    // ── capture.props (8-ch sink input) ──────────────────────────────────────
+    // ── capture.props (multi-ch sink input) ───────────────────────────────────
     out.push_str("            capture.props = {\n");
     out.push_str(&format!(
         "                node.name   = \"{capture_node}\"\n"
     ));
     out.push_str("                media.class = Audio/Sink\n");
-    out.push_str("                audio.channels = 8\n");
-    out.push_str("                audio.position = [ FL FR FC LFE RL RR SL SR ]\n");
+    if is_51 {
+        out.push_str("                audio.channels = 6\n");
+        out.push_str("                audio.position = [ FL FR FC LFE RL RR ]\n");
+    } else {
+        out.push_str("                audio.channels = 8\n");
+        out.push_str("                audio.position = [ FL FR FC LFE RL RR SL SR ]\n");
+    }
     out.push_str("            }\n");
 
-    // ── playback.props (2-ch binaural tail) ──────────────────────────────────
+    // ── playback.props (2-ch binaural tail) ───────────────────────────────────
     out.push_str("            playback.props = {\n");
     out.push_str(&format!(
         "                node.name   = \"{playback_node}\"\n"
@@ -210,6 +359,247 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
     out.push_str("]\n");
 
     Ok(out)
+}
+
+/// Render the full standalone `pipewire -c` conf for a stereo-bypass
+/// filter-chain sink.
+///
+/// This is the fallback used when a game outputs only stereo (no upmix through
+/// the HRIR convolver). The graph passes stereo L/R through, optionally applies
+/// crossfeed, and optionally applies a per-ear output EQ.
+///
+/// # Crossfeed
+///
+/// `crossfeed` is a percentage [0, 100]. When 0, the path is pure passthrough
+/// (two `copy` nodes). When > 0, two `mixer` nodes blend a fraction of the
+/// opposite channel into each ear:
+///
+///     `cf = (crossfeed as f32 / 100.0) * 0.5`
+///
+/// Maximum crossfeed (100) gives `cf = 0.5`, which avoids clipping while still
+/// providing significant blending.
+///
+/// The PipeWire builtin `mixer` supports per-input gain controls `"Gain 1"` …
+/// `"Gain 8"` (verified: <https://docs.pipewire.org/page_module_filter_chain.html>).
+///
+/// # Output EQ
+///
+/// When `output_eq` is `Some`, per-ear `eq_l_{i}` / `eq_r_{i}` bq chains are
+/// inserted between the (passthrough or crossfeed-mixed) L/R signals and the
+/// 2-ch output, identical to the tail-EQ pattern in [`render_surround_conf_ex`].
+///
+/// Returns `AudioError::Invalid` if `output_eq` is `Some` and fails validation.
+pub fn render_stereo_bypass_conf(
+    spec: &SurroundSpec,
+    crossfeed: u8,
+    output_eq: Option<&EqModel>,
+) -> Result<String, AudioError> {
+    if let Some(eq) = output_eq {
+        eq.validate()?;
+    }
+
+    if crossfeed > 100 {
+        return Err(AudioError::Invalid(format!("crossfeed must be 0..=100, got {crossfeed}")));
+    }
+
+    let rate = crate::eq::SAMPLE_RATE_HZ;
+    let desc = &spec.description;
+    let capture_node = spec.capture_node_name();
+    let playback_node = spec.playback_node_name();
+    let has_crossfeed = crossfeed > 0;
+
+    let target_line = match &spec.hw_sink {
+        Some(sink) => format!("                target.object = \"{sink}\"\n"),
+        None => String::new(),
+    };
+
+    let mut out = String::new();
+
+    // ── preamble (identical shape to EQ / mic / surround confs) ─────────────
+    out.push_str("context.properties = {\n");
+    out.push_str(&format!("    default.clock.rate = {rate}\n"));
+    out.push_str(&format!("    default.clock.allowed-rates = [ {rate} ]\n"));
+    out.push_str("}\n");
+    out.push_str("context.spa-libs = {\n");
+    out.push_str("    audio.convert.* = audioconvert/libspa-audioconvert\n");
+    out.push_str("    support.*       = support/libspa-support\n");
+    out.push_str("}\n");
+    out.push_str("context.modules = [\n");
+    out.push_str("    {   name = libpipewire-module-rt\n");
+    out.push_str("        flags = [ ifexists nofail ]\n");
+    out.push_str("    }\n");
+    out.push_str("    {   name = libpipewire-module-protocol-native }\n");
+    out.push_str("    {   name = libpipewire-module-client-node }\n");
+    out.push_str("    {   name = libpipewire-module-adapter }\n");
+    out.push_str("    {   name = libpipewire-module-filter-chain\n");
+    out.push_str("        args = {\n");
+    out.push_str(&format!("            node.description = \"{desc}\"\n"));
+    out.push_str(&format!("            media.name       = \"{desc}\"\n"));
+    out.push_str("            filter.graph = {\n");
+
+    // ── nodes ─────────────────────────────────────────────────────────────────
+    out.push_str("                nodes = [\n");
+
+    // Stereo copy nodes (always present)
+    out.push_str("                    { type = builtin  label = copy  name = copyL }\n");
+    out.push_str("                    { type = builtin  label = copy  name = copyR }\n");
+
+    // Optional crossfeed mixer nodes.
+    // PipeWire mixer builtin: "Gain 1".."Gain 8" set per-input gain.
+    // copyL→mixL In 1 (gain 1.0), copyR→mixL In 2 (gain cf)
+    // copyR→mixR In 1 (gain 1.0), copyL→mixR In 2 (gain cf)
+    if has_crossfeed {
+        let cf = (crossfeed as f32 / 100.0) * 0.5;
+        let cf_str = fmt_num(cf);
+        out.push_str(&format!(
+            "                    {{ type = builtin  label = mixer  name = mixL  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
+        ));
+        out.push_str(&format!(
+            "                    {{ type = builtin  label = mixer  name = mixR  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
+        ));
+    }
+
+    // Optional output EQ tail: per-ear bq chains (L first, then R).
+    // Identical pattern to render_surround_conf_ex.
+    if let Some(eq) = output_eq {
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_l_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+        for (i, band) in eq.bands.iter().enumerate() {
+            let freq = fmt_num(band.freq_hz);
+            let q = fmt_num(band.q);
+            let gain = fmt_num(band.gain_db);
+            out.push_str(&format!(
+                "                    {{   type = builtin  name = \"eq_r_{i}\"  label = {}\n                        control = {{ \"Freq\" = {freq}  \"Q\" = {q}  \"Gain\" = {gain} }}\n                    }}\n",
+                band.kind.label()
+            ));
+        }
+    }
+
+    out.push_str("                ]\n");
+
+    // ── links ─────────────────────────────────────────────────────────────────
+    out.push_str("                links = [\n");
+
+    if has_crossfeed {
+        // Crossfeed routing: each mixer receives its own channel + opposite channel
+        out.push_str("                    { output = \"copyL:Out\"  input = \"mixL:In 1\" }\n");
+        out.push_str("                    { output = \"copyR:Out\"  input = \"mixL:In 2\" }\n");
+        out.push_str("                    { output = \"copyR:Out\"  input = \"mixR:In 1\" }\n");
+        out.push_str("                    { output = \"copyL:Out\"  input = \"mixR:In 2\" }\n");
+    }
+
+    // EQ tail links: source (copy or mixer) → eq chain per ear
+    let left_src = if has_crossfeed { "mixL" } else { "copyL" };
+    let right_src = if has_crossfeed { "mixR" } else { "copyR" };
+
+    if let Some(eq) = output_eq {
+        let n = eq.bands.len();
+        // Left ear chain
+        out.push_str(&format!(
+            "                    {{ output = \"{left_src}:Out\"  input = \"eq_l_0:In\" }}\n"
+        ));
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_l_{prev}:Out\"  input = \"eq_l_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+        // Right ear chain
+        out.push_str(&format!(
+            "                    {{ output = \"{right_src}:Out\"  input = \"eq_r_0:In\" }}\n"
+        ));
+        for i in 1..n {
+            out.push_str(&format!(
+                "                    {{ output = \"eq_r_{prev}:Out\"  input = \"eq_r_{i}:In\" }}\n",
+                prev = i - 1
+            ));
+        }
+    }
+
+    out.push_str("                ]\n");
+
+    // inputs / outputs
+    out.push_str("                inputs  = [ \"copyL:In\" \"copyR:In\" ]\n");
+    match output_eq {
+        Some(eq) => {
+            let last = eq.bands.len() - 1;
+            out.push_str(&format!(
+                "                outputs = [ \"eq_l_{last}:Out\" \"eq_r_{last}:Out\" ]\n"
+            ));
+        }
+        None => {
+            if has_crossfeed {
+                out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
+            } else {
+                out.push_str("                outputs = [ \"copyL:Out\" \"copyR:Out\" ]\n");
+            }
+        }
+    }
+
+    out.push_str("            }\n");
+
+    // ── capture.props (2-ch stereo sink) ──────────────────────────────────────
+    out.push_str("            capture.props = {\n");
+    out.push_str(&format!(
+        "                node.name   = \"{capture_node}\"\n"
+    ));
+    out.push_str("                media.class = Audio/Sink\n");
+    out.push_str("                audio.channels = 2\n");
+    out.push_str("                audio.position = [ FL FR ]\n");
+    out.push_str("            }\n");
+
+    // ── playback.props (2-ch stereo output) ───────────────────────────────────
+    out.push_str("            playback.props = {\n");
+    out.push_str(&format!(
+        "                node.name   = \"{playback_node}\"\n"
+    ));
+    out.push_str("                node.passive = true\n");
+    out.push_str("                audio.channels = 2\n");
+    out.push_str("                audio.position = [ FL FR ]\n");
+    out.push_str(&target_line);
+    out.push_str("            }\n");
+
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str("]\n");
+
+    Ok(out)
+}
+
+/// Render the full standalone `pipewire -c` conf for the 7.1→binaural HeSuVi
+/// surround filter-chain.
+///
+/// The graph topology is reproduced verbatim from
+/// `/usr/share/pipewire/filter-chain/sink-virtual-surround-7.1-hesuvi.conf`,
+/// including the FL→convFL_L/convFL_R, FR→convFR_R/convFR_L asymmetry and the
+/// `mixL/mixR:In 1..8` numbering. Our node names replace the shipped ones.
+///
+/// Unlike the EQ/mic renderers the surround graph is a DAG (fan-out / fan-in),
+/// so we do NOT route through `render_chain_conf` / `FilterNode` — this
+/// function owns the full template.
+///
+/// Prepends the same standalone preamble (`context.properties`,
+/// `context.spa-libs`, `context.modules` support set) that our EQ and mic
+/// confs emit, so the conf can be launched with `pipewire -c <path>`.
+///
+/// Returns `AudioError::Invalid` if `hrir_path` is empty.
+///
+/// This is a thin wrapper over [`render_surround_conf_ex`] with 8-channel
+/// input and no output EQ. All existing callers remain unchanged.
+pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<String, AudioError> {
+    render_surround_conf_ex(&SurroundRender {
+        spec,
+        hrir_path,
+        channels: 8,
+        output_eq: None,
+    })
 }
 
 // ─── SurroundBackend ──────────────────────────────────────────────────────────
@@ -267,6 +657,23 @@ impl<R: CommandRunner> SurroundBackend<R> {
         )))
     }
 
+    /// Write `conf` to the on-disk conf file and spawn `pipewire -c <path>`.
+    ///
+    /// Shared write+spawn logic extracted to satisfy G1 (no duplication).
+    fn spawn_conf(&mut self, conf: String) -> Result<ConfHandle, AudioError> {
+        let path = self.conf_path();
+        std::fs::write(&path, conf).map_err(|e| AudioError::Spawn {
+            program: "write-conf".to_string(),
+            source_msg: e.to_string(),
+        })?;
+        let path_str = path.to_string_lossy().into_owned();
+        let token = self.runner.spawn_owned("pipewire", &["-c", &path_str])?;
+        Ok(ConfHandle {
+            conf_path: path,
+            child: Some(token),
+        })
+    }
+
     /// Create the surround sink idempotently.
     ///
     /// Returns a `ConfHandle` with `child = Some(token)` when a new `pipewire -c`
@@ -280,16 +687,7 @@ impl<R: CommandRunner> SurroundBackend<R> {
             });
         }
         let conf = render_surround_conf(&self.spec, hrir_path)?;
-        std::fs::write(&path, conf).map_err(|e| AudioError::Spawn {
-            program: "write-conf".to_string(),
-            source_msg: e.to_string(),
-        })?;
-        let path_str = path.to_string_lossy().into_owned();
-        let token = self.runner.spawn_owned("pipewire", &["-c", &path_str])?;
-        Ok(ConfHandle {
-            conf_path: path,
-            child: Some(token),
-        })
+        self.spawn_conf(conf)
     }
 
     /// Remove the surround sink idempotently.
@@ -314,6 +712,41 @@ impl<R: CommandRunner> SurroundBackend<R> {
         self.create(hrir_path)
     }
 
+    /// Teardown then recreate with explicit channel count and optional output EQ.
+    ///
+    /// `channels` must be `6` (5.1) or `8` (7.1); see [`render_surround_conf_ex`].
+    /// Use this when switching surround topology at runtime — always tears down the
+    /// existing sink before spawning the new one.
+    pub fn recreate_ex(
+        &mut self,
+        hrir_path: &Path,
+        channels: u8,
+        output_eq: Option<&EqModel>,
+    ) -> Result<ConfHandle, AudioError> {
+        self.remove()?;
+        let conf = render_surround_conf_ex(&SurroundRender {
+            spec: &self.spec,
+            hrir_path,
+            channels,
+            output_eq,
+        })?;
+        self.spawn_conf(conf)
+    }
+
+    /// Teardown then recreate as a stereo-bypass sink (no HRIR convolver).
+    ///
+    /// `crossfeed` is [0, 100]; see [`render_stereo_bypass_conf`].
+    /// Use this when the source is already stereo and no upmix is wanted.
+    pub fn recreate_stereo_bypass(
+        &mut self,
+        crossfeed: u8,
+        output_eq: Option<&EqModel>,
+    ) -> Result<ConfHandle, AudioError> {
+        self.remove()?;
+        let conf = render_stereo_bypass_conf(&self.spec, crossfeed, output_eq)?;
+        self.spawn_conf(conf)
+    }
+
     /// Resolve the filter-chain node id for the capture (sink) node.
     fn find_node_id(&mut self) -> Result<String, AudioError> {
         let out = self.runner.run("pw-cli", &["ls", "Node"])?;
@@ -333,6 +766,7 @@ impl<R: CommandRunner> SurroundBackend<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eq::{BandKind, EqBand, EqModel};
     use crate::runner::MockRunner;
     use std::path::PathBuf;
 
@@ -466,6 +900,546 @@ id 40, type PipeWire:Interface:Node/3
         );
     }
 
+    // ── render_surround_conf_ex: new parametric renderer tests ────────────────
+
+    #[test]
+    fn render_surround_conf_ex_rejects_invalid_channels() {
+        let spec = test_spec();
+        let err = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 7,
+            output_eq: None,
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, AudioError::Invalid(_)),
+            "expected Invalid for channels=7, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn render_surround_conf_ex_rejects_invalid_eq() {
+        let spec = test_spec();
+        // EqModel with no bands fails validation.
+        let eq = EqModel { bands: vec![] };
+        let err = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: Some(&eq),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, AudioError::Invalid(_)),
+            "expected Invalid for empty eq, got {err:?}"
+        );
+    }
+
+    /// 6-channel render must emit 6-ch capture props and omit all SL/SR nodes.
+    #[test]
+    fn render_5_1_emits_6_channel_capture_and_no_side_nodes() {
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 6,
+            output_eq: None,
+        })
+        .unwrap();
+
+        // capture.props must be 6-ch with 5.1 position
+        let cap = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            cap.contains("audio.channels = 6"),
+            "5.1 must have 6 channels in capture.props"
+        );
+        assert!(
+            cap.contains("audio.position = [ FL FR FC LFE RL RR ]"),
+            "5.1 must use 5.1 position"
+        );
+        assert!(
+            !cap.contains("SL"),
+            "5.1 capture.props must not reference SL"
+        );
+        assert!(
+            !cap.contains("SR"),
+            "5.1 capture.props must not reference SR"
+        );
+
+        // No SL/SR copy or convolver nodes
+        assert!(
+            !got.contains("copySL"),
+            "5.1 must not emit copySL node"
+        );
+        assert!(
+            !got.contains("copySR"),
+            "5.1 must not emit copySR node"
+        );
+        assert!(
+            !got.contains("convSL"),
+            "5.1 must not emit any convSL node"
+        );
+        assert!(
+            !got.contains("convSR"),
+            "5.1 must not emit any convSR node"
+        );
+
+        // Must still have 12 convolver nodes (not 16)
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 12, "5.1 must have 12 convolver nodes, got {conv_count}");
+
+        // Outputs still come from mixers (no EQ tail)
+        assert!(
+            got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "5.1 no-EQ outputs must be from mixers"
+        );
+    }
+
+    /// 8-channel render with a 2-band EqModel must insert per-ear bq nodes
+    /// linked after the mixers, with the graph output coming from the last EQ nodes.
+    /// STRENGTHENED: asserts the actual control value formatting, not just node presence.
+    #[test]
+    fn render_with_output_eq_inserts_per_ear_bq_nodes_after_mixers() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![
+                EqBand::new(BandKind::Peaking, 200.0, 1.0, 3.0),
+                EqBand::new(BandKind::HighShelf, 8000.0, 0.7, -2.0),
+            ],
+        };
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: Some(&eq),
+        })
+        .unwrap();
+
+        // Both band types must appear
+        assert!(got.contains("bq_peaking"), "must contain bq_peaking node");
+        assert!(got.contains("bq_highshelf"), "must contain bq_highshelf node");
+
+        // Per-ear node names must be present
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_l_1\""), "must have eq_l_1 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+        assert!(got.contains("\"eq_r_1\""), "must have eq_r_1 node");
+
+        // STRENGTHENED: Assert actual control value formatting for peaking band (eq_l_0).
+        // fmt_num formats: whole numbers with .1 (200.0), decimals as-is (1.0, 3.0).
+        assert!(
+            got.contains("\"Freq\" = 200.0  \"Q\" = 1.0  \"Gain\" = 3.0"),
+            "eq_l_0 must have exact peaking band controls: Freq=200.0, Q=1.0, Gain=3.0"
+        );
+        assert!(
+            got.contains("\"Freq\" = 8000.0  \"Q\" = 0.7  \"Gain\" = -2.0"),
+            "eq_l_1 must have exact highshelf band controls: Freq=8000.0, Q=0.7, Gain=-2.0"
+        );
+
+        // Mixer → EQ links must be present
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0"
+        );
+
+        // Intra-EQ chain links
+        assert!(
+            got.contains("output = \"eq_l_0:Out\"  input = \"eq_l_1:In\""),
+            "eq_l_0 must link to eq_l_1"
+        );
+        assert!(
+            got.contains("output = \"eq_r_0:Out\"  input = \"eq_r_1:In\""),
+            "eq_r_0 must link to eq_r_1"
+        );
+
+        // Outputs must come from the last EQ nodes, not directly from mixers
+        assert!(
+            got.contains("outputs = [ \"eq_l_1:Out\" \"eq_r_1:Out\" ]"),
+            "outputs must reference last EQ nodes"
+        );
+        assert!(
+            !got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "outputs must NOT come directly from mixers when EQ is present"
+        );
+
+        // Still 7.1: 8-ch capture, 16 convolvers
+        assert!(got.contains("audio.channels = 8"));
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 16, "7.1 with EQ must still have 16 convolver nodes");
+    }
+
+    /// 5.1 (6-channel) with output EQ must combine both features:
+    /// 6-ch capture.props AND per-ear EQ nodes after mixers with EQ outputs.
+    #[test]
+    fn render_5_1_with_output_eq_combines_both() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![
+                EqBand::new(BandKind::Peaking, 1000.0, 1.5, 2.0),
+                EqBand::new(BandKind::LowShelf, 100.0, 0.9, -1.5),
+            ],
+        };
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 6,
+            output_eq: Some(&eq),
+        })
+        .unwrap();
+
+        // 5.1: capture must be 6-ch
+        let cap = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            cap.contains("audio.channels = 6"),
+            "5.1 with EQ must emit 6-ch capture"
+        );
+        assert!(
+            cap.contains("audio.position = [ FL FR FC LFE RL RR ]"),
+            "5.1 with EQ must use 5.1 position"
+        );
+
+        // No SL/SR nodes in 5.1
+        assert!(
+            !got.contains("copySL"),
+            "5.1 with EQ must not emit copySL"
+        );
+        assert!(
+            !got.contains("convSL"),
+            "5.1 with EQ must not emit convSL"
+        );
+
+        // EQ nodes present: 2-band chain per ear
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0");
+        assert!(got.contains("\"eq_l_1\""), "must have eq_l_1");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0");
+        assert!(got.contains("\"eq_r_1\""), "must have eq_r_1");
+
+        // Mixer → EQ_0 links
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0"
+        );
+
+        // Outputs reference last EQ nodes
+        assert!(
+            got.contains("outputs = [ \"eq_l_1:Out\" \"eq_r_1:Out\" ]"),
+            "5.1 with EQ outputs must reference eq_l_1/eq_r_1"
+        );
+
+        // Only 12 convolvers for 5.1
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 12, "5.1 with EQ must have 12 convolver nodes");
+    }
+
+    /// Render with a 1-band EqModel must create a degenerate chain (no internal links).
+    /// outputs must reference eq_l_0:Out / eq_r_0:Out (no eq_l_1, etc.).
+    #[test]
+    fn render_with_single_band_eq_degenerate_chain() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 500.0, 1.0, 0.0)],
+        };
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: Some(&eq),
+        })
+        .unwrap();
+
+        // Only eq_l_0 and eq_r_0 nodes exist (no eq_l_1, eq_r_1, etc.)
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+        assert!(
+            !got.contains("\"eq_l_1\""),
+            "degenerate 1-band chain must not have eq_l_1"
+        );
+        assert!(
+            !got.contains("\"eq_r_1\""),
+            "degenerate 1-band chain must not have eq_r_1"
+        );
+
+        // Mixer directly links to the single EQ node
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0 in degenerate chain"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0 in degenerate chain"
+        );
+
+        // No intra-EQ links (no eq_l_0 → eq_l_1)
+        assert!(
+            !got.contains("output = \"eq_l_0:Out\"  input = \"eq_l_1:In\""),
+            "degenerate chain must not have internal EQ links"
+        );
+
+        // Outputs reference the sole EQ nodes
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "degenerate 1-band outputs must reference eq_l_0/eq_r_0"
+        );
+
+        // Control values present and correct (0.0 dB formatted as "0.0")
+        assert!(
+            got.contains("\"Freq\" = 500.0  \"Q\" = 1.0  \"Gain\" = 0.0"),
+            "single band must have exact control values: Freq=500.0, Q=1.0, Gain=0.0"
+        );
+
+        // Still 7.1: 8-ch capture, 16 convolvers
+        assert!(got.contains("audio.channels = 8"));
+        let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
+        assert_eq!(conv_count, 16, "7.1 with 1-band EQ must still have 16 convolver nodes");
+    }
+
+    /// render_surround_conf must produce identical output to render_surround_conf_ex
+    /// with channels=8 and output_eq=None (back-compat wrapper guarantee).
+    #[test]
+    fn render_surround_conf_wrapper_unchanged_vs_ex() {
+        let spec = test_spec();
+        let path = PathBuf::from("/test/hrir.wav");
+        let via_wrapper = render_surround_conf(&spec, &path).unwrap();
+        let via_ex = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &path,
+            channels: 8,
+            output_eq: None,
+        })
+        .unwrap();
+        assert_eq!(
+            via_wrapper, via_ex,
+            "render_surround_conf must be an exact alias for render_surround_conf_ex(channels=8, eq=None)"
+        );
+    }
+
+    // ── render_stereo_bypass_conf tests ──────────────────────────────────────
+
+    /// Passthrough (crossfeed=0, no EQ): 2-channel FL/FR sink, no convolver nodes.
+    #[test]
+    fn stereo_bypass_passthrough_no_eq_is_2ch_no_convolver() {
+        let spec = test_spec();
+        let got = render_stereo_bypass_conf(&spec, 0, None).unwrap();
+
+        // No convolver nodes anywhere
+        assert!(
+            !got.contains("convolver"),
+            "passthrough must not have any convolver nodes"
+        );
+
+        // capture.props must be a 2-ch stereo Audio/Sink
+        let cap = got
+            .split("capture.props")
+            .nth(1)
+            .and_then(|s| s.split("playback.props").next())
+            .expect("capture.props section");
+        assert!(
+            cap.contains("media.class = Audio/Sink"),
+            "must be Audio/Sink"
+        );
+        assert!(
+            cap.contains("audio.channels = 2"),
+            "must have 2 channels"
+        );
+        assert!(
+            cap.contains("audio.position = [ FL FR ]"),
+            "must have stereo position"
+        );
+
+        // playback.props must also be 2-ch
+        let pb = got
+            .split("playback.props")
+            .nth(1)
+            .expect("playback.props section");
+        assert!(pb.contains("audio.channels = 2"), "playback must be 2-ch");
+        assert!(pb.contains("audio.position = [ FL FR ]"), "playback must be FL FR");
+        assert!(pb.contains("target.object = \"hwsink\""), "target must be set");
+
+        // Passthrough outputs come directly from copy nodes
+        assert!(
+            got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
+            "passthrough outputs must come from copy nodes"
+        );
+    }
+
+    /// crossfeed=0 with a 1-band EQ: eq_l_0/eq_r_0 nodes present, outputs from them.
+    #[test]
+    fn stereo_bypass_with_eq_applies_tail() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 500.0, 1.0, 0.0)],
+        };
+        let got = render_stereo_bypass_conf(&spec, 0, Some(&eq)).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // EQ nodes are present
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+        assert!(
+            !got.contains("\"eq_l_1\""),
+            "single-band chain must not have eq_l_1"
+        );
+        assert!(
+            !got.contains("\"eq_r_1\""),
+            "single-band chain must not have eq_r_1"
+        );
+
+        // copyL/R link directly into the EQ tail (no mixer in the path)
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"eq_l_0:In\""),
+            "copyL must link to eq_l_0"
+        );
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"eq_r_0:In\""),
+            "copyR must link to eq_r_0"
+        );
+
+        // Outputs come from the EQ nodes, not directly from copy
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "outputs must reference eq_l_0/eq_r_0"
+        );
+        assert!(
+            !got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
+            "copy outputs must not appear when EQ is present"
+        );
+    }
+
+    /// crossfeed=50 → cf=0.25: mixer nodes with correct gains, cross-links correct.
+    #[test]
+    fn stereo_bypass_crossfeed_blends_opposite_channel() {
+        let spec = test_spec();
+        // cf = (50 / 100) * 0.5 = 0.25
+        let got = render_stereo_bypass_conf(&spec, 50, None).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // Mixer nodes are present
+        assert!(got.contains("name = mixL"), "must have mixL node");
+        assert!(got.contains("name = mixR"), "must have mixR node");
+
+        // Per-input gain controls: Gain 1 = 1.0 (direct), Gain 2 = 0.25 (cross)
+        assert!(
+            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
+            "mixer must have Gain 1=1.0 and Gain 2=0.25 for crossfeed=50"
+        );
+
+        // Direct links: each channel's own copy to its mixer's In 1
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"mixL:In 1\""),
+            "copyL must feed mixL In 1 (direct)"
+        );
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"mixR:In 1\""),
+            "copyR must feed mixR In 1 (direct)"
+        );
+
+        // Cross links: opposite channel to In 2
+        assert!(
+            got.contains("output = \"copyR:Out\"  input = \"mixL:In 2\""),
+            "copyR must feed mixL In 2 (crossfeed)"
+        );
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"mixR:In 2\""),
+            "copyL must feed mixR In 2 (crossfeed)"
+        );
+
+        // Outputs come from mixers (no EQ)
+        assert!(
+            got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "crossfeed outputs must be from mixers"
+        );
+    }
+
+    /// crossfeed=50 with a 1-band EQ: mixers are present AND EQ chain composes.
+    /// Verifies that mixL/mixR link INTO the EQ tail (not copyL/copyR).
+    #[test]
+    fn stereo_bypass_crossfeed_with_eq_composes() {
+        let spec = test_spec();
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 2.0)],
+        };
+        let got = render_stereo_bypass_conf(&spec, 50, Some(&eq)).unwrap();
+
+        // No convolver nodes
+        assert!(!got.contains("convolver"), "must not have convolver nodes");
+
+        // Mixer nodes are present (for crossfeed)
+        assert!(got.contains("name = mixL"), "must have mixL node for crossfeed");
+        assert!(got.contains("name = mixR"), "must have mixR node for crossfeed");
+
+        // EQ nodes are present
+        assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
+        assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
+
+        // Mixer gains set for cf=0.25 (crossfeed=50)
+        assert!(
+            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
+            "mixer must have correct crossfeed gains"
+        );
+
+        // CRITICAL: mixL and mixR link to eq_l_0 and eq_r_0 (NOT copyL/copyR)
+        assert!(
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0 when both crossfeed and EQ are present"
+        );
+        assert!(
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0 when both crossfeed and EQ are present"
+        );
+
+        // Ensure copyL/copyR do NOT link to EQ (they go to mixer instead)
+        assert!(
+            !got.contains("output = \"copyL:Out\"  input = \"eq_l_0:In\""),
+            "copyL must NOT link to eq_l_0; it goes to mixL first"
+        );
+        assert!(
+            !got.contains("output = \"copyR:Out\"  input = \"eq_r_0:In\""),
+            "copyR must NOT link to eq_r_0; it goes to mixR first"
+        );
+
+        // Outputs come from EQ, not directly from mixer
+        assert!(
+            got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
+            "outputs must reference eq_l_0/eq_r_0 when EQ is present"
+        );
+    }
+
+    /// crossfeed > 100 must return an error (out of valid range 0..=100).
+    #[test]
+    fn stereo_bypass_crossfeed_over_100_errors() {
+        let spec = test_spec();
+        let err = render_stereo_bypass_conf(&spec, 200, None).unwrap_err();
+        assert!(
+            matches!(err, AudioError::Invalid(_)),
+            "crossfeed=200 must return Invalid, got {err:?}"
+        );
+        // Verify the error message mentions the constraint
+        let msg = format!("{err:?}");
+        assert!(msg.contains("0..=100"), "error must mention valid range 0..=100");
+        assert!(msg.contains("200"), "error must mention the invalid value 200");
+    }
+
     // ── SurroundBackend tests (MockRunner) ────────────────────────────────────
 
     #[test]
@@ -555,6 +1529,109 @@ id 40, type PipeWire:Interface:Node/3
         assert!(
             handle.child.is_some(),
             "recreate must surface new child token"
+        );
+    }
+
+    // ── recreate_ex / recreate_stereo_bypass tests ───────────────────────────
+    //
+    // Each test uses a unique node_name_base to avoid file-system races when
+    // tests run in parallel (all would otherwise share the same conf path).
+
+    #[test]
+    fn recreate_ex_8ch_with_eq_writes_conf_with_eq_and_spawns() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_8ch_eq".into(),
+            description: "Test 8ch EQ".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent (early return, no destroy)
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let hrir = PathBuf::from("/test/hrir.wav");
+        let eq = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 3.0)],
+        };
+        let handle = be.recreate_ex(&hrir, 8, Some(&eq)).unwrap();
+
+        // (a) one spawn_owned("pipewire", ["-c", <conf_path>]) recorded
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert_eq!(spawned[0][0], "pipewire");
+        assert_eq!(spawned[0][1], "-c");
+        assert!(
+            spawned[0][2].ends_with("test_surr_8ch_eq.conf"),
+            "conf path ends with test_surr_8ch_eq.conf, got: {}",
+            spawned[0][2]
+        );
+        assert!(handle.child.is_some(), "child token must be present");
+
+        // (b) conf file contains EQ nodes and 8-channel capture
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("\"eq_l_0\""),
+            "conf must contain eq_l_0 node (EQ tail present)"
+        );
+        assert!(
+            conf.contains("\"eq_r_0\""),
+            "conf must contain eq_r_0 node (EQ tail present)"
+        );
+        assert!(
+            conf.contains("audio.channels = 8"),
+            "conf must have 8-channel capture props"
+        );
+    }
+
+    #[test]
+    fn recreate_ex_6ch_writes_5_1_conf() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_6ch".into(),
+            description: "Test 6ch".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let hrir = PathBuf::from("/test/hrir.wav");
+        let handle = be.recreate_ex(&hrir, 6, None).unwrap();
+
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert!(handle.child.is_some(), "child token must be present");
+
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("audio.channels = 6"),
+            "5.1 conf must have 6-channel capture props"
+        );
+    }
+
+    #[test]
+    fn recreate_stereo_bypass_writes_2ch_no_convolver() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_bypass".into(),
+            description: "Test bypass".into(),
+            hw_sink: None,
+        };
+        // remove: source_exists → absent
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be.recreate_stereo_bypass(0, None).unwrap();
+
+        let spawned = &be.runner().spawned;
+        assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
+        assert!(handle.child.is_some(), "child token must be present");
+
+        let conf = std::fs::read_to_string(&spawned[0][2])
+            .expect("conf file must exist at spawned path");
+        assert!(
+            conf.contains("audio.channels = 2"),
+            "stereo bypass must have 2-channel capture props"
+        );
+        assert!(
+            !conf.contains("convolver"),
+            "stereo bypass must not contain any convolver node"
         );
     }
 }

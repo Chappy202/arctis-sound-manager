@@ -23,6 +23,8 @@ pub fn factory_eq_presets() -> Vec<EqPreset> {
             vec![ls(4.0), pk(62.0,2.0), pkq(125.0,1.41,-5.0), pk(250.0,-0.5), pk(500.0,0.5), pk(1000.0,1.5), pk(2000.0,1.0), pk(4000.0,2.5), pk(8000.0,-1.0), hs(1.0)]),
         eqp("FPS / Footsteps", "Gaming · preamp -5 dB",
             vec![ls(-2.0), pk(62.0,-1.5), pkq(125.0,1.41,-7.0), pk(250.0,-2.5), pk(500.0,0.0), pk(1000.0,2.0), pk(2000.0,3.5), pk(4000.0,5.0), pk(8000.0,2.5), hs(1.0)]),
+        eqp("FPS / Footsteps (Competitive)", "Gaming · preamp -3 dB",
+            vec![ls(0.0), pk(62.0,-3.0), pkq(125.0,1.41,-2.0), pk(250.0,3.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,3.0), pk(4000.0,2.0), pk(8000.0,0.0), hs(0.0)]),
         eqp("Immersive", "Movies · preamp -4.5 dB",
             vec![ls(4.5), pk(62.0,2.5), pkq(125.0,1.41,-5.5), pk(250.0,-1.0), pk(500.0,0.0), pk(1000.0,0.5), pk(2000.0,1.0), pk(4000.0,2.0), pk(8000.0,-2.0), hs(3.5)]),
         eqp("Vocal Clarity", "Voice · preamp -4 dB",
@@ -111,5 +113,14 @@ mod tests {
         // Names unique within each catalog.
         let mut eqn: Vec<_> = eq.iter().map(|p| &p.name).collect(); eqn.sort(); eqn.dedup();
         assert_eq!(eqn.len(), eq.len());
+    }
+
+    #[test]
+    fn competitive_footsteps_preset_present_and_gentle() {
+        let p = factory_eq_presets();
+        let fp = p.iter().find(|p| p.name == "FPS / Footsteps (Competitive)").expect("preset present");
+        // gentle: no band exceeds +4 dB, sub-bass cut present
+        assert!(fp.bands.iter().all(|b| b.gain_db <= 4.0));
+        assert!(fp.bands.iter().any(|b| b.freq_hz == 62.0 && b.gain_db < 0.0));
     }
 }

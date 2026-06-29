@@ -291,6 +291,33 @@ pub async fn surround_set_hw_sink(
     call(&state, Request::SurroundSetHwSink { hw_sink }).await
 }
 
+// ── A6: HRIR import / fetch commands ─────────────────────────────────────────
+
+#[tauri::command]
+pub async fn surround_import_hrirs(
+    dir: Option<String>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundImportHrirs { dir }).await
+}
+
+#[tauri::command]
+pub async fn surround_fetch_hrirs(
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SurroundFetchHrirs).await
+}
+
+// ── A8: Factory profile creation ─────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn profile_create_from_factory(
+    template: String,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::ProfileCreateFromFactory { template }).await
+}
+
 // ── F3b: Profile management commands ─────────────────────────────────────────
 
 #[tauri::command]

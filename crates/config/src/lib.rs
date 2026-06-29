@@ -8,5 +8,5 @@ pub use error::ConfigError;
 pub use schema::{
     ChannelConfig, Config, EqBandConfig, EqPreset, MicChainConfig, MicCompressorStage,
     MicGainStage, MicGateStage, MicHighpassStage, MicPreset, MicSuppressionStage, Profile,
-    RouteConfig, SuppressionBackend, SurroundConfig, CURRENT_VERSION,
+    RouteConfig, SuppressionBackend, SurroundConfig, SurroundMode, CURRENT_VERSION,
 };

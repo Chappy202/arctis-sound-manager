@@ -6,7 +6,8 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { hrirDisplayName, channelChecked, toggleChannel } from "./surround.js";
+import { hrirDisplayName, channelChecked, toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink } from "./surround.js";
+import type { OutputDeviceSnapshot } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
 // hrirDisplayName
@@ -107,5 +108,110 @@ describe("toggleChannel", () => {
   it("appends newly added channel at the end", () => {
     const result = toggleChannel("chat", ["game"]);
     expect(result[result.length - 1]).toBe("chat");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildSinkOptions
+// ---------------------------------------------------------------------------
+
+describe("buildSinkOptions", () => {
+  const devices: OutputDeviceSnapshot[] = [
+    { node_name: "alsa_output.arctis", description: "Arctis Nova Pro", is_default: true },
+    { node_name: "alsa_output.hdmi", description: "HDMI", is_default: false },
+  ];
+
+  it("first entry is Auto-detect with value ''", () => {
+    const opts = buildSinkOptions(devices, null);
+    expect(opts[0].value).toBe("");
+    expect(opts[0].label).toBe("Auto-detect");
+  });
+
+  it("includes resolved name in Auto-detect label when provided", () => {
+    const opts = buildSinkOptions(devices, "alsa_output.arctis");
+    expect(opts[0].label).toBe("Auto-detect (alsa_output.arctis)");
+  });
+
+  it("maps node_name to value for each device", () => {
+    const opts = buildSinkOptions(devices, null);
+    expect(opts[1].value).toBe("alsa_output.arctis");
+    expect(opts[2].value).toBe("alsa_output.hdmi");
+  });
+
+  it("maps description to label for each device", () => {
+    const opts = buildSinkOptions(devices, null);
+    expect(opts[1].label).toBe("Arctis Nova Pro");
+    expect(opts[2].label).toBe("HDMI");
+  });
+
+  it("falls back to node_name as label when description is empty", () => {
+    const noDesc: OutputDeviceSnapshot[] = [
+      { node_name: "alsa_output.unknown", description: "", is_default: false },
+    ];
+    const opts = buildSinkOptions(noDesc, null);
+    expect(opts[1].label).toBe("alsa_output.unknown");
+  });
+
+  it("returns only the Auto-detect entry when outputs list is empty", () => {
+    const opts = buildSinkOptions([], null);
+    expect(opts).toHaveLength(1);
+    expect(opts[0].value).toBe("");
+  });
+
+  it("total length is outputs.length + 1 (Auto-detect + all devices)", () => {
+    const opts = buildSinkOptions(devices, null);
+    expect(opts).toHaveLength(devices.length + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sinkSelectValue
+// ---------------------------------------------------------------------------
+
+describe("sinkSelectValue", () => {
+  it("returns '' for null", () => {
+    expect(sinkSelectValue(null)).toBe("");
+  });
+
+  it("returns '' for undefined", () => {
+    expect(sinkSelectValue(undefined)).toBe("");
+  });
+
+  it("returns the node name for a non-null value", () => {
+    expect(sinkSelectValue("alsa_output.arctis")).toBe("alsa_output.arctis");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sinkValueToHwSink
+// ---------------------------------------------------------------------------
+
+describe("sinkValueToHwSink", () => {
+  it("returns null for empty string (Auto-detect)", () => {
+    expect(sinkValueToHwSink("")).toBeNull();
+  });
+
+  it("returns the node name for a non-empty string", () => {
+    expect(sinkValueToHwSink("alsa_output.arctis")).toBe("alsa_output.arctis");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Round-trip: sinkValueToHwSink(sinkSelectValue(x))
+// ---------------------------------------------------------------------------
+
+describe("sinkSelectValue / sinkValueToHwSink round-trip", () => {
+  it("null → '' → null", () => {
+    expect(sinkValueToHwSink(sinkSelectValue(null))).toBeNull();
+  });
+
+  it("'' (empty string treated as null source) → '' → null", () => {
+    // An empty string from hw_sink is treated as auto-detect
+    expect(sinkValueToHwSink(sinkSelectValue(""))).toBeNull();
+  });
+
+  it("node_name → node_name → node_name", () => {
+    const name = "alsa_output.arctis";
+    expect(sinkValueToHwSink(sinkSelectValue(name))).toBe(name);
   });
 });

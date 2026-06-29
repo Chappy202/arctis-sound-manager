@@ -276,6 +276,9 @@ enum ProfileAction {
     },
     /// Import a profile from a TOML file.
     Import { file: std::path::PathBuf },
+    /// Create a factory profile from a named template and make it active.
+    /// Supported templates: DayZ (game surround on, footstep EQ, default sink = game).
+    CreateFactory { template: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -426,6 +429,14 @@ enum SurroundAction {
         /// Hardware sink node.name; omit to clear the pin.
         device: Option<String>,
     },
+    /// Import HeSuVi 14-channel WAVs into the HRIR profiles directory.
+    Import {
+        /// Path to a directory containing HeSuVi .wav files. Omit to use the
+        /// default import path (~/.local/share/pipewire/hrir_hesuvi/import).
+        dir: Option<String>,
+    },
+    /// Placeholder: automatic HeSuVi download (not yet available).
+    Fetch,
 }
 
 #[derive(Subcommand, Debug)]
@@ -855,6 +866,8 @@ fn dispatch_surround(action: SurroundAction) -> ExitCode {
         } => daemon::Request::SurroundSetHrir { name },
         SurroundAction::Channels { channels } => daemon::Request::SurroundSetChannels { channels },
         SurroundAction::HwSink { device } => daemon::Request::SurroundSetHwSink { hw_sink: device },
+        SurroundAction::Import { dir } => daemon::Request::SurroundImportHrirs { dir },
+        SurroundAction::Fetch => daemon::Request::SurroundFetchHrirs,
     };
 
     match daemon::send_request(&req) {
@@ -1741,6 +1754,36 @@ fn dispatch_profile(action: ProfileAction) -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("error importing profile: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        ProfileAction::CreateFactory { template } => {
+            if !daemon::socket_path().exists() {
+                eprintln!("error: daemon is not running — start it with `asm-cli daemon`");
+                eprintln!(
+                    "note: profile create-factory requires the daemon \
+                     (single worker enforces PipeWire serialisation)"
+                );
+                return ExitCode::FAILURE;
+            }
+            let req = daemon::Request::ProfileCreateFromFactory {
+                template: template.clone(),
+            };
+            match daemon::send_request(&req) {
+                Ok(resp) if resp.ok => {
+                    println!("factory profile '{template}' created and activated");
+                    ExitCode::SUCCESS
+                }
+                Ok(resp) => {
+                    eprintln!(
+                        "error: {}",
+                        resp.error.unwrap_or_else(|| "unknown error".to_string())
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("error communicating with daemon: {e}");
                     ExitCode::FAILURE
                 }
             }
