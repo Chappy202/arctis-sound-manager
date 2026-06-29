@@ -26,6 +26,7 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             libudev-dev \
             build-essential \
+            libfuse2 \
             file
 
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +52,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # linuxdeploy/appimagetool are AppImages needing FUSE (absent on the
+          # runner) → run them extract-and-run; and skip linuxdeploy's strip
+          # step, which fails on the bundled binaries (reproduced locally).
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          NO_STRIP: "true"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Arctis Sound Manager ${{ github.ref_name }}"

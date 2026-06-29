@@ -14,14 +14,21 @@ icon_dir="${HOME}/.local/share/icons/hicolor/128x128/apps"
 mkdir -p "$app_dir" "$desktop_dir" "$icon_dir"
 install -m 0755 "$src" "$dest"
 
-# Extract the bundled icon (best-effort; falls back to no icon).
+# Extract the bundled icon (best-effort — must never abort the install).
+# Note: the AppDir root holds a *.png symlink into usr/share/icons; extracting
+# only the root glob leaves it dangling, so target the real hicolor icon and
+# accept only regular files (-type f skips broken symlinks).
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-( cd "$tmp" && "$dest" --appimage-extract '*.png' >/dev/null 2>&1 || true )
-icon_src="$(find "$tmp" -name '*.png' -path '*128x128*' | head -n1 || true)"
-[[ -z "$icon_src" ]] && icon_src="$(find "$tmp" -name '*.png' | head -n1 || true)"
-if [[ -n "$icon_src" ]]; then
-  install -m 0644 "$icon_src" "${icon_dir}/arctis-sound-manager.png"
+( cd "$tmp" && APPIMAGE_EXTRACT_AND_RUN=1 "$dest" --appimage-extract 'usr/share/icons/hicolor/128x128/apps/*.png' >/dev/null 2>&1 || true )
+icon_src="$(find "$tmp" -path '*128x128*' -name '*.png' -type f | head -n1 || true)"
+if [[ -z "$icon_src" ]]; then
+  # Fallback: extract everything, take any real (non-empty, non-symlink) png.
+  ( cd "$tmp" && APPIMAGE_EXTRACT_AND_RUN=1 "$dest" --appimage-extract >/dev/null 2>&1 || true )
+  icon_src="$(find "$tmp" -name '*.png' -type f -not -empty | head -n1 || true)"
+fi
+if [[ -n "$icon_src" && -f "$icon_src" ]]; then
+  install -m 0644 "$icon_src" "${icon_dir}/arctis-sound-manager.png" || true
 fi
 
 cat > "${desktop_dir}/arctis-sound-manager.desktop" <<EOF
