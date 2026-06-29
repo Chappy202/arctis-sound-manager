@@ -135,7 +135,7 @@ pub fn resolve_effective_mode(cfg_mode: SurroundMode, negotiated: Option<u8>) ->
 }
 
 /// Convert a `SurroundMode` to its canonical snake_case wire-format string.
-fn surround_mode_str(m: SurroundMode) -> &'static str {
+pub(crate) fn surround_mode_str(m: SurroundMode) -> &'static str {
     use SurroundMode::*;
     match m {
         Auto => "auto",
@@ -2703,6 +2703,9 @@ impl<R: CommandRunner> Engine<R> {
         &mut self,
         bands: Vec<arctis_config::EqBandConfig>,
     ) -> Result<(), crate::error::EngineError> {
+        // Validate BEFORE persisting so out-of-bounds gains/kinds are rejected
+        // with a typed error and nothing is saved or torn down (G7).
+        convert::eq_model_from_bands(&bands)?.validate()?;
         {
             let name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
@@ -2725,6 +2728,13 @@ impl<R: CommandRunner> Engine<R> {
         &mut self,
         blocksize: Option<u32>,
     ) -> Result<(), crate::error::EngineError> {
+        // Reject obviously-invalid values BEFORE persisting (G7). A 0 blocksize is
+        // invalid; `None` stays valid (PipeWire default / auto).
+        if blocksize == Some(0) {
+            return Err(crate::error::EngineError::BadRequest(
+                "blocksize must be greater than 0 (use None for the PipeWire default)".into(),
+            ));
+        }
         {
             let name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
@@ -6645,6 +6655,57 @@ mod tests {
         }];
         engine.surround_set_output_eq(bands.clone()).unwrap();
         assert_eq!(engine.config.active().unwrap().surround.output_eq, bands);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_output_eq_rejects_out_of_range_gain_and_leaves_config_unchanged() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_oeq_bad");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let before = engine.config.active().unwrap().surround.output_eq.clone();
+
+        // +99 dB is well out of the validated gain range → typed Err, nothing saved.
+        let bad = vec![arctis_config::EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 1000.0,
+            q: 1.0,
+            gain_db: 99.0,
+        }];
+        let res = engine.surround_set_output_eq(bad);
+        assert!(matches!(res, Err(crate::error::EngineError::Audio(_))));
+        assert_eq!(
+            engine.config.active().unwrap().surround.output_eq,
+            before,
+            "config must be unchanged when validation fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_blocksize_rejects_zero() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_bs_zero");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let before = engine.config.active().unwrap().surround.blocksize;
+
+        let res = engine.surround_set_blocksize(Some(0));
+        assert!(matches!(res, Err(crate::error::EngineError::BadRequest(_))));
+        assert_eq!(
+            engine.config.active().unwrap().surround.blocksize,
+            before,
+            "config must be unchanged when blocksize is rejected"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");

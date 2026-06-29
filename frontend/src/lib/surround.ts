@@ -135,13 +135,20 @@ export function bandsToOutputEq(bands: Band[]): EqBandSnapshot[] {
 }
 
 /**
- * Seed a flat 10-band peaking output-EQ curve at the canonical EQ frequencies
- * (matches eq.ts DEFAULT_BAND_FREQS / the engine's EqModel::default_10band()).
+ * Seed a flat 10-band output-EQ curve at the canonical EQ frequencies, matching
+ * the engine's EqModel::default_10band() (eq.rs) exactly: band 0 is a low-shelf
+ * (31 Hz), band 9 a high-shelf (16 kHz), and the middle eight peaking — so
+ * bass/treble adjustments move real energy at the extremes. All bands gain 0 dB,
+ * Q 1.0 (the engine default).
  * Used when the "Spatial correction (post)" toggle is switched on so the editor
  * has manipulable bands rather than an empty curve.
  */
 export function flatOutputEq(): EqBandSnapshot[] {
-  return DEFAULT_BAND_FREQS.map((freq) => ({ kind: "peaking", freq_hz: freq, q: 1, gain_db: 0 }));
+  const last = DEFAULT_BAND_FREQS.length - 1;
+  return DEFAULT_BAND_FREQS.map((freq, i) => {
+    const kind: Band["kind"] = i === 0 ? "lowshelf" : i === last ? "highshelf" : "peaking";
+    return { kind, freq_hz: freq, q: 1, gain_db: 0 };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -151,4 +158,16 @@ export function flatOutputEq(): EqBandSnapshot[] {
 /** Human label for a factory-profile row. */
 export function factoryProfileLabel(info: FactoryProfileInfo): string {
   return info.hrir ? `${info.name} · ${info.hrir}` : info.name;
+}
+
+// ---------------------------------------------------------------------------
+// Read-only mode / blocksize display (spec §6.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Format the convolver blocksize for read-only display.
+ * null / undefined (PipeWire default) → "auto"; otherwise the sample count.
+ */
+export function formatBlocksize(blocksize: number | null | undefined): string {
+  return blocksize == null ? "auto" : String(blocksize);
 }

@@ -181,17 +181,20 @@ mod tests {
 
     #[test]
     fn factory_profile_info_lists_dayz() {
+        // Build via the SAME serializer the shipped `Engine::list_factory_profiles()`
+        // uses (snake_case wire string), so the test exercises the real wire format
+        // ("hrir71"), not the Debug rendering ("Hrir71").
         let infos: Vec<FactoryProfileInfo> = factory_profiles()
             .iter()
             .map(|s| FactoryProfileInfo {
                 name: s.name.to_string(),
                 hrir: s.hrir_stem.map(|h| h.to_string()),
-                mode: format!("{:?}", s.mode),
+                mode: crate::engine::surround_mode_str(s.mode).to_string(),
             })
             .collect();
-        assert!(infos
-            .iter()
-            .any(|i| i.name == "DayZ" && i.hrir.as_deref() == Some("04-gsx-sennheiser-gsx")));
+        assert!(infos.iter().any(|i| i.name == "DayZ"
+            && i.hrir.as_deref() == Some("04-gsx-sennheiser-gsx")
+            && i.mode == "hrir71"));
     }
 
     #[test]

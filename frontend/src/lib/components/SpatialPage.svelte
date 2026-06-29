@@ -45,6 +45,7 @@
     bandsToOutputEq,
     factoryProfileLabel,
     flatOutputEq,
+    formatBlocksize,
   } from "../surround.js";
   import EqEditor from "./EqEditor.svelte";
   import Switch from "../ui/Switch.svelte";
@@ -61,6 +62,10 @@
 
   const masterEnabled     = $derived(surround?.enabled ?? false);
   const currentHrir       = $derived(surround?.hrir ?? null);
+  // Read-only effective mode + blocksize (spec §6.3). effective_mode is the
+  // resolved mode after fallback; blocksize null → "auto" (PipeWire default).
+  const effectiveMode     = $derived(surround?.effective_mode ?? surround?.mode ?? "—");
+  const blocksizeLabel    = $derived(formatBlocksize(surround?.blocksize));
   const availableHrirs    = $derived(surround?.available_hrirs ?? []);
   const availableHrirEntries = $derived(surround?.available_hrir_entries ?? []);
   const activeChannels    = $derived(surround?.channels ?? []);
@@ -327,6 +332,15 @@
               ariaLabel="Enable virtual surround"
             />
           </span>
+        </div>
+        <!-- Read-only mode + blocksize (spec §6.3) -->
+        <div class="field-row">
+          <span class="field-label">MODE</span>
+          <span class="field-value">{effectiveMode}</span>
+        </div>
+        <div class="field-row">
+          <span class="field-label">BLOCKSIZE</span>
+          <span class="field-value">{blocksizeLabel}</span>
         </div>
       </div>
     </div>
@@ -665,6 +679,14 @@
     text-transform: uppercase;
     color: var(--ss-text-secondary);
     flex-shrink: 0;
+  }
+
+  /* Read-only value text (mode / blocksize display). */
+  .field-value {
+    font-family: var(--ss-font-mono, var(--ss-font-ui));
+    font-size: var(--ss-type-body-size);
+    color: var(--ss-text-primary);
+    text-transform: none;
   }
 
   .field-label--hint {

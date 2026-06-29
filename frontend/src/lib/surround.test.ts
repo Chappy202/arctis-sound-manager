@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from "vitest";
 import { hrirDisplayName, channelChecked, toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink } from "./surround.js";
-import { groupHrirOptionsByTonality, outputEqToBands, bandsToOutputEq, factoryProfileLabel, flatOutputEq } from "./surround.js";
+import { groupHrirOptionsByTonality, outputEqToBands, bandsToOutputEq, factoryProfileLabel, flatOutputEq, formatBlocksize } from "./surround.js";
 import type { OutputDeviceSnapshot, HrirEntrySnapshot, EqBandSnapshot, FactoryProfileInfo } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -259,13 +259,29 @@ describe("factoryProfileLabel", () => {
 });
 
 describe("flatOutputEq", () => {
-  it("seeds a flat 10-band peaking curve at the canonical frequencies", () => {
+  it("seeds a flat 10-band curve with shelves at the extremes (matches engine default_10band)", () => {
     const bands = flatOutputEq();
     expect(bands).toHaveLength(10);
-    expect(bands.every((b) => b.kind === "peaking" && b.gain_db === 0)).toBe(true);
+    // Band 0 = low-shelf, band 9 = high-shelf, the middle eight = peaking.
+    expect(bands[0].kind).toBe("lowshelf");
+    expect(bands[9].kind).toBe("highshelf");
+    expect(bands.slice(1, 9).every((b) => b.kind === "peaking")).toBe(true);
+    // All bands flat (gain 0 dB).
+    expect(bands.every((b) => b.gain_db === 0)).toBe(true);
     expect(bands.map((b) => b.freq_hz)).toEqual([31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]);
   });
   it("round-trips through outputEqToBands", () => {
     expect(bandsToOutputEq(outputEqToBands(flatOutputEq()))).toEqual(flatOutputEq());
+  });
+});
+
+describe("formatBlocksize", () => {
+  it("shows 'auto' for null/undefined (PipeWire default)", () => {
+    expect(formatBlocksize(null)).toBe("auto");
+    expect(formatBlocksize(undefined)).toBe("auto");
+  });
+  it("shows the sample count for a pinned blocksize", () => {
+    expect(formatBlocksize(128)).toBe("128");
+    expect(formatBlocksize(0)).toBe("0");
   });
 });
