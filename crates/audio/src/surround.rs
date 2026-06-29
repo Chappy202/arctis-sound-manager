@@ -48,6 +48,9 @@ pub struct SurroundRender<'a> {
     /// When `Some`, per-ear bq nodes are inserted between the mixers and the
     /// 2-channel output.
     pub output_eq: Option<&'a EqModel>,
+    /// Convolver partition size in samples. `Some(n)` emits `blocksize = n` into
+    /// every convolver node's config; `None` omits it (PipeWire default).
+    pub blocksize: Option<u32>,
 }
 
 // ─── Conf renderer ────────────────────────────────────────────────────────────
@@ -184,8 +187,12 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
     ];
     let convs: &[(&str, u32)] = if is_51 { convs_51 } else { convs_71 };
     for (name, ch) in convs {
+        let bs = match r.blocksize {
+            Some(n) => format!("  blocksize = {n}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch} }} }}\n"
+            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch}{bs} }} }}\n"
         ));
     }
 
@@ -597,6 +604,7 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
         hrir_path,
         channels: 8,
         output_eq: None,
+        blocksize: None,
     })
 }
 
@@ -720,6 +728,7 @@ impl<R: CommandRunner> SurroundBackend<R> {
         hrir_path: &Path,
         channels: u8,
         output_eq: Option<&EqModel>,
+        blocksize: Option<u32>,
     ) -> Result<ConfHandle, AudioError> {
         self.remove()?;
         let conf = render_surround_conf_ex(&SurroundRender {
@@ -727,6 +736,7 @@ impl<R: CommandRunner> SurroundBackend<R> {
             hrir_path,
             channels,
             output_eq,
+            blocksize,
         })?;
         self.spawn_conf(conf)
     }
@@ -908,6 +918,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 7,
             output_eq: None,
+            blocksize: None,
         })
         .unwrap_err();
         assert!(
@@ -926,6 +937,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 8,
             output_eq: Some(&eq),
+            blocksize: None,
         })
         .unwrap_err();
         assert!(
@@ -943,6 +955,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 6,
             output_eq: None,
+            blocksize: None,
         })
         .unwrap();
 
@@ -998,6 +1011,38 @@ id 40, type PipeWire:Interface:Node/3
         );
     }
 
+    #[test]
+    fn render_with_blocksize_emits_blocksize_on_every_convolver() {
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: None,
+            blocksize: Some(128),
+        })
+        .unwrap();
+        let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
+        assert_eq!(conv_lines.len(), 16, "7.1 has 16 convolvers");
+        for line in &conv_lines {
+            assert!(line.contains("blocksize = 128"), "convolver line missing blocksize: {line}");
+        }
+    }
+
+    #[test]
+    fn render_without_blocksize_omits_blocksize() {
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: None,
+            blocksize: None,
+        })
+        .unwrap();
+        assert!(!got.contains("blocksize"), "None must not emit a blocksize key");
+    }
+
     /// 8-channel render with a 2-band EqModel must insert per-ear bq nodes
     /// linked after the mixers, with the graph output coming from the last EQ nodes.
     /// STRENGTHENED: asserts the actual control value formatting, not just node presence.
@@ -1015,6 +1060,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 8,
             output_eq: Some(&eq),
+            blocksize: None,
         })
         .unwrap();
 
@@ -1091,6 +1137,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 6,
             output_eq: Some(&eq),
+            blocksize: None,
         })
         .unwrap();
 
@@ -1159,6 +1206,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &PathBuf::from("/test/hrir.wav"),
             channels: 8,
             output_eq: Some(&eq),
+            blocksize: None,
         })
         .unwrap();
 
@@ -1220,6 +1268,7 @@ id 40, type PipeWire:Interface:Node/3
             hrir_path: &path,
             channels: 8,
             output_eq: None,
+            blocksize: None,
         })
         .unwrap();
         assert_eq!(
@@ -1549,7 +1598,7 @@ id 40, type PipeWire:Interface:Node/3
         let eq = EqModel {
             bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 3.0)],
         };
-        let handle = be.recreate_ex(&hrir, 8, Some(&eq)).unwrap();
+        let handle = be.recreate_ex(&hrir, 8, Some(&eq), None).unwrap();
 
         // (a) one spawn_owned("pipewire", ["-c", <conf_path>]) recorded
         let spawned = &be.runner().spawned;
@@ -1591,7 +1640,7 @@ id 40, type PipeWire:Interface:Node/3
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
         let hrir = PathBuf::from("/test/hrir.wav");
-        let handle = be.recreate_ex(&hrir, 6, None).unwrap();
+        let handle = be.recreate_ex(&hrir, 6, None, None).unwrap();
 
         let spawned = &be.runner().spawned;
         assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
