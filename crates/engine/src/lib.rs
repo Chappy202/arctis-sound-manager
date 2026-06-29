@@ -17,6 +17,7 @@ pub use children::ChildOwner;
 pub use device::{DeviceCommand, DeviceOpener};
 pub use engine::Engine;
 pub use error::EngineError;
+pub use factory_profiles::FactoryProfileInfo;
 pub use state::{
     AppStream, ChannelSnapshot, DeviceShared, EngineState, EqBandSnapshot, EqPresetSnapshot, Event,
     MicParam, MicPresetSnapshot, MicSnapshot, MicStageSnapshot, OutputDeviceSnapshot,

@@ -1197,6 +1197,18 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// List the factory-profile catalog as serializable info for the UI.
+    pub fn list_factory_profiles(&self) -> Vec<crate::factory_profiles::FactoryProfileInfo> {
+        crate::factory_profiles::factory_profiles()
+            .iter()
+            .map(|s| crate::factory_profiles::FactoryProfileInfo {
+                name: s.name.to_string(),
+                hrir: s.hrir_stem.map(|h| h.to_string()),
+                mode: surround_mode_str(s.mode).to_string(),
+            })
+            .collect()
+    }
+
     /// Rename a profile. If it was the active profile, also updates `active_profile`.
     /// Saves config and emits `ProfileRenamed`.
     pub fn rename_profile(&mut self, old: &str, new: &str) -> Result<(), EngineError> {

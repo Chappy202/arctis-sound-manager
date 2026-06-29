@@ -46,6 +46,14 @@ pub fn find_factory_profile(name: &str) -> Option<&'static FactoryProfileSpec> {
     factory_profiles().iter().find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
+/// Serializable summary of a factory template for the UI listing.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FactoryProfileInfo {
+    pub name: String,
+    pub hrir: Option<String>,
+    pub mode: String,
+}
+
 /// Resolve a named EQ preset to its bands; unknown names are a hard error.
 fn preset_bands(name: &str) -> Result<Vec<arctis_config::EqBandConfig>, EngineError> {
     crate::presets::factory_eq_presets()
@@ -169,6 +177,21 @@ mod tests {
         assert!(find_factory_profile("DAYZ").is_some());
         assert!(find_factory_profile("DayZ").is_some());
         assert!(find_factory_profile("nope").is_none());
+    }
+
+    #[test]
+    fn factory_profile_info_lists_dayz() {
+        let infos: Vec<FactoryProfileInfo> = factory_profiles()
+            .iter()
+            .map(|s| FactoryProfileInfo {
+                name: s.name.to_string(),
+                hrir: s.hrir_stem.map(|h| h.to_string()),
+                mode: format!("{:?}", s.mode),
+            })
+            .collect();
+        assert!(infos
+            .iter()
+            .any(|i| i.name == "DayZ" && i.hrir.as_deref() == Some("04-gsx-sennheiser-gsx")));
     }
 
     #[test]

@@ -228,6 +228,13 @@ pub enum Request {
     SurroundImportHrirs { dir: Option<String> },
     /// Placeholder: automatic HeSuVi download (not yet implemented).
     SurroundFetchHrirs,
+    /// List the static factory-profile catalog (name + hrir + mode). Returns
+    /// `Response.factory_profiles`.
+    ListFactoryProfiles,
+    /// Set the explicit post-convolution surround EQ on the active profile's binaural tail.
+    SurroundSetOutputEq { bands: Vec<arctis_engine::EqBandSnapshot> },
+    /// Pin (or clear) the convolver blocksize on the active profile's surround.
+    SurroundSetBlocksize { blocksize: Option<u32> },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -252,6 +259,9 @@ pub struct Response {
     /// Coexistence disable result. Populated only for CoexistDisable responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coexist_result: Option<CoexistDisableResult>,
+    /// Factory-profile catalog payload. Populated only for ListFactoryProfiles responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub factory_profiles: Option<Vec<arctis_engine::FactoryProfileInfo>>,
 }
 
 impl Response {
@@ -265,6 +275,7 @@ impl Response {
             output_devices: None,
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
         }
     }
 
@@ -278,6 +289,7 @@ impl Response {
             output_devices: None,
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
         }
     }
 
@@ -291,6 +303,7 @@ impl Response {
             output_devices: None,
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
         }
     }
 
@@ -304,6 +317,7 @@ impl Response {
             output_devices: None,
             coexist_report: Some(report),
             coexist_result: None,
+            factory_profiles: None,
         }
     }
 
@@ -317,6 +331,7 @@ impl Response {
             output_devices: None,
             coexist_report: None,
             coexist_result: Some(result),
+            factory_profiles: None,
         }
     }
 
@@ -330,6 +345,7 @@ impl Response {
             output_devices: None,
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
         }
     }
 
@@ -343,6 +359,21 @@ impl Response {
             output_devices: Some(devices),
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
+        }
+    }
+
+    pub fn ok_with_factory_profiles(profiles: Vec<arctis_engine::FactoryProfileInfo>) -> Self {
+        Self {
+            ok: true,
+            state: None,
+            error: None,
+            text: None,
+            streams: None,
+            output_devices: None,
+            coexist_report: None,
+            coexist_result: None,
+            factory_profiles: Some(profiles),
         }
     }
 }
@@ -421,6 +452,7 @@ mod tests {
             output_devices: None,
             coexist_report: None,
             coexist_result: None,
+            factory_profiles: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -606,6 +638,42 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    // ── Task 9: ListFactoryProfiles + SurroundSetOutputEq/Blocksize ─────────────
+
+    #[test]
+    fn list_factory_profiles_wire_tag() {
+        let req = Request::ListFactoryProfiles;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"cmd\":\"list-factory-profiles\""));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Request::ListFactoryProfiles);
+    }
+
+    #[test]
+    fn surround_set_output_eq_round_trips() {
+        let req = Request::SurroundSetOutputEq {
+            bands: vec![arctis_engine::EqBandSnapshot {
+                kind: "peaking".into(),
+                freq_hz: 250.0,
+                q: 1.0,
+                gain_db: 3.0,
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"cmd\":\"surround-set-output-eq\""));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn surround_set_blocksize_round_trips() {
+        let req = Request::SurroundSetBlocksize { blocksize: Some(128) };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"cmd\":\"surround-set-blocksize\""));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, req);
     }
 
     // ── Task 6: DeviceSet verb ───────────────────────────────────────────────
