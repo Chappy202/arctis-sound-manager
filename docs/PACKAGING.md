@@ -31,31 +31,24 @@ routing rules.
 The private signing key is generated once and stored securely by the owner.
 It is NEVER committed to the repository.
 
-### One-time generation (already done — DO NOT regenerate unless key is lost)
+### Keypair status
 
-```sh
-# Run from the frontend/ directory
-pnpm tauri signer generate -w ~/.signing/arctis-sound-manager.key -p ""
-# Or with a passphrase (recommended for production):
-pnpm tauri signer generate -w ~/.signing/arctis-sound-manager.key
-```
+Generated 2026-06-29 with an **empty passphrase**.
 
-This writes:
-- `~/.signing/arctis-sound-manager.key`     — **PRIVATE key (keep secret)**
-- `~/.signing/arctis-sound-manager.key.pub` — public key (already committed to
-  `tauri.conf.json` as `plugins.updater.pubkey`)
+- `~/.signing/arctis-sound-manager.key` — **PRIVATE key (mode 600, outside repo, keep secret)**
+- Public key committed to `src-tauri/tauri.conf.json` as `plugins.updater.pubkey` (commit `4aa5f8c`).
 
 ### CI secret — OWNER-ONLY
 
-Set the following CI/CD environment variable (GitHub Actions secret or
-equivalent):
+Set the GitHub Actions secret once:
 
-```
-TAURI_SIGNING_PRIVATE_KEY = <contents of ~/.signing/arctis-sound-manager.key>
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD = <passphrase, or empty string if none>
+```sh
+gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.signing/arctis-sound-manager.key
 ```
 
-Tauri's build system reads these automatically during `pnpm tauri build` to
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` is **not set** — the key has an empty passphrase.
+
+Tauri's build system reads `TAURI_SIGNING_PRIVATE_KEY` automatically during `pnpm tauri build` to
 sign the updater artifact.
 
 ---
@@ -76,6 +69,21 @@ enumeration), and a C compiler.  On Nobara/Fedora:
 ```sh
 sudo dnf install webkit2gtk4.1-devel libudev-devel gcc
 ```
+
+---
+
+## Releasing
+
+1. Bump `version` in `src-tauri/tauri.conf.json`.
+2. Commit, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. `.github/workflows/release.yml` builds, signs, and publishes to GitHub Releases.
+   (Requires the `TAURI_SIGNING_PRIVATE_KEY` secret to be set once.)
+4. Users on an older AppImage see the in-app update banner on next launch.
+
+The workflow runs `scripts/check-version.sh` (asserts the tag matches the version in
+`tauri.conf.json`) and `scripts/stage-sidecar.sh` (builds `asm-cli` and stages it as a
+sidecar binary) before invoking `tauri-action`, which builds, signs, and uploads the
+AppImage, `.AppImage.tar.gz`, `.sig`, `latest.json`, `.deb`, and `.rpm` to GitHub Releases.
 
 ---
 
@@ -100,18 +108,16 @@ sudo dnf install webkit2gtk4.1-devel libudev-devel gcc
    ```
 2. **The signed `.AppImage.tar.gz`** — the binary artifact the updater downloads.
 
-### Endpoint URL — OWNER-FILL
+### Endpoint URL
 
-Set the real URL in `src-tauri/tauri.conf.json` under `plugins.updater.endpoints`:
+The committed endpoint in `src-tauri/tauri.conf.json` under `plugins.updater.endpoints`:
 
-```json
-"endpoints": [
-  "https://YOUR-UPDATE-HOST.example.com/arctis-sound-manager/{{target}}-{{arch}}/{{current_version}}"
-]
+```
+https://github.com/Chappy202/arctis-sound-manager/releases/latest/download/latest.json
 ```
 
-The placeholder value `https://REPLACE-ME.example.com/...` will cause the
-updater to fail silently in production until this is set.
+The GitHub Releases pipeline (`.github/workflows/release.yml`) uploads `latest.json` automatically
+on each tagged release — no separate hosting required.
 
 The endpoint must return:
 - **200** with a `latest.json` body when an update is available.
@@ -119,11 +125,6 @@ The endpoint must return:
 - **Any non-2xx** causes Tauri to try the next endpoint in the list.
 
 TLS is enforced in production mode — HTTP is rejected.
-
-### Simple hosting options
-
-- GitHub Releases: `https://github.com/<user>/<repo>/releases/latest/download/latest.json`
-- Any static file host (Cloudflare R2, S3, Backblaze B2, self-hosted nginx).
 
 ---
 
@@ -140,6 +141,37 @@ TLS is enforced in production mode — HTTP is rejected.
    relaunches.
 
 Signature mismatch → update is rejected.  No download of an unsigned artifact.
+
+---
+
+## Daemon bundling
+
+`asm-cli` ships as a Tauri `externalBin` sidecar, staged by `scripts/stage-sidecar.sh` during the
+release workflow.
+
+| Install type | `asm-cli` location |
+|---|---|
+| AppImage | GUI copies it to `~/.local/bin/asm-cli` on first launch |
+| `.deb` / `.rpm` | Installed to `/usr/bin/asm-cli` by the package manager |
+
+For AppImage installs the GUI performs the copy on launch so that the systemd `ExecStart` path
+(`%h/.local/bin/asm-cli`) remains valid across in-app updates (the AppImage is replaced in place,
+but the extracted binary at `~/.local/bin/asm-cli` is refreshed automatically).
+
+---
+
+## AppImage install
+
+```sh
+scripts/install-appimage.sh arctis-sound-manager_<ver>_amd64.AppImage
+```
+
+This registers the app as a launcher application (creates the `.desktop` entry, marks the
+AppImage executable, and places it in `~/.local/bin/`).  Then run the udev installer once:
+
+```sh
+asm-cli setup-udev
+```
 
 ---
 
