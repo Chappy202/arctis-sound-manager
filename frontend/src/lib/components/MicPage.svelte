@@ -13,6 +13,7 @@
   import { get } from "svelte/store";
   import { untrack } from "svelte";
   import { engineState } from "../stores.js";
+  import { connectionStatus } from "../stores/connection.js";
   import { eqEditing } from "../stores/eqEditing.js";
   import {
     micEnable,
@@ -33,6 +34,7 @@
     backendAvailable,
   } from "../mic.js";
   import { findMicPresetDescription } from "./micPresetUtils.js";
+  import DaemonUnavailable from "./DaemonUnavailable.svelte";
   import EqEditor from "./EqEditor.svelte";
   import LevelMeter from "./LevelMeter.svelte";
   import { type Band } from "../eq.js";
@@ -311,22 +313,15 @@
   }
 </script>
 
+{#if $connectionStatus !== "connected"}
+  <DaemonUnavailable />
+{:else}
 <div class="mic-page">
   <!-- ===== Page header ===== -->
   <div class="page-header">
     <h1 class="page-title">MIC</h1>
     <p class="page-subtitle">Noise suppression · EQ · Gain · Chain</p>
   </div>
-
-  {#if !$engineState}
-    <div class="state-card" role="status" aria-live="polite">
-      <div class="state-icon connecting-icon" aria-hidden="true">◎</div>
-      <div class="state-body">
-        <span class="state-title">Connecting to Daemon…</span>
-        <span class="state-desc">Waiting for state from the Arctis daemon.</span>
-      </div>
-    </div>
-  {:else}
     <!-- ===== Master enable ===== -->
     <div class="device-card device-card--live">
       <div class="card-header">
@@ -877,8 +872,8 @@
         {/if}
       </div>
     {/if}
-  {/if}
 </div>
+{/if}
 
 <style>
   .mic-page {
@@ -934,63 +929,6 @@
     font-size: var(--ss-type-caption-size);
     color: var(--ss-text-tertiary);
     margin: 0;
-  }
-
-  /* ===== State card (connecting) ===== */
-  .state-card {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--ss-space-4);
-    padding: var(--ss-space-6);
-    background: var(--ss-surface-1);
-    border: var(--ss-border-width) solid var(--ss-border);
-    border-radius: var(--ss-radius-md);
-    box-shadow: var(--ss-e1);
-  }
-
-  .state-icon {
-    font-size: 28px;
-    line-height: 1;
-    flex-shrink: 0;
-    color: var(--ss-text-tertiary);
-    margin-top: 2px;
-  }
-
-  .connecting-icon {
-    color: var(--ss-warning);
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.35; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .connecting-icon {
-      animation: none;
-    }
-  }
-
-  .state-body {
-    display: flex;
-    flex-direction: column;
-    gap: var(--ss-space-2);
-    flex: 1;
-  }
-
-  .state-title {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-h3-size);
-    font-weight: var(--ss-type-h3-weight);
-    color: var(--ss-text-primary);
-    letter-spacing: var(--ss-type-h3-letter-spacing);
-  }
-
-  .state-desc {
-    font-family: var(--ss-font-ui);
-    font-size: var(--ss-type-body-size);
-    color: var(--ss-text-secondary);
   }
 
   /* ===== Stage cards — masonry columns =====
