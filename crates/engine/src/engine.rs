@@ -706,7 +706,13 @@ impl<R: CommandRunner> Engine<R> {
         band: usize,
         cfg: EqBandConfig,
     ) -> Result<(), EngineError> {
-        // Update in-memory config
+        // Update in-memory config. Capture whether the band's filter TYPE (kind)
+        // changed BEFORE overwriting it: a biquad's type is the filter-chain node
+        // label (bq_peaking/bq_lowshelf/bq_highshelf), fixed at chain-build time,
+        // and CANNOT be switched by a live `pw-cli s … Props` set — only
+        // Freq/Q/Gain are live-updatable. A kind change therefore needs a sink
+        // rebuild; a value-only change keeps the fast live path (G3).
+        let kind_changed;
         {
             let active_name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
@@ -733,6 +739,7 @@ impl<R: CommandRunner> Engine<R> {
             if channel.eq.len() < arctis_audio::MAX_BANDS {
                 channel.eq = convert::dense_eq_bands(channel);
             }
+            kind_changed = channel.eq[band].kind != cfg.kind;
             channel.eq[band] = cfg.clone();
         }
         // Persist
@@ -750,9 +757,22 @@ impl<R: CommandRunner> Engine<R> {
                 })?;
             let def = convert::channel_def_from_cfg(channel);
             let spec = def.sink_spec();
-            let eq_band = convert::eq_band_from_cfg(&cfg)?;
             let mut be = AudioBackend::new(&mut self.runner, spec);
-            be.apply_band(band, &eq_band)?;
+            if kind_changed {
+                // Rebuild ONLY this channel's sink so the new bq_* label takes
+                // effect (reuses AudioBackend::recreate, the same teardown+respawn
+                // ChannelManager::set_output uses). The new conf is rendered from
+                // the full dense band model, so all live values are preserved.
+                let eq_model = convert::eq_model_for(channel)?;
+                let handle = be.recreate(&eq_model)?;
+                if let Some(t) = handle.child {
+                    self.children.track(t);
+                }
+            } else {
+                // Value-only edit (Freq/Q/Gain): keep the low-latency live path.
+                let eq_band = convert::eq_band_from_cfg(&cfg)?;
+                be.apply_band(band, &eq_band)?;
+            }
             let _ = active_name; // suppress unused warning
         }
         // Emit event
@@ -2142,7 +2162,11 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Validate band
         let eq_band = convert::eq_band_from_cfg(&cfg)?;
-        // Mutate config
+        // Mutate config. Capture whether the band's filter TYPE (kind) changed
+        // BEFORE overwriting: like the channel EQ, a mic biquad's type is the
+        // filter-chain node label and can only change via a chain rebuild — live
+        // apply_control only updates Freq/Q/Gain.
+        let kind_changed;
         {
             let name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
@@ -2158,26 +2182,47 @@ impl<R: CommandRunner> Engine<R> {
                 }
                 profile.mic.eq = dense;
             }
+            kind_changed = profile.mic.eq[band].kind != cfg.kind;
             profile.mic.eq[band] = cfg.clone();
         }
         self.save_config()?;
 
-        // Only perform live apply_control when the master switch is on.
+        // Only perform live I/O when the master switch is on.
         // When off, the persisted config change takes effect the next time
         // mic_set_enabled(true) or reconcile() builds the chain.
         if self.config.active()?.mic.enabled {
-            let profile = self.config.active()?.clone();
-            let spec = convert::mic_chain_spec(&profile.mic);
-            let node_name = convert::mic_eq_band_node_name(band);
-            let mut mic_be = MicBackend::new(&mut self.runner, spec);
-            if let Err(e) = mic_be.apply_control(&node_name, "Freq", eq_band.freq_hz) {
-                eprintln!("warning: mic_set_eq_band Freq apply_control failed: {e}");
-            }
-            if let Err(e) = mic_be.apply_control(&node_name, "Q", eq_band.q) {
-                eprintln!("warning: mic_set_eq_band Q apply_control failed: {e}");
-            }
-            if let Err(e) = mic_be.apply_control(&node_name, "Gain", eq_band.gain_db) {
-                eprintln!("warning: mic_set_eq_band Gain apply_control failed: {e}");
+            if kind_changed {
+                // Filter-type change → rebuild the mic chain so the new bq_*
+                // label takes effect (mirrors mic_set_param's recreate branch).
+                self.ensure_pw_version();
+                let profile = self.config.active()?.clone();
+                let (nodes, availability) = convert::mic_chain_nodes(
+                    &profile.mic,
+                    self.probe.as_ref(),
+                    self.builtin_noisegate,
+                );
+                self.mic_availability = availability;
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
+                let handle = mic_be.recreate(&nodes)?;
+                if let Some(token) = handle.child {
+                    self.children.track(token);
+                }
+            } else {
+                // Value-only edit (Freq/Q/Gain): keep the live apply_control path.
+                let profile = self.config.active()?.clone();
+                let spec = convert::mic_chain_spec(&profile.mic);
+                let node_name = convert::mic_eq_band_node_name(band);
+                let mut mic_be = MicBackend::new(&mut self.runner, spec);
+                if let Err(e) = mic_be.apply_control(&node_name, "Freq", eq_band.freq_hz) {
+                    eprintln!("warning: mic_set_eq_band Freq apply_control failed: {e}");
+                }
+                if let Err(e) = mic_be.apply_control(&node_name, "Q", eq_band.q) {
+                    eprintln!("warning: mic_set_eq_band Q apply_control failed: {e}");
+                }
+                if let Err(e) = mic_be.apply_control(&node_name, "Gain", eq_band.gain_db) {
+                    eprintln!("warning: mic_set_eq_band Gain apply_control failed: {e}");
+                }
             }
         }
 
@@ -4038,6 +4083,125 @@ mod tests {
         std::env::remove_var("ASM_CONFIG_HOME");
     }
 
+    /// Bugfix: changing a band's filter TYPE (kind) must REBUILD the channel sink
+    /// (the bq_* node label is fixed at chain-build time and can't be live-set),
+    /// so the audible filter matches the on-screen curve without a daemon restart.
+    #[test]
+    fn set_eq_band_kind_change_rebuilds_sink() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_band_kind_change");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // game band 0 is stored as "peaking"; we change it to "lowshelf".
+        let cfg = make_config_with_eq_bands();
+
+        // recreate() = remove() [sink_exists ls + find_node_id ls + destroy + pkill]
+        //            + create() [sink_exists ls]. Queue two present ls so remove
+        // proceeds to destroy; create's sink_exists then sees the default-empty
+        // output → absent → spawn_owned a fresh `pipewire -c <Game.conf>`.
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // remove: sink_exists (present)
+            .with_output(0, &ls, ""); // remove: find_node_id (present)
+
+        let mut engine = Engine::new(runner, cfg);
+
+        let band_cfg = EqBandConfig {
+            kind: "lowshelf".to_string(), // CHANGED from "peaking"
+            freq_hz: 100.0,
+            q: 1.0,
+            gain_db: 3.0,
+        };
+        engine
+            .set_eq_band("game", 0, band_cfg)
+            .expect("set_eq_band kind-change should succeed");
+
+        // A fresh filter-chain instance was spawned for the game channel → rebuild.
+        let spawned = &engine.runner.spawned;
+        assert_eq!(spawned.len(), 1, "kind change must rebuild the channel sink");
+        assert_eq!(spawned[0][0], "pipewire");
+        assert!(
+            spawned[0][2].ends_with("Arctis_Game.conf"),
+            "rebuild must respawn the Game channel conf, got {:?}",
+            spawned[0]
+        );
+        // The teardown half of recreate ran (destroy the old node).
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 2 && c[0] == "pw-cli" && c[1] == "destroy"),
+            "kind change must destroy the old node as part of the rebuild"
+        );
+        // The new child token is tracked for shutdown reaping.
+        assert_eq!(
+            engine.children.len(),
+            1,
+            "rebuild must track the new pipewire child"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Bugfix guard: a VALUE-ONLY edit (same kind, different gain) must keep the
+    /// fast live `pw-cli s … Props` path — NO sink rebuild (no regression of G3).
+    #[test]
+    fn set_eq_band_value_only_change_keeps_live_apply() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("eq_band_value_only");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // game band 0 is stored as "peaking"; we keep "peaking", change only gain.
+        let cfg = make_config_with_eq_bands();
+
+        // apply_band: find_node_id (1 ls) + 1 pw-cli s <id> Props.
+        let ls = ls_all_present();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // find_node_id
+            .with_output(0, "", ""); // pw-cli s <id> Props
+
+        let mut engine = Engine::new(runner, cfg);
+
+        let band_cfg = EqBandConfig {
+            kind: "peaking".to_string(), // SAME kind
+            freq_hz: 100.0,
+            q: 1.0,
+            gain_db: 9.0, // changed value only
+        };
+        engine
+            .set_eq_band("game", 0, band_cfg)
+            .expect("set_eq_band value-only should succeed");
+
+        // No rebuild: no spawn, no destroy, no child tracked.
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "value-only edit must NOT rebuild the sink"
+        );
+        assert!(
+            !engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 2 && c[0] == "pw-cli" && c[1] == "destroy"),
+            "value-only edit must NOT destroy the node"
+        );
+        assert_eq!(engine.children.len(), 0, "value-only edit tracks no child");
+        // The live Props set DID run.
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 4 && c[1] == "s" && c[3] == "Props"),
+            "value-only edit must issue the live pw-cli s <id> Props"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
     // ─────────────────────────────────────────────
     // TDD: new features — get-state full EQ, set_channel_output, new_profile
     // ─────────────────────────────────────────────
@@ -5314,6 +5478,114 @@ mod tests {
             dial_controls_balance: true,
             knob_controls_master: true,
         }
+    }
+
+    /// Bugfix (mic): changing a mic EQ band's filter TYPE must rebuild the mic
+    /// chain (the bq_* label is fixed at build time); value-only edits keep the
+    /// live apply_control path.
+    #[test]
+    fn mic_set_eq_band_kind_change_rebuilds_chain() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_eq_kind_change");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        // mic.enabled = true, mic.eq empty → dense band 0 default kind = "lowshelf".
+        let cfg = make_config_mic_enabled();
+
+        // recreate(): remove() [source_exists ls + find_node_id ls + destroy + pkill]
+        //           + create() [source_exists ls → default-empty → absent → spawn].
+        let ls = ls_with_mic();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "") // remove: source_exists (present)
+            .with_output(0, &ls, ""); // remove: find_node_id (present)
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.seed_pw_version((1, 4, 11)); // keep ensure_pw_version() a no-op
+
+        let band_cfg = EqBandConfig {
+            kind: "peaking".to_string(), // CHANGED from default "lowshelf" at band 0
+            freq_hz: 31.0,
+            q: 1.0,
+            gain_db: 2.0,
+        };
+        engine
+            .mic_set_eq_band(0, band_cfg)
+            .expect("mic_set_eq_band kind-change should succeed");
+
+        // Rebuild: fresh chain spawned, old node destroyed, child tracked.
+        assert_eq!(
+            engine.runner.spawned.len(),
+            1,
+            "mic kind change must rebuild the chain"
+        );
+        assert!(
+            engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 2 && c[0] == "pw-cli" && c[1] == "destroy"),
+            "mic kind change must destroy the old node"
+        );
+        assert_eq!(
+            engine.children.len(),
+            1,
+            "mic rebuild must track the new child"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Bugfix guard (mic): a value-only mic EQ edit keeps the live apply_control
+    /// path — NO chain rebuild.
+    #[test]
+    fn mic_set_eq_band_value_only_keeps_live_apply() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("mic_eq_value_only");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_mic_enabled();
+
+        // apply_control path: 3 sets (Freq/Q/Gain), each find_node_id ls + set.
+        let ls = ls_with_mic();
+        let runner = MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+
+        let mut engine = Engine::with_probe(runner, cfg, Box::new(MockPluginProbe::none()));
+        engine.seed_pw_version((1, 4, 11));
+
+        let band_cfg = EqBandConfig {
+            kind: "lowshelf".to_string(), // SAME as default band 0 kind
+            freq_hz: 31.0,
+            q: 1.0,
+            gain_db: 4.0, // value-only change
+        };
+        engine
+            .mic_set_eq_band(0, band_cfg)
+            .expect("mic_set_eq_band value-only should succeed");
+
+        // No rebuild.
+        assert!(
+            engine.runner.spawned.is_empty(),
+            "value-only mic edit must NOT rebuild the chain"
+        );
+        assert!(
+            !engine
+                .runner
+                .calls
+                .iter()
+                .any(|c| c.len() >= 2 && c[0] == "pw-cli" && c[1] == "destroy"),
+            "value-only mic edit must NOT destroy the node"
+        );
+        assert_eq!(engine.children.len(), 0, "value-only mic edit tracks no child");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     /// Queue outputs for a 3-channel reconcile with mic DISABLED.
