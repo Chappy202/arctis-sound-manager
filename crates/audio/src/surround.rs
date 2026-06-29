@@ -55,6 +55,16 @@ pub struct SurroundRender<'a> {
 
 // ─── Conf renderer ────────────────────────────────────────────────────────────
 
+/// Per-input gain baked into every binaural mixer (`mixL`/`mixR`) to prevent
+/// the N-way convolver sum from clipping.
+///
+/// PipeWire's builtin `mixer` defaults every input to Gain=1.0.  With 8
+/// convolvers feeding each ear (7.1) or 6 (5.1, but LFE still at In 8) at
+/// unity, the summed binaural output routinely overshoots 0 dBFS by +6…+12 dB
+/// → audible clipping.  −6 dB (×0.5) gives comfortable headroom; the level is
+/// recovered at the master/hardware sink.
+const SURROUND_MIX_HEADROOM_GAIN: f32 = 0.5;
+
 /// Format a float value the way PipeWire filter-chain confs expect: always
 /// emit a decimal point for whole numbers so PipeWire parses them as floats.
 fn fmt_num(v: f32) -> String {
@@ -64,6 +74,19 @@ fn fmt_num(v: f32) -> String {
         // Trim to a stable short form (no scientific notation for our ranges).
         format!("{v}")
     }
+}
+
+/// Build the `"Gain 1" = G  "Gain 2" = G  …  "Gain N" = G` string for a
+/// PipeWire builtin `mixer` control block.
+///
+/// `n` is the number of consecutive input ports to attenuate (starting at 1).
+/// Setting gain on an unconnected port is harmless — PipeWire ignores it.
+fn mixer_gain_control(n: u8, gain: f32) -> String {
+    let g = fmt_num(gain);
+    (1..=n)
+        .map(|i| format!("\"Gain {i}\" = {g}"))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 /// Render the full standalone `pipewire -c` conf for the surround filter-chain.
@@ -196,9 +219,19 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
         ));
     }
 
-    // Mixer nodes
-    out.push_str("                    { type = builtin  label = mixer  name = mixL }\n");
-    out.push_str("                    { type = builtin  label = mixer  name = mixR }\n");
+    // Mixer nodes — each input attenuated by SURROUND_MIX_HEADROOM_GAIN to prevent
+    // the N-way convolver sum from clipping.
+    //
+    // LFE is always routed to In 8 in both 7.1 and 5.1 configurations, so we must
+    // emit gains for all 8 ports.  In 5.1, ports 2 and 6 are unconnected (no
+    // SL/SR); setting their gain is harmless — PipeWire ignores disconnected inputs.
+    let mg = mixer_gain_control(8, SURROUND_MIX_HEADROOM_GAIN);
+    out.push_str(&format!(
+        "                    {{ type = builtin  label = mixer  name = mixL  control = {{ {mg} }} }}\n"
+    ));
+    out.push_str(&format!(
+        "                    {{ type = builtin  label = mixer  name = mixR  control = {{ {mg} }} }}\n"
+    ));
 
     // Optional output EQ nodes: per-ear bq chains (L first, then R)
     if let Some(eq) = r.output_eq {
@@ -1191,6 +1224,69 @@ id 40, type PipeWire:Interface:Node/3
         // Only 12 convolvers for 5.1
         let conv_count = got.lines().filter(|l| l.contains("label = convolver")).count();
         assert_eq!(conv_count, 12, "5.1 with EQ must have 12 convolver nodes");
+    }
+
+    /// mixL and mixR must carry a control block with SURROUND_MIX_HEADROOM_GAIN (0.5)
+    /// on every input port, for both 7.1 and 5.1 configurations.
+    ///
+    /// Root cause of clipping (now fixed): PipeWire builtin mixer defaults every
+    /// input to Gain=1.0.  With 8 convolvers feeding each ear's mixer in 7.1 (or
+    /// 6 in 5.1, still with LFE at In 8), the summed output routinely overshoots
+    /// 0 dBFS by +6…+12 dB.  Fix: bake -6 dB (gain=0.5) into each mixer input.
+    ///
+    /// For 5.1, convolvers connect at ports 1,3,4,5,7,8 (LFE always at In 8).
+    /// We emit gains for all 8 ports; the gain on unconnected ports 2 and 6
+    /// is applied to disconnected inputs and is therefore harmless.
+    #[test]
+    fn surround_mixer_has_headroom_gains() {
+        let spec = test_spec();
+        let path = PathBuf::from("/test/hrir.wav");
+
+        // Build the expected gains string: "Gain 1" = 0.5 … "Gain 8" = 0.5
+        let gain_str = (1u8..=8)
+            .map(|i| format!("\"Gain {i}\" = 0.5"))
+            .collect::<Vec<_>>()
+            .join("  ");
+
+        // --- 7.1 (8 channels) ---
+        let got_71 = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &path,
+            channels: 8,
+            output_eq: None,
+            blocksize: None,
+        })
+        .unwrap();
+
+        assert!(
+            got_71.contains(&format!("name = mixL  control = {{ {gain_str} }}")),
+            "7.1 mixL must carry 8-entry headroom gains; got:\n{got_71}"
+        );
+        assert!(
+            got_71.contains(&format!("name = mixR  control = {{ {gain_str} }}")),
+            "7.1 mixR must carry 8-entry headroom gains"
+        );
+
+        // --- 5.1 (6 channels) ---
+        // 5.1 connects to ports 1,3,4,5,7,8 (max port = 8 via LFE).
+        // We still emit 8 gain entries; unconnected ports 2 and 6 are harmless.
+        let got_51 = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &path,
+            channels: 6,
+            output_eq: None,
+            blocksize: None,
+        })
+        .unwrap();
+
+        assert!(
+            got_51.contains(&format!("name = mixL  control = {{ {gain_str} }}")),
+            "5.1 mixL must carry 8-entry headroom gains (LFE at In 8)"
+        );
+        assert!(
+            got_51.contains(&format!("name = mixR  control = {{ {gain_str} }}")),
+            "5.1 mixR must carry 8-entry headroom gains (LFE at In 8)"
+        );
     }
 
     /// Render with a 1-band EqModel must create a degenerate chain (no internal links).
