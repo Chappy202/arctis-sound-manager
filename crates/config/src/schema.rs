@@ -365,6 +365,12 @@ pub struct SurroundConfig {
     /// Old configs without this field deserialize cleanly via `#[serde(default)]`.
     #[serde(default)]
     pub crossfeed: u8,
+    /// Post-convolution EQ applied to the 2-ch binaural output. Empty = none.
+    #[serde(default)]
+    pub output_eq: Vec<EqBandConfig>,
+    /// Convolver partition size (samples). None = PipeWire default.
+    #[serde(default)]
+    pub blocksize: Option<u32>,
 }
 
 impl Default for SurroundConfig {
@@ -376,6 +382,8 @@ impl Default for SurroundConfig {
             hw_sink: None,
             mode: SurroundMode::default(),
             crossfeed: 0,
+            output_eq: Vec::new(),
+            blocksize: None,
         }
     }
 }
@@ -1352,6 +1360,8 @@ description = "Chat"
             hw_sink: Some("alsa_output.usb_headset".to_string()),
             mode: SurroundMode::Hrir71,
             crossfeed: 0,
+            output_eq: Vec::new(),
+            blocksize: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
@@ -1783,5 +1793,31 @@ volume_db = -6.0
         // old config without the fields still loads
         let old: SurroundConfig = toml::from_str("enabled = true\n").unwrap();
         assert!(matches!(old.mode, SurroundMode::Auto));
+    }
+
+    #[test]
+    fn surround_config_round_trips_with_output_eq_and_blocksize() {
+        let sc = SurroundConfig {
+            enabled: true,
+            hrir: Some("04-gsx-sennheiser-gsx".into()),
+            channels: vec!["game".into()],
+            hw_sink: None,
+            mode: SurroundMode::Hrir71,
+            crossfeed: 0,
+            output_eq: vec![EqBandConfig { kind: "peaking".into(), freq_hz: 250.0, q: 1.0, gain_db: 3.0 }],
+            blocksize: Some(128),
+        };
+        let toml = toml::to_string(&sc).expect("serialize");
+        let back: SurroundConfig = toml::from_str(&toml).expect("deserialize");
+        assert_eq!(sc, back);
+    }
+
+    #[test]
+    fn surround_config_old_toml_defaults_output_eq_and_blocksize() {
+        // An old config block missing both new fields must load with []/None.
+        let old = "enabled = true\nhrir = \"04-gsx-sennheiser-gsx\"\nchannels = [\"game\"]\nmode = \"hrir71\"\ncrossfeed = 0\n";
+        let sc: SurroundConfig = toml::from_str(old).expect("deserialize old");
+        assert!(sc.output_eq.is_empty());
+        assert_eq!(sc.blocksize, None);
     }
 }
