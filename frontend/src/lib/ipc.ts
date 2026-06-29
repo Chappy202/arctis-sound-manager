@@ -328,6 +328,16 @@ export const surroundSetChannels = (channels: string[]): Promise<EngineState> =>
 export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =>
   invoke<EngineState>("surround_set_hw_sink", { hwSink });
 
+// ── A6: HRIR import / fetch commands ─────────────────────────────────────────
+
+/** Import HeSuVi 14-channel WAVs from `dir` (null = use default path) into the HRIR profiles dir. */
+export const surroundImportHrirs = (dir: string | null): Promise<EngineState> =>
+  invoke<EngineState>("surround_import_hrirs", { dir });
+
+/** Placeholder: automatic HeSuVi download (not yet available — returns an error from the daemon). */
+export const surroundFetchHrirs = (): Promise<EngineState> =>
+  invoke<EngineState>("surround_fetch_hrirs", {});
+
 // ── F3b: Profile management commands ─────────────────────────────────────────
 
 /** Rename a profile. Returns updated EngineState. */

@@ -274,6 +274,14 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Ok(()) => Response::ok_with_state(engine.state()),
             Err(e) => Response::err(e.to_string()),
         },
+        Request::SurroundImportHrirs { dir } => match engine.surround_import_hrirs(dir) {
+            Ok(_report) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
+        Request::SurroundFetchHrirs => match engine.surround_fetch_hrirs() {
+            Ok(_) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::CoexistStatus => {
             // Run pw-cli ls Node + check home dir for legacy components.
             let node_stdout = RealRunner
@@ -2633,6 +2641,79 @@ mod tests {
         assert!(
             !super::socket_is_live(&tmp_path),
             "socket_is_live must return false for a non-existent path"
+        );
+    }
+
+    // ── A6: SurroundImportHrirs / SurroundFetchHrirs dispatch tests ──────────
+
+    #[test]
+    fn handle_surround_import_with_empty_dir_returns_ok_with_state() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_a6_imp_{}", std::process::id()));
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        // Also set HOME so hrir_base_dir can resolve (uses HOME to build the path).
+        let home_tmp = std::env::temp_dir().join(format!("asm_a6_home_{}", std::process::id()));
+        std::fs::create_dir_all(&home_tmp).unwrap();
+        std::env::set_var("HOME", &home_tmp);
+
+        // Empty import dir → import_dir returns Ok with zero imports (no WAVs present).
+        let import_dir = std::env::temp_dir().join(format!("asm_a6_src_{}", std::process::id()));
+        std::fs::create_dir_all(&import_dir).unwrap();
+
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundImportHrirs {
+                dir: Some(import_dir.to_string_lossy().into_owned()),
+            },
+        );
+
+        assert!(resp.ok, "import from empty dir must return ok:true, got: {:?}", resp.error);
+        assert!(resp.state.is_some(), "response must include state");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&home_tmp);
+        let _ = std::fs::remove_dir_all(&import_dir);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn handle_surround_import_with_missing_dir_returns_err() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundImportHrirs {
+                dir: Some("/nonexistent-xyz-asm-a6-test".into()),
+            },
+        );
+
+        assert!(
+            !resp.ok,
+            "import from missing dir must return ok:false"
+        );
+        assert!(resp.error.is_some(), "error message must be present");
+    }
+
+    #[test]
+    fn handle_surround_fetch_hrirs_returns_err_placeholder() {
+        let cfg = two_profile_config();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let resp = handle_request(&mut engine, Request::SurroundFetchHrirs);
+
+        assert!(
+            !resp.ok,
+            "SurroundFetchHrirs placeholder must return ok:false"
+        );
+        let msg = resp.error.expect("error must be present");
+        assert!(
+            msg.contains("not yet available") || msg.contains("HeSuVi"),
+            "error must describe the placeholder: {msg}"
         );
     }
 }

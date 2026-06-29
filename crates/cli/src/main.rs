@@ -426,6 +426,14 @@ enum SurroundAction {
         /// Hardware sink node.name; omit to clear the pin.
         device: Option<String>,
     },
+    /// Import HeSuVi 14-channel WAVs into the HRIR profiles directory.
+    Import {
+        /// Path to a directory containing HeSuVi .wav files. Omit to use the
+        /// default import path (~/.local/share/pipewire/hrir_hesuvi/import).
+        dir: Option<String>,
+    },
+    /// Placeholder: automatic HeSuVi download (not yet available).
+    Fetch,
 }
 
 #[derive(Subcommand, Debug)]
@@ -855,6 +863,8 @@ fn dispatch_surround(action: SurroundAction) -> ExitCode {
         } => daemon::Request::SurroundSetHrir { name },
         SurroundAction::Channels { channels } => daemon::Request::SurroundSetChannels { channels },
         SurroundAction::HwSink { device } => daemon::Request::SurroundSetHwSink { hw_sink: device },
+        SurroundAction::Import { dir } => daemon::Request::SurroundImportHrirs { dir },
+        SurroundAction::Fetch => daemon::Request::SurroundFetchHrirs,
     };
 
     match daemon::send_request(&req) {

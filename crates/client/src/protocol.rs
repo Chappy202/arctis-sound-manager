@@ -218,6 +218,11 @@ pub enum Request {
     ChatmixValidate,
     /// Apply a named mic DSP preset (sets all mic DSP parameters in one shot).
     ApplyMicPreset { name: String },
+    /// Import HeSuVi 14-channel WAVs from `dir` into the HRIR profiles directory.
+    /// `dir: None` falls back to the well-known default import paths under $HOME.
+    SurroundImportHrirs { dir: Option<String> },
+    /// Placeholder: automatic HeSuVi download (not yet implemented).
+    SurroundFetchHrirs,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

@@ -2535,6 +2535,67 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Import HeSuVi 14-channel WAVs from `dir` into the HRIR profiles directory.
+    ///
+    /// If `dir` is `None`, tries a priority-ordered list of well-known paths under `$HOME`:
+    /// 1. `~/.local/share/pipewire/hrir_hesuvi/import`
+    /// 2. `~/Dev/Personal/sound-manager/Arctis-Sound-Manager/hrir/HRIR_wav_files`
+    /// 3. `~/src/Arctis-Sound-Manager/hrir/HRIR_wav_files`
+    ///
+    /// Returns an `ImportReport` describing which files were imported / skipped.
+    pub fn surround_import_hrirs(
+        &mut self,
+        dir: Option<String>,
+    ) -> Result<crate::hrir_import::ImportReport, crate::error::EngineError> {
+        let src = match dir {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let home = std::env::var("HOME").map(std::path::PathBuf::from).map_err(|_| {
+                    crate::error::EngineError::BadRequest(
+                        "no HRIR import directory found; pass an explicit path or create \
+                         ~/.local/share/pipewire/hrir_hesuvi/import"
+                            .into(),
+                    )
+                })?;
+                let candidates = [
+                    home.join(".local/share/pipewire/hrir_hesuvi/import"),
+                    home.join("Dev/Personal/sound-manager/Arctis-Sound-Manager/hrir/HRIR_wav_files"),
+                    home.join("src/Arctis-Sound-Manager/hrir/HRIR_wav_files"),
+                ];
+                candidates
+                    .into_iter()
+                    .find(|p| p.is_dir())
+                    .ok_or_else(|| {
+                        crate::error::EngineError::BadRequest(
+                            "no HRIR import directory found; pass an explicit path or create \
+                             ~/.local/share/pipewire/hrir_hesuvi/import"
+                                .into(),
+                        )
+                    })?
+            }
+        };
+        let base = crate::convert::hrir_base_dir()?;
+        let report = crate::hrir_import::import_dir(&mut self.runner, &src, &base)?;
+        eprintln!(
+            "surround_import_hrirs: imported {}, skipped {}",
+            report.imported.len(),
+            report.skipped.len()
+        );
+        Ok(report)
+    }
+
+    /// Placeholder: automatic HeSuVi download is not yet implemented.
+    ///
+    /// This method is wired through the full stack so the surface exists. The actual
+    /// download + import logic will be added in a future task.
+    pub fn surround_fetch_hrirs(&mut self) -> Result<(), crate::error::EngineError> {
+        Err(crate::error::EngineError::BadRequest(
+            "automatic HeSuVi download is not yet available — use Import to add your local \
+             HeSuVi collection"
+                .into(),
+        ))
+    }
+
     /// Set (or clear) the hardware sink for the surround output tail. Recreates if enabled.
     pub fn surround_set_hw_sink(
         &mut self,
