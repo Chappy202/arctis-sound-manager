@@ -159,6 +159,17 @@
     });
   }
 
+  /**
+   * Whether a stage's enable toggle should be disabled. The toggle stays LIVE
+   * unless the master is off, or the stage is unavailable AND currently off —
+   * i.e. you can't enable a missing plugin, but an enabled stage can always be
+   * turned back off, so a stage is never trapped on/off.
+   */
+  function stageToggleDisabled(stage: MicStageSnapshot | undefined): boolean {
+    if (!masterEnabled || !stage) return true;
+    return isStageDisabled(stage) && !stage.enabled;
+  }
+
   // ---------------------------------------------------------------------------
   // Slider param drafts — local mirror so each slider thumb + readout track
   // during a drag (engine values only update after a successful commit). The
@@ -481,7 +492,7 @@
               <Switch
                 size="sm"
                 checked={gainStage.enabled}
-                disabled={isStageDisabled(gainStage) || !masterEnabled}
+                disabled={stageToggleDisabled(gainStage)}
                 onCheckedChange={(on) => onStageToggle("gain", on)}
                 ariaLabel="Enable gain stage"
               />
@@ -527,7 +538,7 @@
               <Switch
                 size="sm"
                 checked={highpassStage.enabled}
-                disabled={isStageDisabled(highpassStage) || !masterEnabled}
+                disabled={stageToggleDisabled(highpassStage)}
                 onCheckedChange={(on) => onStageToggle("highpass", on)}
                 ariaLabel="Enable high-pass filter"
               />
@@ -573,7 +584,7 @@
               <Switch
                 size="sm"
                 checked={suppressionStage.enabled}
-                disabled={isStageDisabled(suppressionStage) || !masterEnabled}
+                disabled={stageToggleDisabled(suppressionStage)}
                 onCheckedChange={(on) => onStageToggle("suppression", on)}
                 ariaLabel="Enable noise suppression"
               />
@@ -707,7 +718,7 @@
               <Switch
                 size="sm"
                 checked={compStage.enabled}
-                disabled={isStageDisabled(compStage) || !masterEnabled}
+                disabled={stageToggleDisabled(compStage)}
                 onCheckedChange={(on) => onStageToggle("compressor", on)}
                 ariaLabel="Enable compressor"
               />
@@ -789,7 +800,7 @@
               <Switch
                 size="sm"
                 checked={gateStage.enabled}
-                disabled={isStageDisabled(gateStage) || !masterEnabled}
+                disabled={stageToggleDisabled(gateStage)}
                 onCheckedChange={(on) => onStageToggle("gate", on)}
                 ariaLabel="Enable noise gate"
               />
@@ -839,7 +850,7 @@
             <Switch
               size="sm"
               checked={micEqStage.enabled}
-              disabled={isStageDisabled(micEqStage) || !masterEnabled}
+              disabled={stageToggleDisabled(micEqStage)}
               onCheckedChange={(on) => onStageToggle("mic_eq", on)}
               ariaLabel="Enable mic EQ"
             />
@@ -1028,8 +1039,10 @@
   .device-card--disabled {
     background: var(--ss-bg-base);
     opacity: 0.6;
-    pointer-events: none;
     color: var(--ss-text-disabled);
+    /* No `pointer-events: none` here: it trapped the enable toggle when a stage
+       was unavailable. The header toggle is gated by stageToggleDisabled() and the
+       body controls by their own `disabled` props, so the card stays escapable. */
   }
 
   .card-header {

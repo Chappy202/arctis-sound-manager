@@ -420,10 +420,15 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
                 {
+                    // Default to AVAILABLE when there's no reconcile entry. A disabled
+                    // stage isn't probed during the chain build, so it has no entry —
+                    // defaulting to false made a just-disabled stage look "unavailable",
+                    // which greyed its card and locked the enable toggle (trapping it off).
+                    // A genuinely missing plugin is still recorded as false while enabled.
                     let avail = avail_map
                         .get(&StageName::Suppression)
                         .copied()
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     let mut params = std::collections::BTreeMap::new();
                     if mc.suppression.enabled {
                         // Include all params — harmless to include both backends' params
@@ -446,10 +451,11 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
                 {
+                    // See Suppression above: default to available when not probed.
                     let avail = avail_map
                         .get(&StageName::Compressor)
                         .copied()
-                        .unwrap_or(false);
+                        .unwrap_or(true);
                     let mut params = std::collections::BTreeMap::new();
                     if mc.compressor.enabled {
                         params.insert("threshold_db".to_string(), mc.compressor.threshold_db);
@@ -464,7 +470,8 @@ impl<R: CommandRunner> Engine<R> {
                     }
                 },
                 {
-                    let avail = avail_map.get(&StageName::Gate).copied().unwrap_or(false);
+                    // See Suppression above: default to available when not probed.
+                    let avail = avail_map.get(&StageName::Gate).copied().unwrap_or(true);
                     let mut params = std::collections::BTreeMap::new();
                     if mc.gate.enabled {
                         params.insert("threshold".to_string(), mc.gate.threshold);
@@ -5282,6 +5289,37 @@ mod tests {
             !suppression.available,
             "suppression must be unavailable (probe returns false)"
         );
+    }
+
+    /// Regression: disabling a mic stage must NOT report it unavailable. A disabled
+    /// stage has no reconcile availability entry (the chain build skips probing it),
+    /// so `state()` must default it to available — otherwise the UI greyed the card
+    /// and locked the enable toggle, trapping the stage OFF with no way to re-enable
+    /// it (the reported gate / suppression / compressor bug).
+    #[test]
+    fn disabled_mic_stages_default_available_so_toggle_stays_live() {
+        // mic_enabled_passthrough() = chain on, every stage off.
+        let cfg = make_config_mic_enabled();
+        // No reconcile → mic_availability is empty → each stage hits its unwrap_or default.
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let state = engine.state();
+        for kind in [
+            crate::state::StageName::Gate,
+            crate::state::StageName::Compressor,
+            crate::state::StageName::Suppression,
+        ] {
+            let s = state
+                .mic
+                .stages
+                .iter()
+                .find(|s| s.kind == kind)
+                .unwrap_or_else(|| panic!("{kind:?} stage must be present"));
+            assert!(!s.enabled, "{kind:?} is disabled in this config");
+            assert!(
+                s.available,
+                "disabled {kind:?} must default to available so its enable toggle stays live"
+            );
+        }
     }
 
     // ─────────────────────────────────────────────
