@@ -48,6 +48,39 @@ pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
     )))
 }
 
+// ─── Bundled HRIR install ─────────────────────────────────────────────────────
+
+const BUNDLED_HRIR: &[(&str, &[u8])] = &[(
+    "07-oal+++-openal-max",
+    include_bytes!("../../../assets/hrir/07-oal+++-openal-max.wav"),
+)];
+
+/// On first daemon boot, write each bundled HRIR into `<base_dir>/profiles/<stem>.wav`
+/// if it is not already present.  Returns the stems newly installed (so
+/// `["07-oal+++-openal-max"]` on the first run, `[]` on every subsequent run).
+///
+/// Callers should treat errors as non-fatal: surround simply reports "no HRIR"
+/// when no profiles are present.
+pub fn ensure_bundled(base_dir: &Path) -> Result<Vec<String>, EngineError> {
+    let profiles = base_dir.join("profiles");
+    std::fs::create_dir_all(&profiles).map_err(|e| {
+        EngineError::BadRequest(format!("cannot create profiles dir: {e}"))
+    })?;
+    let mut installed = Vec::new();
+    for (stem, data) in BUNDLED_HRIR {
+        let dst = profiles.join(format!("{stem}.wav"));
+        if !dst.exists() {
+            std::fs::write(&dst, data).map_err(|e| {
+                EngineError::BadRequest(format!("write bundled HRIR {stem}: {e}"))
+            })?;
+            installed.push((*stem).to_string());
+        }
+    }
+    Ok(installed)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Summary of a `import_dir` run: which files were imported and which were skipped (with reasons).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImportReport {
@@ -233,6 +266,26 @@ pub(crate) mod tests {
         assert!(report.imported.contains(&"04-gsx".to_string()));
         assert!(base.join("profiles/04-gsx.wav").exists());
         assert!(report.skipped.iter().any(|(s, _)| s == "none"));
+    }
+
+    #[test]
+    fn ensure_bundled_installs_when_absent_and_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        let installed = ensure_bundled(d.path()).unwrap();
+        assert!(
+            installed.contains(&"07-oal+++-openal-max".to_string()),
+            "first run must install 07-oal+++-openal-max; got: {installed:?}"
+        );
+        assert!(
+            d.path().join("profiles/07-oal+++-openal-max.wav").exists(),
+            "profiles/07-oal+++-openal-max.wav must exist after install"
+        );
+        // Second run: idempotent — nothing newly installed.
+        let again = ensure_bundled(d.path()).unwrap();
+        assert!(
+            again.is_empty(),
+            "second run must return empty (idempotent); got: {again:?}"
+        );
     }
 
     #[test]

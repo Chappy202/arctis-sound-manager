@@ -657,6 +657,19 @@ pub fn run_daemon() -> Result<(), EngineError> {
         eprintln!("warning: reconcile on start failed: {e}");
     }
 
+    // ── First-run: install bundled HRIR profiles ────────────────────────────
+    // Best-effort: surround simply reports "no HRIR" when no profiles are found.
+    match arctis_engine::convert::hrir_base_dir() {
+        Ok(base) => match arctis_engine::hrir_import::ensure_bundled(&base) {
+            Ok(stems) if !stems.is_empty() => {
+                eprintln!("daemon: installed bundled HRIR profiles: {}", stems.join(", "));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("daemon: bundled HRIR install skipped: {e}"),
+        },
+        Err(e) => eprintln!("daemon: bundled HRIR install skipped (no HOME): {e}"),
+    }
+
     // ── Self-pipe for SIGTERM/SIGINT ────────────────────────────────────────
     // Create an OS pipe. Signal handler writes to the write-end; a watcher
     // thread reads from the read-end and sends a Shutdown request to our own
