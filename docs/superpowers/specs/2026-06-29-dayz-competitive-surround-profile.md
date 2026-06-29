@@ -34,9 +34,15 @@ post-convolution correction stage, and generalize the factory-profile mechanism.
   `mode: SurroundMode`, `crossfeed: u8`. `SurroundMode` (~lines 313-326): `Auto | Hrir71 | Hrir51 | StereoBypass`.
   `resolve_effective_mode()` (`engine.rs` ~120-135) maps `Auto` → `Hrir71` at 8ch.
 - **Renderer** — `crates/audio/src/surround.rs`: `render_surround_conf_ex(&SurroundRender) -> Result<String, AudioError>`
-  (~line 82). `SurroundRender` already carries `output_eq: Option<&EqModel>` (post-convolution
-  EQ on the binaural output) — **currently never set by any profile**. Convolver `blocksize` is
-  **not** parameterized (PipeWire default). `hw_sink` pins the playback target (~104-106).
+  (~line 82). `SurroundRender` already carries `output_eq: Option<&EqModel>` — a **post-convolution**
+  per-ear EQ on the binaural output. Convolver `blocksize` is **not** parameterized (PipeWire
+  default). `hw_sink` pins the playback target (~104-106). `SurroundBackend::recreate_ex(hrir_path,
+  channels, output_eq)` (~line 718) tears down and respawns the sink.
+- **EQ is already applied post-convolution.** `apply_surround` (`engine.rs` ~2404-2428, 2544-2545)
+  already **relocates** the primary (game) channel's non-empty EQ onto the binaural output tail
+  (`output_eq`) and flattens the channel sink, so spatialisation and EQ don't double-apply. So
+  the existing DayZ footstep EQ already lands post-convolution — there is no pre-convolution
+  channel-EQ stage for a surround-routed channel today.
 - **HRIR catalog** — `crates/engine/src/hrir_catalog.rs` (`const CATALOG`, ~35-108), entries carry
   `stem, display, group, tonality: Tonality::{Dry,Neutral,Roomy}, license, origin`. Includes
   `04-gsx-sennheiser-gsx` (Dry, Proprietary, Import) and bundled `07-oal+++-openal-max` (Dry,
@@ -54,7 +60,7 @@ post-convolution correction stage, and generalize the factory-profile mechanism.
 
 | Decision | Choice |
 |---|---|
-| Footstep EQ placement | **Split**: footstep boost stays pre-convolution on the game channel; a gentle Arctis-correction EQ is added **post-convolution** on the binaural output. |
+| EQ structure | **Single combined post-convolution EQ**: one curve (competitive footsteps + gentle Arctis bass-tighten/air correction) carried explicitly in `SurroundConfig.output_eq` on the binaural tail. The footstep EQ already lands post today via channel-EQ→tail relocation; the new field makes the post EQ explicit and per-profile. No pre/post split, no 8-channel pre-EQ stage. |
 | DayZ default HRIR | **Pin GSX** (`04-gsx-sennheiser-gsx`); if not installed, **fall back to a safe dry HRIR and raise an import prompt** (no silent permanent substitution). |
 | Convolver latency | **Pin blocksize 128** (~2.7 ms @ 48 kHz; full reverb tail preserved). |
 | Scaffolding scope | **Full**: build the data-driven factory-profile catalog, generic apply, Tauri/UI listing, and the two new `SurroundConfig` fields; DayZ is the first catalog entry. |
@@ -84,8 +90,8 @@ pub struct FactoryProfileSpec {
     pub blocksize: Option<u32>,                      // Some(128)
     pub surround_channels: &'static [&'static str],  // ["game"]
     pub default_sink_channel: Option<&'static str>,  // Some("game")
-    pub content_eq: Option<ChannelEqSeed>,           // pre-spatial, per channel
-    pub correction_eq_preset: Option<&'static str>,  // post-spatial → SurroundConfig.output_eq
+    pub content_eq: Option<ChannelEqSeed>,           // pre-spatial channel EQ (None for DayZ)
+    pub output_eq_preset: Option<&'static str>,      // post-spatial → SurroundConfig.output_eq
 }
 
 /// The catalog. DayZ is the first (today: only) entry.
@@ -106,15 +112,21 @@ pub fn apply_factory_spec(active: &Profile, spec: &FactoryProfileSpec)
 `find_factory_profile(template).ok_or(BadRequest)?` → `apply_factory_spec`. **Adding a future
 game = one `FactoryProfileSpec` struct literal**, no new code paths.
 
-### A2. General two-stage spatial EQ
+### A2. Explicit post-convolution surround EQ
 
-A documented, reusable pattern any profile inherits:
+Today the post-convolution (binaural-tail) EQ is *implicitly* derived: `apply_surround`
+relocates a surround-routed primary channel's EQ to the tail. This spec adds an **explicit**
+`SurroundConfig.output_eq` field that is the post EQ when set, with the existing relocation
+kept as back-compat fallback when it is empty:
 
-- **Channel EQ** (`ChannelConfig.eq`, existing) = *pre-spatial content shaping*, per source/game.
-- **Surround output EQ** (`SurroundConfig.output_eq`, new) = *post-spatial headphone/room correction*, per headphone.
+- **`SurroundConfig.output_eq` (new, explicit)** — the post-convolution per-ear EQ on the
+  binaural output. When non-empty it is used directly; the primary channel sink is flattened
+  (same as today's relocation), so EQ is never double-applied.
+- **Channel-EQ → tail relocation (existing)** — unchanged fallback used only when
+  `output_eq` is empty, preserving current behavior for every existing profile.
 
-Both are plain `EqModel`s reusing the existing `EqEditor`, `band_kind_*`, the EQ-preset
-catalog, and the low/high-shelf default work already shipped. No EQ machinery is duplicated.
+Both reuse the existing `EqModel`, `EqEditor`, `band_kind_*`, the EQ-preset catalog, and the
+shelf-default work already shipped. No EQ machinery is duplicated.
 
 ### A3. General `SurroundConfig` knobs (additive, back-compat)
 
@@ -162,36 +174,38 @@ const DAYZ: FactoryProfileSpec = FactoryProfileSpec {
     blocksize: Some(128),
     surround_channels: &["game"],
     default_sink_channel: Some("game"),
-    content_eq: Some(ChannelEqSeed {
-        channel_id: "game",
-        preset_name: "FPS / Footsteps (Competitive)",  // existing preset, PRE
-    }),
-    correction_eq_preset: Some("Arctis Spatial Correction"),  // new preset, POST
+    content_eq: None,                            // no pre-convolution channel EQ for DayZ
+    output_eq_preset: Some("DayZ Spatial"),      // new combined post-convolution preset
 };
 ```
 
-### 5.1 New EQ preset: "Arctis Spatial Correction" (post-convolution)
+`ChannelEqSeed` / `content_eq` stay in the struct for generality (a future profile could seed
+a channel EQ on a non-surround channel) but are `None` for DayZ.
 
-Added to `factory_eq_presets()` in `crates/engine/src/presets.rs`. Gentle (≤ ±2 dB),
-purpose = neutralize the Arctis bass shelf + HRIR coloration so HRTF cues land cleanly,
-**without** re-boosting the presence band the footstep EQ already handles. 10 bands at the
+### 5.1 New EQ preset: "DayZ Spatial" (single combined post-convolution curve)
+
+Added to `factory_eq_presets()` in `crates/engine/src/presets.rs`. Combines the competitive
+footstep shaping with a gentle Arctis bass-tighten + air correction in one curve applied
+post-convolution on the binaural tail. Gentle (no boost beyond +3 dB). 10 bands at the
 canonical centers; shelves at the extremes (consistent with the default EQ):
 
 | Band | Center | Kind | Gain (dB) | Q | Rationale |
 |---|---|---|---|---|---|
-| 0 | 31 Hz | lowshelf | −2.0 | 0.7 | tighten Arctis bass shelf; reduce footstep masking |
-| 1 | 62 Hz | peaking | 0.0 | 1.0 | — |
-| 2 | 125 Hz | peaking | −1.5 | 1.0 | reduce low-mid bloom |
-| 3 | 250 Hz | peaking | 0.0 | 1.0 | — (weight handled pre by footstep EQ) |
+| 0 | 31 Hz | lowshelf | −1.0 | 0.7 | gently tighten the Arctis bass shelf |
+| 1 | 62 Hz | peaking | −3.0 | 1.0 | cut rumble/explosions that mask footsteps |
+| 2 | 125 Hz | peaking | −2.0 | 1.41 | reduce low-mid bloom |
+| 3 | 250 Hz | peaking | +3.0 | 1.0 | footstep weight/body |
 | 4 | 500 Hz | peaking | 0.0 | 1.0 | — |
 | 5 | 1000 Hz | peaking | 0.0 | 1.0 | — |
-| 6 | 2000 Hz | peaking | 0.0 | 1.0 | — (presence handled pre) |
-| 7 | 4000 Hz | peaking | 0.0 | 1.0 | — (presence handled pre) |
+| 6 | 2000 Hz | peaking | +3.0 | 1.0 | footstep surface/click |
+| 7 | 4000 Hz | peaking | +2.0 | 1.0 | footstep presence/clarity |
 | 8 | 8000 Hz | peaking | +1.5 | 1.0 | gentle localization clarity (kept modest — 6–10 kHz fatigue risk) |
 | 9 | 16000 Hz | highshelf | +1.5 | 0.7 | slight "air" for distance/elevation cues |
 
-All gains within the engine's existing ±12 dB bounds. The preset is visible and editable
-like any other.
+Built with the existing `presets.rs` band helpers: `ls(-1.0)`, `pk(62.0,-3.0)`,
+`pkq(125.0,1.41,-2.0)`, `pk(250.0,3.0)`, `pk(500.0,0.0)`, `pk(1000.0,0.0)`, `pk(2000.0,3.0)`,
+`pk(4000.0,2.0)`, `pk(8000.0,1.5)`, `hs(1.5)`. All gains within the engine's ±12 dB bounds;
+visible and editable like any other preset.
 
 ## 6. Mechanical layers
 
@@ -205,8 +219,12 @@ like any other.
 
 ### 6.2 Engine apply path (`crates/engine/src/engine.rs`)
 
-- Thread `surround.output_eq` (→ `EqModel` via `convert`) and `surround.blocksize` into the
-  `recreate_ex(hrir_path, channels, output_eq, blocksize)` call (extend its signature).
+- In `apply_surround`, source the binaural `output_eq` from `sc.output_eq` when non-empty
+  (via a new `convert::eq_model_from_bands(&[EqBandConfig]) -> Result<EqModel, EngineError>`),
+  falling back to the existing primary-channel-EQ relocation only when `sc.output_eq` is empty.
+  The "flatten the primary channel sink when output_eq is set" logic is unchanged.
+- Thread `surround.blocksize` into `recreate_ex(hrir_path, channels, output_eq, blocksize)`
+  (extend its signature and `SurroundRender`).
 - Compute the missing-HRIR fallback + state flag where `resolve_hrir_path` runs.
 - `create_factory_profile` becomes catalog-driven (A1).
 
@@ -233,11 +251,11 @@ re-creating the DayZ factory profile applies the new template. No destructive mi
 - **Catalog (`factory_profiles.rs`):** `find_factory_profile` is case-insensitive; `apply_factory_spec`
   for DAYZ yields `name="DayZ"`, `hrir=Some("04-gsx-sennheiser-gsx")`, `mode=Hrir71`,
   `blocksize=Some(128)`, `surround.channels=["game"]`, `default_sink_channel="game"`,
-  game channel EQ = footstep preset (non-empty, 10 bands), `surround.output_eq` non-empty;
+  `surround.output_eq` non-empty (10 bands), game channel EQ left empty (no `content_eq`);
   node names / hw_sink / mic preserved from active. Unknown preset name → `EngineError`.
   Existing DayZ tests are updated to the catalog path.
-- **EQ preset:** `"Arctis Spatial Correction"` present, all |gain| ≤ 2 dB, shelves at the extremes,
-  10 bands, validates within ±12 dB bounds.
+- **EQ preset:** `"DayZ Spatial"` present, no gain beyond +3 dB, shelves at the extremes,
+  10 bands at canonical centers, validates within ±12 dB bounds.
 - **Schema:** `SurroundConfig` round-trips with and without `output_eq`/`blocksize`; an old TOML
   (missing both) loads with `[]`/`None`.
 - **Renderer:** snapshot for `blocksize=Some(128)` (emits `blocksize = 128` per convolver);
