@@ -200,6 +200,9 @@ pub struct Engine<R: CommandRunner> {
     /// of the stale live value — prevents a post-commit thumb snap-back without re-spawning
     /// pw-dump on every throttled drag commit (preserves A4 no-subprocess-per-drag property).
     last_volume_write: Option<std::time::Instant>,
+    /// Set by `apply_surround` when a pinned HRIR stem was missing and a fallback was
+    /// substituted; surfaced in `state().surround.hrir_missing` so the UI can prompt to import.
+    surround_hrir_missing: Option<String>,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -221,6 +224,7 @@ impl<R: CommandRunner> Engine<R> {
             surround_routed: std::collections::HashSet::new(),
             volume_dump_cache: None,
             last_volume_write: None,
+            surround_hrir_missing: None,
         }
     }
 
@@ -244,6 +248,7 @@ impl<R: CommandRunner> Engine<R> {
             surround_routed: std::collections::HashSet::new(),
             volume_dump_cache: None,
             last_volume_write: None,
+            surround_hrir_missing: None,
         }
     }
 
@@ -595,6 +600,7 @@ impl<R: CommandRunner> Engine<R> {
             MicSnapshot::default()
         };
 
+        let surround_hrir_missing = self.surround_hrir_missing.clone();
         let surround = if let Ok(p) = self.config.active() {
             let sc = &p.surround;
             let (available_hrirs, available_hrir_entries) = convert::hrir_base_dir()
@@ -614,6 +620,18 @@ impl<R: CommandRunner> Engine<R> {
                 mode: surround_mode_str(sc.mode).to_string(),
                 effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
                 negotiated_channels: None,
+                hrir_missing: surround_hrir_missing,
+                output_eq: sc
+                    .output_eq
+                    .iter()
+                    .map(|b| crate::state::EqBandSnapshot {
+                        kind: b.kind.clone(),
+                        freq_hz: b.freq_hz,
+                        q: b.q,
+                        gain_db: b.gain_db,
+                    })
+                    .collect(),
+                blocksize: sc.blocksize,
             }
         } else {
             crate::state::SurroundSnapshot::default()
@@ -2459,7 +2477,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref())
+                    surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref(), None)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2469,7 +2487,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref())
+                    surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref(), None)
                 }
                 SurroundMode::StereoBypass => {
                     surround_be.recreate_stereo_bypass(sc.crossfeed, output_eq.as_ref())
