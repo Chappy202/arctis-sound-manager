@@ -2698,6 +2698,50 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Set the explicit post-convolution surround EQ. Persists; re-applies when enabled.
+    pub fn surround_set_output_eq(
+        &mut self,
+        bands: Vec<arctis_config::EqBandConfig>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.output_eq = bands;
+        }
+        self.save_config()?;
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        Ok(())
+    }
+
+    /// Pin (or clear) the convolver blocksize. Persists; re-applies when enabled.
+    pub fn surround_set_blocksize(
+        &mut self,
+        blocksize: Option<u32>,
+    ) -> Result<(), crate::error::EngineError> {
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            profile.surround.blocksize = blocksize;
+        }
+        self.save_config()?;
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        Ok(())
+    }
+
     /// Import HeSuVi 14-channel WAVs from `dir` into the HRIR profiles directory.
     ///
     /// If `dir` is `None`, tries a priority-ordered list of well-known paths under `$HOME`:
@@ -6579,6 +6623,46 @@ mod tests {
                 channels: vec!["game".into(), "chat".into(), "media".into()]
             }
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_output_eq_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_oeq");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        let bands = vec![arctis_config::EqBandConfig {
+            kind: "peaking".into(),
+            freq_hz: 250.0,
+            q: 1.0,
+            gain_db: 3.0,
+        }];
+        engine.surround_set_output_eq(bands.clone()).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.output_eq, bands);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_blocksize_persists() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_bs");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        engine.surround_set_blocksize(Some(128)).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.blocksize, Some(128));
+        engine.surround_set_blocksize(None).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.blocksize, None);
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
