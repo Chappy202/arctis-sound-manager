@@ -134,6 +134,17 @@ pub fn resolve_effective_mode(cfg_mode: SurroundMode, negotiated: Option<u8>) ->
     }
 }
 
+/// Convert a `SurroundMode` to its canonical snake_case wire-format string.
+fn surround_mode_str(m: SurroundMode) -> &'static str {
+    use SurroundMode::*;
+    match m {
+        Auto => "auto",
+        Hrir71 => "hrir71",
+        Hrir51 => "hrir51",
+        StereoBypass => "stereo_bypass",
+    }
+}
+
 /// Build `Vec<HrirEntrySnapshot>` from the HRIR profiles directory under `base_dir`.
 ///
 /// For each `.wav` stem found by `convert::available_hrirs`, looks up the catalog entry
@@ -600,12 +611,8 @@ impl<R: CommandRunner> Engine<R> {
                 available_hrir_entries,
                 channels: sc.channels.clone(),
                 hw_sink: sc.hw_sink.clone(),
-                mode: format!("{:?}", sc.mode).to_lowercase(),
-                effective_mode: format!(
-                    "{:?}",
-                    resolve_effective_mode(sc.mode, None)
-                )
-                .to_lowercase(),
+                mode: surround_mode_str(sc.mode).to_string(),
+                effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
                 negotiated_channels: None,
             }
         } else {
@@ -2445,11 +2452,23 @@ impl<R: CommandRunner> Engine<R> {
                 SurroundMode::Hrir71 | SurroundMode::Auto => {
                     // Auto is resolved above; this arm is unreachable in practice but
                     // kept for exhaustiveness.
-                    let hrir_path = hrir_path_opt.as_deref().expect("HRIR path resolved above");
+                    let hrir_path = match hrir_path_opt.as_deref() {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("warning: apply_surround internal: HRIR path unexpectedly None (skipping)");
+                            return Ok(());
+                        }
+                    };
                     surround_be.recreate_ex(hrir_path, 8, output_eq.as_ref())
                 }
                 SurroundMode::Hrir51 => {
-                    let hrir_path = hrir_path_opt.as_deref().expect("HRIR path resolved above");
+                    let hrir_path = match hrir_path_opt.as_deref() {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("warning: apply_surround internal: HRIR path unexpectedly None (skipping)");
+                            return Ok(());
+                        }
+                    };
                     surround_be.recreate_ex(hrir_path, 6, output_eq.as_ref())
                 }
                 SurroundMode::StereoBypass => {
@@ -7860,6 +7879,36 @@ mod tests {
         assert_eq!(
             st.surround.negotiated_channels, None,
             "negotiated_channels must be None before any pw-dump probe"
+        );
+    }
+
+    #[test]
+    fn surround_snapshot_stereo_bypass_mode_string() {
+        // Set mode explicitly to StereoBypass and verify the snapshot produces "stereo_bypass".
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround = arctis_config::SurroundConfig {
+            enabled: true,
+            mode: arctis_config::SurroundMode::StereoBypass,
+            hrir: None,
+            channels: vec!["game".into()],
+            hw_sink: None,
+            ..Default::default()
+        };
+
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        let st = engine.state();
+
+        // mode must reflect StereoBypass as "stereo_bypass" (snake_case, not "stereobypass").
+        assert_eq!(
+            st.surround.mode, "stereo_bypass",
+            "mode must be 'stereo_bypass' for SurroundMode::StereoBypass, got: {:?}",
+            st.surround.mode
+        );
+        // effective_mode for explicit StereoBypass → "stereo_bypass".
+        assert_eq!(
+            st.surround.effective_mode, "stereo_bypass",
+            "effective_mode must be 'stereo_bypass' when mode=StereoBypass, got: {:?}",
+            st.surround.effective_mode
         );
     }
 }
