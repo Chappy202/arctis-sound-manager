@@ -83,14 +83,28 @@ pub struct EqModel {
 }
 
 impl EqModel {
-    /// 10 flat peaking bands at standard ISO-ish centers; gain 0 dB, Q 1.0.
+    /// 10 flat bands at standard ISO-ish centers; gain 0 dB, Q 1.0.
+    ///
+    /// The lowest band is a **low-shelf** and the highest a **high-shelf** so
+    /// bass/treble adjustments move real energy at the frequency extremes — a
+    /// peaking filter at 31 Hz / 16 kHz has half its skirt off the edge of
+    /// hearing and barely shifts level. The eight middle bands stay peaking.
     pub fn default_10band() -> Self {
         const CENTERS: [f32; MAX_BANDS] = [
             31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
         ];
+        let last = MAX_BANDS - 1;
         let bands = CENTERS
             .iter()
-            .map(|&f| EqBand::new(BandKind::Peaking, f, 1.0, 0.0))
+            .enumerate()
+            .map(|(i, &f)| {
+                let kind = match i {
+                    0 => BandKind::LowShelf,
+                    i if i == last => BandKind::HighShelf,
+                    _ => BandKind::Peaking,
+                };
+                EqBand::new(kind, f, 1.0, 0.0)
+            })
             .collect();
         Self { bands }
     }
@@ -131,6 +145,17 @@ mod tests {
         assert_eq!(m.bands.len(), 10);
         assert!(m.bands.iter().all(|b| b.gain_db == 0.0 && b.q == 1.0));
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn default_uses_shelves_at_the_extremes() {
+        let m = EqModel::default_10band();
+        assert_eq!(m.bands[0].kind, BandKind::LowShelf, "lowest band is a low-shelf");
+        assert_eq!(m.bands[9].kind, BandKind::HighShelf, "highest band is a high-shelf");
+        assert!(
+            m.bands[1..9].iter().all(|b| b.kind == BandKind::Peaking),
+            "the eight middle bands stay peaking"
+        );
     }
 
     #[test]

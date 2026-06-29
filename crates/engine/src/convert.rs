@@ -20,6 +20,15 @@ pub fn band_kind_from_str(s: &str) -> Result<BandKind, EngineError> {
     }
 }
 
+/// Inverse of `band_kind_from_str`: an audio-layer `BandKind` → config kind string.
+pub fn band_kind_to_str(kind: BandKind) -> &'static str {
+    match kind {
+        BandKind::Peaking => "peaking",
+        BandKind::LowShelf => "lowshelf",
+        BandKind::HighShelf => "highshelf",
+    }
+}
+
 /// Map a single `EqBandConfig` (from the config layer) to an `EqBand` (audio layer).
 pub fn eq_band_from_cfg(c: &EqBandConfig) -> Result<EqBand, EngineError> {
     let kind = band_kind_from_str(&c.kind)?;
@@ -33,7 +42,7 @@ pub fn default_eq_band_configs() -> Vec<arctis_config::EqBandConfig> {
         .bands
         .iter()
         .map(|b| arctis_config::EqBandConfig {
-            kind: "peaking".to_string(),
+            kind: band_kind_to_str(b.kind).to_string(),
             freq_hz: b.freq_hz,
             q: b.q,
             gain_db: b.gain_db,
@@ -673,7 +682,18 @@ mod tests {
             freqs,
             vec![31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
         );
-        assert!(v.iter().all(|b| b.kind == "peaking" && b.gain_db == 0.0 && b.q == 1.0));
+        assert!(v.iter().all(|b| b.gain_db == 0.0 && b.q == 1.0));
+        // Kinds derive from the audio default: shelves at the extremes, peaking middle.
+        assert_eq!(v[0].kind, "lowshelf");
+        assert_eq!(v[9].kind, "highshelf");
+        assert!(v[1..9].iter().all(|b| b.kind == "peaking"));
+    }
+
+    #[test]
+    fn band_kind_to_str_round_trips_with_from_str() {
+        for s in ["peaking", "lowshelf", "highshelf"] {
+            assert_eq!(band_kind_to_str(band_kind_from_str(s).unwrap()), s);
+        }
     }
 
     #[test]

@@ -4046,7 +4046,11 @@ mod tests {
         assert_eq!(chat.eq_bands.len(), 10, "flat channel emits 10 dense default bands");
         assert_eq!(chat.eq_bands[0].freq_hz, 31.0);
         assert_eq!(chat.eq_bands[9].freq_hz, 16000.0);
-        assert!(chat.eq_bands.iter().all(|b| b.gain_db == 0.0 && b.kind == "peaking"));
+        assert!(chat.eq_bands.iter().all(|b| b.gain_db == 0.0));
+        // Dense defaults use shelves at the extremes, peaking in the middle.
+        assert_eq!(chat.eq_bands[0].kind, "lowshelf");
+        assert_eq!(chat.eq_bands[9].kind, "highshelf");
+        assert!(chat.eq_bands[1..9].iter().all(|b| b.kind == "peaking"));
     }
 
     #[test]
@@ -7237,7 +7241,11 @@ mod tests {
         assert_eq!(game.eq_bands.len(), 10, "flat channel must report 10 dense bands");
         assert_eq!(game.eq_bands[0].freq_hz, 31.0);
         assert_eq!(game.eq_bands[9].freq_hz, 16000.0);
-        assert!(game.eq_bands.iter().all(|b| b.gain_db == 0.0 && b.kind == "peaking"));
+        assert!(game.eq_bands.iter().all(|b| b.gain_db == 0.0));
+        // Dense defaults: shelves at the extremes, peaking in the middle.
+        assert_eq!(game.eq_bands[0].kind, "lowshelf");
+        assert_eq!(game.eq_bands[9].kind, "highshelf");
+        assert!(game.eq_bands[1..9].iter().all(|b| b.kind == "peaking"));
     }
 
     #[test]
