@@ -62,6 +62,40 @@ pub fn query_status(env: &impl DaemonEnv, socket: &Path, binary: Option<PathBuf>
     }
 }
 
+fn use_systemd(env: &impl DaemonEnv, home: &Path) -> bool {
+    let available = env.run("systemctl", &["--user", "--version"]).map(|o| o.status == 0).unwrap_or(false);
+    available && env.path_exists(&unit_path(home))
+}
+
+fn systemctl(env: &impl DaemonEnv, verb: &str) -> Result<(), String> {
+    match env.run("systemctl", &["--user", verb, UNIT_NAME]) {
+        Ok(o) if o.status == 0 => Ok(()),
+        Ok(o) => Err(format!("systemctl --user {verb} failed (exit {}): {}", o.status, o.stderr.trim())),
+        Err(e) => Err(format!("systemctl not runnable: {e}")),
+    }
+}
+
+pub fn start(env: &impl DaemonEnv, socket: &Path, binary: &Path, home: &Path) -> Result<(), String> {
+    if use_systemd(env, home) { return systemctl(env, "start"); }
+    if env.socket_live(socket) { return Ok(()); }
+    env.spawn_detached(&binary.to_string_lossy(), &["daemon"])
+        .map_err(|e| format!("failed to spawn daemon: {e}"))
+}
+
+pub fn stop(env: &impl DaemonEnv, socket: &Path, home: &Path) -> Result<(), String> {
+    if use_systemd(env, home) { return systemctl(env, "stop"); }
+    if env.socket_live(socket) {
+        return if env.shutdown_ipc(socket) { Ok(()) } else { Err("daemon did not acknowledge shutdown".into()) };
+    }
+    Ok(())
+}
+
+pub fn restart(env: &impl DaemonEnv, socket: &Path, binary: &Path, home: &Path) -> Result<(), String> {
+    if use_systemd(env, home) { return systemctl(env, "restart"); }
+    stop(env, socket, home)?;
+    start(env, socket, binary, home)
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockEnv {
@@ -160,5 +194,41 @@ mod tests {
         let s = query_status(&env, Path::new("/run/x.sock"), None, Path::new("/home/x"));
         assert_eq!(s.managed_by, ManagedBy::Stopped);
         assert!(!s.running);
+    }
+
+    #[test]
+    fn start_spawns_when_no_systemd_and_socket_dead() {
+        let env = MockEnv::default();
+        env.run_results.borrow_mut().insert("systemctl --user --version".into(),
+            CmdOut { status: 127, stdout: String::new(), stderr: "not found".into() });
+        env.socket_live.set(false);
+        start(&env, Path::new("/run/x.sock"), Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
+        let spawns = env.spawns.borrow();
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].0, "/usr/bin/asm-cli");
+        assert_eq!(spawns[0].1, vec!["daemon".to_string()]);
+    }
+
+    #[test]
+    fn stop_sends_shutdown_ipc_when_manual() {
+        let env = MockEnv::default();
+        env.run_results.borrow_mut().insert("systemctl --user --version".into(),
+            CmdOut { status: 127, stdout: String::new(), stderr: String::new() });
+        env.socket_live.set(true);
+        env.shutdown_ok.set(true);
+        stop(&env, Path::new("/run/x.sock"), Path::new("/home/x")).unwrap();
+        // No systemctl stop attempted (no unit); shutdown_ipc was used → success.
+    }
+
+    #[test]
+    fn start_uses_systemctl_when_unit_installed_and_available() {
+        let env = MockEnv::default();
+        env.existing.borrow_mut().insert(unit_path(Path::new("/home/x")));
+        // systemctl --version default status 0 (available)
+        start(&env, Path::new("/run/x.sock"), Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
+        let runs = env.runs.borrow();
+        assert!(runs.iter().any(|(p, a)| p == "systemctl" && a == &vec!["--user","start","arctis-sound-manager.service"]
+            .iter().map(|s| s.to_string()).collect::<Vec<_>>()));
+        assert!(env.spawns.borrow().is_empty());
     }
 }
