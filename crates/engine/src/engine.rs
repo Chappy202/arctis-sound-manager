@@ -1446,18 +1446,35 @@ impl<R: CommandRunner> Engine<R> {
         // Persist
         self.save_config()?;
 
+        // Detect the headset hardware sink BEFORE the immutable borrow of
+        // self.config.active() below so the borrow checker is satisfied.
+        // Mirrors reconcile()'s overlay_default_output pattern: the stored
+        // config keeps output_device=None so future reconcile passes can
+        // re-detect the headset automatically; the overlay is applied only to
+        // the local clone used to build the PipeWire filter-chain conf.
+        let headset = self.detect_headset_sink();
+
         // Bring the new channel sink up (reuse channel-up path)
         {
             let profile = self.config.active()?.clone();
-            let channel = profile
+            let mut channel = profile
                 .channels
                 .iter()
                 .find(|ch| ch.id == id)
                 .ok_or_else(|| {
                     EngineError::BadRequest(format!("channel not found after add: {id}"))
-                })?;
-            let eq_model = convert::eq_model_for(channel)?;
-            let def = convert::channel_def_from_cfg(channel);
+                })?
+                .clone();
+            // Pin to the hardware sink so the new channel's output does not
+            // follow the PipeWire default sink (which can be another virtual
+            // channel, causing chain-through chaining).  output_device stays
+            // None in the stored config so that apply_surround can override
+            // the target when surround-routing is later enabled on this channel.
+            if channel.output_device.is_none() {
+                channel.output_device = headset;
+            }
+            let eq_model = convert::eq_model_for(&channel)?;
+            let def = convert::channel_def_from_cfg(&channel);
             let spec = def.sink_spec();
             let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
             match be.create(&eq_model) {
@@ -8513,5 +8530,68 @@ mod tests {
             "no subprocess call must be made for a bad channel id, calls: {:?}",
             engine.runner.calls
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Bug fix: add_channel must pin new channel output to headset hardware sink
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Regression test: a channel created via `add_channel` must have its
+    /// PipeWire filter-chain conf emitted with `target.object` pointing at the
+    /// detected headset hardware sink, NOT left empty (which caused the new
+    /// channel to follow the PipeWire default sink and chain through whatever
+    /// virtual channel happened to be default at the time).
+    ///
+    /// MockRunner call sequence after the fix:
+    ///   [0] pw-metadata 0  — detect_headset_sink → list_output_devices default
+    ///   [1] pw-dump        — detect_headset_sink → list_output_devices sinks
+    ///   [2] pw-cli ls Node — AudioBackend::create → sink_exists (empty → absent)
+    ///   spawn: pipewire -c — spawn_owned (never queued; always succeeds)
+    #[test]
+    fn add_channel_pins_output_to_headset_sink() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("add_channel_pin");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        // Three queued run() outputs; spawn_owned is not from the queue.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, PW_METADATA_SINK, "") // [0] pw-metadata 0
+            .with_output(0, dump, "")             // [1] pw-dump (SteelSeries present)
+            .with_output(0, "", "");              // [2] pw-cli ls Node (empty → absent → spawn)
+
+        let mut engine = Engine::new(runner, cfg);
+        engine.add_channel("music").expect("add_channel must succeed");
+
+        // The filter-chain conf written to /tmp must pin target.object to the
+        // headset hardware sink node name found in the fixture.
+        let conf_path = std::env::temp_dir().join("arctis_eq.Arctis_Music.conf");
+        let conf = std::fs::read_to_string(&conf_path)
+            .expect("filter-chain conf must be written by add_channel");
+        assert!(
+            conf.contains(
+                "target.object = \"alsa_output.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.analog-stereo\""
+            ),
+            "new channel conf must pin to headset hardware sink, got:\n{conf}"
+        );
+
+        // Stored config must still have output_device=None so future reconcile
+        // passes can re-detect (matching reconcile's overlay_default_output contract).
+        let active = engine.config().active().expect("active profile");
+        let stored_ch = active
+            .channels
+            .iter()
+            .find(|c| c.id == "music")
+            .expect("music channel must be in stored config");
+        assert!(
+            stored_ch.output_device.is_none(),
+            "stored output_device must remain None (overlay is in-memory only), got: {:?}",
+            stored_ch.output_device
+        );
+
+        let _ = std::fs::remove_file(&conf_path);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 }
