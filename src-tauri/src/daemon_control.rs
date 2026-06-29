@@ -39,6 +39,29 @@ pub fn resolve_binary(candidates: &[PathBuf], exists: &dyn Fn(&Path) -> bool) ->
     candidates.iter().find(|p| exists(p)).cloned()
 }
 
+pub fn unit_path(home: &Path) -> PathBuf {
+    home.join(".config/systemd/user").join(UNIT_NAME)
+}
+
+pub fn query_status(env: &impl DaemonEnv, socket: &Path, binary: Option<PathBuf>, home: &Path) -> DaemonStatus {
+    let systemd_available = env.run("systemctl", &["--user", "--version"]).map(|o| o.status == 0).unwrap_or(false);
+    let unit_installed = env.path_exists(&unit_path(home));
+    let is_active = systemd_available
+        && env.run("systemctl", &["--user", "is-active", UNIT_NAME]).map(|o| o.status == 0).unwrap_or(false);
+    let autostart_enabled = systemd_available
+        && env.run("systemctl", &["--user", "is-enabled", UNIT_NAME]).map(|o| o.status == 0).unwrap_or(false);
+    let socket_live = env.socket_live(socket);
+    let running = socket_live || is_active;
+    let managed_by = if is_active { ManagedBy::Systemd }
+        else if socket_live { ManagedBy::Manual }
+        else { ManagedBy::Stopped };
+    DaemonStatus {
+        running, managed_by, autostart_enabled, systemd_available,
+        binary_path: binary.map(|p| p.to_string_lossy().into_owned()),
+        unit_installed,
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MockEnv {
@@ -99,5 +122,43 @@ mod tests {
     fn resolve_binary_none_when_no_candidate_exists() {
         let exists = |_: &Path| false;
         assert_eq!(resolve_binary(&[PathBuf::from("/x/asm-cli")], &exists), None);
+    }
+
+    #[test]
+    fn status_manual_when_socket_live_but_no_systemd_unit() {
+        let env = MockEnv::default();
+        env.socket_live.set(true);
+        // systemctl --version ok (available), but is-active/is-enabled fail (1)
+        env.run_results.borrow_mut().insert("systemctl --user is-active arctis-sound-manager.service".into(),
+            CmdOut { status: 3, stdout: "inactive".into(), stderr: String::new() });
+        env.run_results.borrow_mut().insert("systemctl --user is-enabled arctis-sound-manager.service".into(),
+            CmdOut { status: 1, stdout: "disabled".into(), stderr: String::new() });
+        let s = query_status(&env, Path::new("/run/x.sock"), None, Path::new("/home/x"));
+        assert!(s.running);
+        assert_eq!(s.managed_by, ManagedBy::Manual);
+        assert!(!s.autostart_enabled);
+    }
+
+    #[test]
+    fn status_systemd_when_is_active_zero() {
+        let env = MockEnv::default();
+        env.run_results.borrow_mut().insert("systemctl --user is-active arctis-sound-manager.service".into(),
+            CmdOut { status: 0, stdout: "active".into(), stderr: String::new() });
+        env.run_results.borrow_mut().insert("systemctl --user is-enabled arctis-sound-manager.service".into(),
+            CmdOut { status: 0, stdout: "enabled".into(), stderr: String::new() });
+        env.existing.borrow_mut().insert(unit_path(Path::new("/home/x")));
+        let s = query_status(&env, Path::new("/run/x.sock"), None, Path::new("/home/x"));
+        assert_eq!(s.managed_by, ManagedBy::Systemd);
+        assert!(s.running && s.autostart_enabled && s.unit_installed);
+    }
+
+    #[test]
+    fn status_stopped_when_nothing_live() {
+        let env = MockEnv::default();
+        env.run_results.borrow_mut().insert("systemctl --user is-active arctis-sound-manager.service".into(),
+            CmdOut { status: 3, stdout: String::new(), stderr: String::new() });
+        let s = query_status(&env, Path::new("/run/x.sock"), None, Path::new("/home/x"));
+        assert_eq!(s.managed_by, ManagedBy::Stopped);
+        assert!(!s.running);
     }
 }
