@@ -228,6 +228,7 @@ pub fn run() {
             // runtime) the app still runs as a normal window.
             match tray::build_tray(&app.handle().clone()) {
                 Ok(handles) => {
+                    tray::attach_menu_handlers(&handles.tray);
                     app.manage(handles);
                 }
                 Err(e) => eprintln!("tray: build failed (continuing without tray): {e}"),

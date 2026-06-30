@@ -3,9 +3,12 @@
 // this crate; suppress the lint rather than cluttering each item.
 #![allow(dead_code)]
 
+use crate::state::DaemonState;
+use arctis_client::{send_request_to, Request};
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Handles kept in managed state so the poll task can update the tray live.
 pub struct TrayHandles {
@@ -72,6 +75,65 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<TrayHandles> {
         profile,
         last_profiles: std::sync::Mutex::new(Vec::new()),
     })
+}
+
+/// Attach the menu-click handler. Reuses existing daemon IPC + the daemon-stop
+/// path (same as the `daemon_stop` command) for Quit.
+pub fn attach_menu_handlers(tray: &tauri::tray::TrayIcon) {
+    tray.on_menu_event(|app, event| {
+        let app = app.clone();
+        match parse_menu_id(event.id().as_ref()) {
+            MenuAction::Show => toggle_main_window(&app),
+            MenuAction::Mute => {
+                tauri::async_runtime::spawn(async move {
+                    let socket = {
+                        let st = app.state::<AsyncMutex<DaemonState>>();
+                        let g = st.lock().await;
+                        g.socket.clone()
+                    };
+                    // Read current mute, then send the inverse.
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        if let Ok(resp) = send_request_to(&socket, &Request::GetState) {
+                            if let Some(s) = resp.state {
+                                let _ = send_request_to(
+                                    &socket,
+                                    &Request::SetMasterMute { muted: !s.master_mute },
+                                );
+                            }
+                        }
+                    })
+                    .await;
+                });
+            }
+            MenuAction::SwitchProfile(name) => {
+                tauri::async_runtime::spawn(async move {
+                    let socket = {
+                        let st = app.state::<AsyncMutex<DaemonState>>();
+                        let g = st.lock().await;
+                        g.socket.clone()
+                    };
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        send_request_to(&socket, &Request::SwitchProfile { name })
+                    })
+                    .await;
+                });
+            }
+            MenuAction::Quit => {
+                // Stop the daemon (same path as the daemon_stop command), then exit.
+                tauri::async_runtime::spawn(async move {
+                    let _ = tauri::async_runtime::spawn_blocking(|| {
+                        let env = crate::daemon_control::RealEnv;
+                        let socket = arctis_client::socket_path();
+                        let home = crate::daemon_control::home_dir();
+                        let _ = crate::daemon_control::stop(&env, &socket, &home);
+                    })
+                    .await;
+                    app.exit(0);
+                });
+            }
+            MenuAction::Unknown => {}
+        }
+    });
 }
 
 /// What the tray should currently display, derived from engine state.
