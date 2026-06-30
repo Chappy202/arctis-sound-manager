@@ -201,8 +201,11 @@ mod live {
         // Terminate hook: a message on the channel quits the loop cleanly from
         // the daemon's shutdown path (no leaked thread, no hang).
         let _terminate = {
-            let mainloop = mainloop.clone();
-            receiver.attach(mainloop.loop_(), move |_| mainloop.quit())
+            // Borrow the function-level `mainloop` for `.loop_()` (it outlives the
+            // attached receiver), and move a SEPARATE clone into the quit closure —
+            // one binding can't be borrowed and moved in the same expression.
+            let ml = mainloop.clone();
+            receiver.attach(mainloop.loop_(), move |_| ml.quit())
         };
 
         // Resilience: log Core errors instead of letting them bubble up and end
