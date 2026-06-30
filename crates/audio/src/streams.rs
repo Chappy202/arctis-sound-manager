@@ -283,7 +283,7 @@ pub fn richest_surround_input(
                 .is_some_and(|n| surround_sinks.iter().any(|x| x == n))
         })
         .filter_map(|s| s.channels.map(|c| (c, s)))
-        .max_by_key(|(c, _)| *c)
+        .max_by_key(|(c, s)| (*c, classify_surround_input(*c, &s.positions).is_true_surround))
         .map(|(c, s)| classify_surround_input(c, &s.positions))
 }
 
@@ -510,6 +510,34 @@ mod tests {
         let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
         assert_eq!(si.channels, 8);
         assert!(si.is_true_surround);
+    }
+
+    #[test]
+    fn richest_input_tie_breaks_toward_true_surround() {
+        // TRUE-surround stream (full 7.1 positions) listed FIRST; padded 8ch listed LAST.
+        // Old max_by_key (last-wins) would pick the padded/false one → is_true_surround==false.
+        // The tie-break fix must pick the true-surround stream regardless of order.
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "GameA", "application.process.binary": "GameA" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+          { "id": 52, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "GameB", "application.process.binary": "GameB" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR"] } ] } } },
+          { "id": 98, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 52, "input-node-id": 50 } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
+        assert!(si.is_true_surround, "tie-break must favour true surround (padded was last → old code would pick it)");
     }
 
     #[test]

@@ -321,10 +321,12 @@
           <span class="field-label">BLOCKSIZE</span>
           <span class="field-value">{blocksizeLabel}</span>
         </div>
-        <div class="field-row">
-          <span class="field-label">INPUT</span>
-          <span class="field-value input-status input-status--{inputStatus.tone}">{inputStatus.text}</span>
-        </div>
+        {#if masterEnabled}
+          <div class="field-row">
+            <span class="field-label">INPUT</span>
+            <span class="field-value input-status input-status--{inputStatus.tone}">{inputStatus.text}</span>
+          </div>
+        {/if}
       </div>
     </div>
 

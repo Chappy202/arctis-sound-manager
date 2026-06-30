@@ -290,4 +290,7 @@ describe("surroundInputStatus", () => {
       tone: "muted",
     });
   });
+  it("uses Multichannel label for odd-count true-surround layouts (e.g. 5ch)", () => {
+    expect(surroundInputStatus(5, true)).toEqual({ text: "Input: Multichannel surround ✓", tone: "ok" });
+  });
 });

@@ -150,7 +150,7 @@ function inputLayoutLabel(channels: number): string {
     case 8: return "7.1";
     case 6: return "5.1";
     case 4: return "Quad";
-    default: return "Surround";
+    default: return "Multichannel";
   }
 }
 
