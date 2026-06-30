@@ -3,6 +3,7 @@ mod daemon_control;
 mod error;
 mod meters;
 mod state;
+mod tray;
 
 use state::{DaemonState, MeterSubscribers};
 use tauri::{Emitter, Manager};
