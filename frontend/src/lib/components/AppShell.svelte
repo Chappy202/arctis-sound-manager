@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, type Snippet } from "svelte";
+  import { getVersion } from "@tauri-apps/api/app";
   import { currentPage, type Page } from "../stores/page.js";
   import { engineState, loadError, init, destroy } from "../stores.js";
   import { deriveConnectionStatus, connectionLabel as getConnectionLabel } from "../connection.js";
@@ -33,7 +34,14 @@
     currentPage.set(page);
   }
 
+  // Installed app version (from tauri.conf.json via the Tauri runtime). Best-effort:
+  // stays empty outside a Tauri context so the rail simply omits the label.
+  let appVersion = $state("");
+
   onMount(() => {
+    getVersion()
+      .then((v) => { appVersion = v; })
+      .catch(() => { /* not in a Tauri context — leave version hidden */ });
     init();
     return destroy;
   });
@@ -93,6 +101,12 @@
         </li>
       {/each}
     </ul>
+
+    {#if appVersion}
+      <div class="nav-version" aria-label="Installed version {appVersion}" title="Installed version">
+        v{appVersion}
+      </div>
+    {/if}
   </nav>
 
   <!-- ===== Main area ===== -->
@@ -235,6 +249,19 @@
     letter-spacing: var(--ss-type-micro-letter-spacing);
     text-transform: var(--ss-type-micro-transform);
     line-height: 1;
+  }
+
+  /* Installed version, pinned to the bottom of the rail. */
+  .nav-version {
+    margin-top: auto;
+    padding: var(--ss-space-2) var(--ss-space-1) var(--ss-space-1);
+    text-align: center;
+    font-family: var(--ss-font-mono);
+    font-size: var(--ss-type-micro-size);
+    letter-spacing: var(--ss-type-micro-letter-spacing);
+    color: var(--ss-text-tertiary);
+    font-variant-numeric: tabular-nums;
+    user-select: text;
   }
 
   /* ===== Main area ===== */
