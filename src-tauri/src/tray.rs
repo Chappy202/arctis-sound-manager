@@ -1,7 +1,4 @@
 //! System-tray icon for the GUI: pure helpers + (later tasks) the Tauri wiring.
-// Several pub items here are APIs for Tasks 4–6 and are not yet called within
-// this crate; suppress the lint rather than cluttering each item.
-#![allow(dead_code)]
 
 use crate::state::DaemonState;
 use arctis_client::{send_request_to, Request};
@@ -52,8 +49,15 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<TrayHandles> {
         .item(&quit)
         .build()?;
 
+    let icon = app.default_window_icon().cloned().ok_or_else(|| {
+        tauri::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "bundle icon not present",
+        ))
+    })?;
+
     let tray = TrayIconBuilder::with_id("main")
-        .icon(app.default_window_icon().expect("bundle icon present").clone())
+        .icon(icon)
         .tooltip("Arctis Sound Manager")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -208,21 +212,23 @@ pub fn apply_view(app: &AppHandle, view: &TrayView) {
     // Rebuild the profile submenu items only when the set of names changed.
     let mut last = handles.last_profiles.lock().unwrap();
     if *last != view.profiles {
-        // Remove existing items, then append a CheckMenuItem per profile.
+        // Remove existing items; only append new items and update the cache
+        // when removal succeeded, so a transient error leaves last_profiles
+        // unchanged and the next tick retries the full rebuild.
         if let Ok(items) = handles.profile.items() {
             for it in items {
                 let _ = handles.profile.remove(&it);
             }
-        }
-        for name in &view.profiles {
-            if let Ok(item) = CheckMenuItemBuilder::with_id(profile_item_id(name), name)
-                .checked(*name == view.active_profile)
-                .build(app)
-            {
-                let _ = handles.profile.append(&item);
+            for name in &view.profiles {
+                if let Ok(item) = CheckMenuItemBuilder::with_id(profile_item_id(name), name)
+                    .checked(*name == view.active_profile)
+                    .build(app)
+                {
+                    let _ = handles.profile.append(&item);
+                }
             }
+            *last = view.profiles.clone();
         }
-        *last = view.profiles.clone();
     } else {
         // Profile set unchanged — just refresh which item is checked.
         if let Ok(items) = handles.profile.items() {

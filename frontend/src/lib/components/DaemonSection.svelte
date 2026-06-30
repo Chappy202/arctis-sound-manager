@@ -199,9 +199,14 @@
       <!-- ─── GUI login autostart switch ──────────────────────────────────── -->
       <div class="control-row">
         <div class="autostart-label-group">
-          <span>Launch app at login (hidden in tray)</span>
+          <span class="field-label">Launch app at login (hidden in tray)</span>
         </div>
-        <Switch checked={guiAutostart} onCheckedChange={onToggleGuiAutostart} />
+        <Switch
+          checked={guiAutostart}
+          onCheckedChange={onToggleGuiAutostart}
+          ariaLabel="Launch app at login (hidden in tray)"
+          size="sm"
+        />
       </div>
 
       <!-- ─── Inline feedback ──────────────────────────────────────────────── -->
