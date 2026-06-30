@@ -41,10 +41,7 @@ pub use routing::{
     wireplumber_fragment_path, AppMatch, RouteRule, Router,
 };
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
-pub use sinks::{
-    parse_default_sink_name, parse_node_volume, parse_output_sinks, parse_stream_channels,
-    OutputSink,
-};
+pub use sinks::{parse_default_sink_name, parse_node_volume, parse_output_sinks, OutputSink};
 pub use streams::{
     classify_surround_input, parse_app_streams, richest_surround_input, ParsedStream, SurroundInput,
 };
