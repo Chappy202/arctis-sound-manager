@@ -31,4 +31,7 @@ jobs:
       - name: Stage asm-cli sidecar
         run: ./scripts/stage-sidecar.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --test-threads=1: several tests mutate process-global state (ASM_CONFIG_HOME)
+      # and a shared /tmp surround-conf path, which race under parallel execution.
+      # Single-threaded is the project-sanctioned invocation (see CLAUDE.md).
+      - run: cargo test --workspace -- --test-threads=1
