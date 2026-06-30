@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "core:event:default",
+    "autostart:default",
     "updater:default"
   ]
 }

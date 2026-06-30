@@ -13,6 +13,10 @@ use tokio::sync::Mutex;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .manage(Mutex::new(DaemonState::new()))
         .manage(MeterSubscribers::default())
         .invoke_handler(tauri::generate_handler![
@@ -78,6 +82,9 @@ pub fn run() {
             commands::daemon_stop,
             commands::daemon_restart,
             commands::daemon_set_autostart,
+            // GUI login autostart (Task 6)
+            commands::gui_set_autostart,
+            commands::gui_autostart_enabled,
         ])
         .setup(|app| {
             // Make the bundled daemon durable across AppImage updates.
@@ -235,9 +242,13 @@ pub fn run() {
                 Err(e) => eprintln!("tray: build failed (continuing without tray): {e}"),
             }
 
-            // Temporary (Task 6 replaces with --hidden-aware logic): always show.
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
+            // Show the window unless launched hidden (autostart-into-tray).
+            let argv: Vec<String> = std::env::args().collect();
+            if !tray::should_start_hidden(&argv) {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
             }
 
             Ok(())

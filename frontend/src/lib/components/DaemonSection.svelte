@@ -15,6 +15,8 @@
     daemonStop,
     daemonRestart,
     daemonSetAutostart,
+    guiSetAutostart,
+    guiAutostartEnabled,
   } from "../ipc.js";
   import {
     statusLabel,
@@ -89,6 +91,22 @@
       msg = String(e);
     } finally {
       busy = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // GUI login autostart
+  // ---------------------------------------------------------------------------
+
+  let guiAutostart = $state(false);
+  $effect(() => {
+    guiAutostartEnabled().then((v) => (guiAutostart = v)).catch(() => {});
+  });
+  async function onToggleGuiAutostart(enabled: boolean) {
+    try {
+      guiAutostart = await guiSetAutostart(enabled);
+    } catch (e) {
+      console.error("gui autostart toggle failed", e);
     }
   }
 
@@ -176,6 +194,14 @@
           ariaLabel="Start daemon at login"
           size="sm"
         />
+      </div>
+
+      <!-- ─── GUI login autostart switch ──────────────────────────────────── -->
+      <div class="control-row">
+        <div class="autostart-label-group">
+          <span>Launch app at login (hidden in tray)</span>
+        </div>
+        <Switch checked={guiAutostart} onCheckedChange={onToggleGuiAutostart} />
       </div>
 
       <!-- ─── Inline feedback ──────────────────────────────────────────────── -->

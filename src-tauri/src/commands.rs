@@ -661,6 +661,32 @@ pub async fn daemon_set_autostart(enabled: bool) -> Result<DaemonStatus, Command
     .map_err(|e| CommandError::DaemonUnavailable(format!("join error: {e}")))?
 }
 
+// ── GUI login autostart (Task 6) ─────────────────────────────────────────────
+//
+// Distinct from `daemon_set_autostart`, which manages the engine's systemd unit.
+// These commands manage the GUI's own XDG autostart entry (via tauri-plugin-autostart),
+// which launches the app with `--hidden` so it starts silently in the tray.
+
+use tauri_plugin_autostart::ManagerExt;
+
+/// Enable/disable the GUI's own login autostart (launches hidden into the tray).
+/// Distinct from `daemon_set_autostart`, which manages the engine's systemd unit.
+#[tauri::command]
+pub async fn gui_set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
+    }
+    mgr.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn gui_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
 // ── Level-meter subscriber gate (perf) ───────────────────────────────────────
 //
 // The UI calls `meter_subscribe` when a LevelMeter mounts and `meter_unsubscribe`

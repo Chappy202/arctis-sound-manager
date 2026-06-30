@@ -552,6 +552,16 @@ export const daemonRestart = (): Promise<DaemonStatus> =>
 export const daemonSetAutostart = (enabled: boolean): Promise<DaemonStatus> =>
   invoke<DaemonStatus>("daemon_set_autostart", { enabled });
 
+/** Enable/disable the GUI's own login autostart (launches hidden into the tray).
+ *  Distinct from daemonSetAutostart, which manages the engine's systemd unit.
+ *  Returns the new enabled state as confirmed by the plugin. */
+export const guiSetAutostart = (enabled: boolean): Promise<boolean> =>
+  invoke<boolean>("gui_set_autostart", { enabled });
+
+/** Query whether the GUI's own login autostart entry is currently enabled. */
+export const guiAutostartEnabled = (): Promise<boolean> =>
+  invoke<boolean>("gui_autostart_enabled");
+
 // ---------------------------------------------------------------------------
 // Event subscriptions
 // ---------------------------------------------------------------------------
