@@ -82,10 +82,14 @@ impl RouteSnapshot {
         self.map.get(binary).map(String::as_str)
     }
 
+    // Test-only inspectors: in a binary crate `pub` does not suppress dead_code,
+    // and the runtime watcher never queries size — only the unit tests do.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

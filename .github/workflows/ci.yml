@@ -14,7 +14,9 @@ jobs:
             libjavascriptcoregtk-4.1-dev \
             libudev-dev \
             build-essential \
-            file
+            file \
+            clang \
+            libpipewire-0.3-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -31,6 +33,9 @@ jobs:
       - name: Stage asm-cli sidecar
         run: ./scripts/stage-sidecar.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The shipped daemon is built with `pw-watcher` (see stage-sidecar.sh), so
+      # lint that code path too — default-feature clippy above only sees the stub.
+      - run: cargo clippy -p arctis-cli --features pw-watcher --all-targets -- -D warnings
       # --test-threads=1: several tests mutate process-global state (ASM_CONFIG_HOME)
       # and a shared /tmp surround-conf path, which race under parallel execution.
       # Single-threaded is the project-sanctioned invocation (see CLAUDE.md).
