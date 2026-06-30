@@ -860,10 +860,12 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Discover running application output streams, resolving each to a channel id
-    /// (via its linked sink node.name) and flagging those with a persistent route.
-    /// One `pw-dump` per call; pure mapping otherwise. Read-only (no graph mutation).
-    pub fn list_streams(&mut self) -> Result<Vec<crate::state::AppStream>, EngineError> {
+    /// Per-node application output streams (one entry per PipeWire output node),
+    /// each resolved to a channel id (via its linked sink node.name) and flagged
+    /// with a persistent route. One `pw-dump` per call; pure mapping otherwise.
+    /// Read-only. This is the pre-dedup view used by routing, which must act on
+    /// EVERY node of an app — `list_streams` collapses it to one badge per app.
+    fn list_app_streams_raw(&mut self) -> Result<Vec<crate::state::AppStream>, EngineError> {
         // node.name -> channel id, built from the active profile (never hard-coded).
         let (name_to_id, routed_bins): (
             std::collections::HashMap<String, String>,
@@ -892,7 +894,7 @@ impl<R: CommandRunner> Engine<R> {
             }));
         }
         let parsed = arctis_audio::parse_app_streams(&out.stdout)?;
-        Ok(parsed
+        let mut per_node: Vec<crate::state::AppStream> = parsed
             .into_iter()
             .map(|p| crate::state::AppStream {
                 current_channel: p
@@ -907,7 +909,36 @@ impl<R: CommandRunner> Engine<R> {
                 icon_name: p.icon_name,
                 media_name: p.media_name,
             })
-            .collect())
+            .collect();
+        // Stable order by node id so the lowest-id node is the dedup representative.
+        per_node.sort_by_key(|s| s.id);
+        Ok(per_node)
+    }
+
+    /// Discover running application output streams for the mixer: ONE badge per
+    /// app. Read-only (no graph mutation).
+    pub fn list_streams(&mut self) -> Result<Vec<crate::state::AppStream>, EngineError> {
+        let per_node = self.list_app_streams_raw()?;
+        // Collapse multiple output nodes of the same app into ONE badge. A browser
+        // (Vivaldi/Chrome) can hold several Stream/Output/Audio nodes at once — e.g.
+        // a second node appears when a video starts — and one-per-node would show
+        // duplicate badges. Keep the lowest-id node (per_node is id-sorted) as the
+        // representative; if a sibling is linked to a channel, adopt that channel so
+        // a routed stream isn't hidden behind an unlinked one. (Routing is
+        // per-binary, so `routed` is identical across a group.)
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut deduped: Vec<crate::state::AppStream> = Vec::with_capacity(per_node.len());
+        for s in per_node {
+            if let Some(&idx) = seen.get(&s.binary) {
+                if deduped[idx].current_channel.is_none() && s.current_channel.is_some() {
+                    deduped[idx].current_channel = s.current_channel;
+                }
+                continue;
+            }
+            seen.insert(s.binary.clone(), deduped.len());
+            deduped.push(s);
+        }
+        Ok(deduped)
     }
 
     /// Discover real output devices (physical sinks) via `pw-metadata 0` + `pw-dump`.
@@ -974,31 +1005,42 @@ impl<R: CommandRunner> Engine<R> {
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown channel: {channel_id}")))?
         };
 
-        // Find the target stream (by node id string or by binary) for its id + binary.
-        let streams = self.list_streams()?;
+        // Find the requested stream (by node id string or by binary) to resolve
+        // which APP (binary) is being routed. Use the per-node view, not the
+        // deduped badge list, so we can move every node of that app below.
+        let streams = self.list_app_streams_raw()?;
         let target = streams
             .iter()
             .find(|s| s.id.to_string() == stream || s.binary == stream)
             .ok_or_else(|| EngineError::BadRequest(format!("no running stream: {stream}")))?
             .clone();
 
-        // Live move the exact stream node id.
-        let argv = move_stream_argv(&target.id.to_string(), &sink)?;
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.runner.run("pw-metadata", &args)?;
-        if out.status != 0 {
-            return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
-                program: "pw-metadata".into(),
-                status: out.status,
-                stderr: out.stderr,
-            }));
+        // Live-move EVERY currently-running output node of this app, not just the
+        // matched one. Browsers (Vivaldi/Chrome) hold multiple output nodes; moving
+        // a single node leaves the others on the old sink, which is the "jumps back"
+        // symptom the user sees. Routing is per-binary, so move all same-binary nodes.
+        let node_ids: Vec<u32> = streams
+            .iter()
+            .filter(|s| s.binary == target.binary)
+            .map(|s| s.id)
+            .collect();
+        for id in node_ids {
+            let argv = move_stream_argv(&id.to_string(), &sink)?;
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.runner.run("pw-metadata", &args)?;
+            if out.status != 0 {
+                return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
+                    program: "pw-metadata".into(),
+                    status: out.status,
+                    stderr: out.stderr,
+                }));
+            }
         }
 
         // Persist binary -> sink without a second live move.
-        // The exact-id move above already targeted the specific instance; calling
-        // set_route would also trigger a best-effort binary-match live move that
-        // could silently target the wrong instance when multiple instances of the
-        // same binary are running. persist_route writes config + WP fragment +
+        // The per-node moves above already covered every running instance; calling
+        // set_route would also trigger a best-effort binary-match live move (an
+        // extra pw-dump + pw-metadata). persist_route writes config + WP fragment +
         // emits RouteSet without any additional pw-dump / pw-metadata calls.
         self.persist_route(&target.binary, &sink)?;
         Ok(())
@@ -7499,6 +7541,30 @@ mod tests {
         assert!(!sp.routed);
     }
 
+    #[test]
+    fn list_streams_dedupes_multiple_nodes_of_one_app_into_one_badge() {
+        // A browser (Vivaldi) can hold several Stream/Output/Audio nodes at once
+        // (e.g. a second node appears when a video starts). The mixer must show
+        // ONE badge per app, not one per node: two vivaldi-bin nodes → one entry.
+        let dump = r#"[
+          {"id":70,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.name":"Vivaldi",
+            "application.process.binary":"vivaldi-bin","application.process.id":"100","media.name":"Playback"}}},
+          {"id":71,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.name":"Vivaldi",
+            "application.process.binary":"vivaldi-bin","application.process.id":"100","media.name":"AudioStream"}}}
+        ]"#;
+        let runner = arctis_audio::MockRunner::new().with_output(0, dump, ""); // pw-dump
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        let streams = engine.list_streams().unwrap();
+        let vivaldi: Vec<_> = streams.iter().filter(|s| s.binary == "vivaldi-bin").collect();
+        assert_eq!(
+            vivaldi.len(),
+            1,
+            "multiple nodes of one app must collapse into a single badge: {streams:?}"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Task 3 (engine output): list_output_devices
     // ─────────────────────────────────────────────────────────────────────────
@@ -7638,6 +7704,54 @@ mod tests {
                 .iter()
                 .any(|c| c.first().map(|s| s.as_str()) == Some("pw-metadata")),
             "pw-metadata must be called for live move"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn move_stream_moves_every_node_of_a_multi_node_app() {
+        // Routing an app must move ALL its current output nodes, not just the first.
+        // A browser with a video playing has 2+ nodes; moving only one leaves the
+        // other on the default sink, so the app appears to "jump back".
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("move_stream_all");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("move_stream_all_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let cfg = make_config_no_eq_no_routes();
+        let dump = r#"[
+          {"id":70,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.name":"Vivaldi",
+            "application.process.binary":"vivaldi-bin","application.process.id":"100","media.name":"Playback"}}},
+          {"id":71,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.name":"Vivaldi",
+            "application.process.binary":"vivaldi-bin","application.process.id":"100","media.name":"AudioStream"}}}
+        ]"#;
+        // Only the pw-dump output is queued; the pw-metadata moves return default 0.
+        let runner = arctis_audio::MockRunner::new().with_output(0, dump, "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.move_stream("vivaldi-bin", "media").unwrap();
+
+        let moved: std::collections::HashSet<String> = engine
+            .runner
+            .calls
+            .iter()
+            .filter(|c| c.first().map(|s| s.as_str()) == Some("pw-metadata"))
+            .filter_map(|c| {
+                c.iter()
+                    .find(|a| a.as_str() == "70" || a.as_str() == "71")
+                    .cloned()
+            })
+            .collect();
+        assert!(
+            moved.contains("70") && moved.contains("71"),
+            "both vivaldi nodes must be live-moved; pw-metadata calls: {:?}",
+            engine.runner.calls
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
