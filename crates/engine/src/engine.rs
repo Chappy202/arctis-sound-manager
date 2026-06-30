@@ -2000,9 +2000,17 @@ impl<R: CommandRunner> Engine<R> {
             }
         }
 
-        // Step 3: per-channel output device overrides
+        // Step 3: per-channel output device overrides.
+        // SKIP surround-routed channels: their live output is owned by Step 6
+        // (apply_surround routes them to effect_input.arctis_surround). Without this
+        // skip, Step 3 re-points the channel to its output_device (the headset, via
+        // overlay_default_output) on every reconcile, while apply_surround's no-thrash
+        // guard then declines to re-route it — silently bypassing the HRIR after the
+        // first reconcile (bug C1). One writer per channel = no fight.
         for ch in &profile.channels {
-            if ch.output_device.is_some() {
+            if ch.output_device.is_some()
+                && !convert::surround_routes_channel(&profile.surround, &ch.id)
+            {
                 let eq_model = convert::eq_model_for(ch)?;
                 let mut mgr = ChannelManager::new(&mut self.runner, channel_set.clone());
                 let handle = mgr.set_output(&ch.id, ch.output_device.clone(), &eq_model)?;

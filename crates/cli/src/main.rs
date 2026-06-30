@@ -1010,6 +1010,7 @@ fn main() -> ExitCode {
             let spec = SinkSpec {
                 node_name: SINK_NAME.to_string(),
                 description: SINK_DESC.to_string(),
+                channels: arctis_audio::ChainChannels::Stereo,
                 playback_target: target,
             };
             let mut be = AudioBackend::new(RealRunner, spec);
@@ -1040,6 +1041,7 @@ fn main() -> ExitCode {
             let spec = SinkSpec {
                 node_name: SINK_NAME.to_string(),
                 description: SINK_DESC.to_string(),
+                channels: arctis_audio::ChainChannels::Stereo,
                 playback_target: None,
             };
             let mut be = AudioBackend::new(RealRunner, spec);

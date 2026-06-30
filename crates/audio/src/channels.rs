@@ -14,6 +14,10 @@ pub struct ChannelDef {
     pub node_name: String,
     pub description: String,
     pub output_device: Option<String>,
+    /// Channel layout of this channel's sink. Defaults to `Stereo`; set to
+    /// `Surround71` when the channel is surround-routed so a game outputs discrete
+    /// 7.1 into it (which then feeds the HRIR convolver).
+    pub channels: crate::config::ChainChannels,
 }
 
 impl ChannelDef {
@@ -28,6 +32,7 @@ impl ChannelDef {
             node_name: node_name.to_string(),
             description: description.to_string(),
             output_device,
+            channels: crate::config::ChainChannels::Stereo,
         }
     }
 
@@ -36,6 +41,7 @@ impl ChannelDef {
         SinkSpec {
             node_name: self.node_name.clone(),
             description: self.description.clone(),
+            channels: self.channels,
             playback_target: self.output_device.clone(),
         }
     }

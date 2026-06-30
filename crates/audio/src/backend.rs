@@ -119,11 +119,13 @@ impl<R: CommandRunner> AudioBackend<R> {
 
     /// Apply volume+mute to the channel sink node live via `pw-cli s <id> Props …`.
     /// `volume_db` is in dB; converted to linear (10^(db/20)) for channelVolumes.
-    /// Channel sinks are stereo → 2 identical channelVolume entries.
+    /// Emits one identical channelVolume entry per sink channel (2 for stereo,
+    /// 8 for a surround-routed 7.1 channel) so the gain applies to ALL channels.
     pub fn apply_volume_mute(&mut self, volume_db: f32, muted: bool) -> Result<(), AudioError> {
         let id = self.find_node_id()?;
         let linear = 10f32.powf(volume_db / 20.0);
-        let argv = set_node_volume_props_argv(&id, &[linear, linear], muted)?;
+        let vols = vec![linear; self.spec.channels.count() as usize];
+        let argv = set_node_volume_props_argv(&id, &vols, muted)?;
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let out = self.runner.run("pw-cli", &args)?;
         Self::check(out, "pw-cli")?;
@@ -143,7 +145,8 @@ impl<R: CommandRunner> AudioBackend<R> {
         let id = self.find_node_id()?;
         let frac = (volume_pct as f32 / 100.0).clamp(0.0, 1.0);
         let linear = frac * frac * frac; // (pct/100)^3
-        let argv = set_node_volume_props_argv(&id, &[linear, linear], muted)?;
+        let vols = vec![linear; self.spec.channels.count() as usize];
+        let argv = set_node_volume_props_argv(&id, &vols, muted)?;
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         let out = self.runner.run("pw-cli", &args)?;
         Self::check(out, "pw-cli")?;
@@ -219,6 +222,7 @@ mod tests {
         SinkSpec {
             node_name: "arctis_eq".into(),
             description: "Arctis EQ Sink".into(),
+            channels: crate::config::ChainChannels::Stereo,
             playback_target: None,
         }
     }
@@ -351,6 +355,7 @@ id 58, type PipeWire:Interface:Node/3
         let spec = SinkSpec {
             node_name: "arctis_eq".into(),
             description: "Arctis EQ Sink".into(),
+            channels: crate::config::ChainChannels::Stereo,
             playback_target: Some("alsa_output.speakers".into()),
         };
         let mut be = AudioBackend::new(runner, spec);
@@ -408,6 +413,31 @@ id 58, type PipeWire:Interface:Node/3
         be.apply_volume_mute(0.0, true).unwrap();
         let last = be.runner().last_call().unwrap();
         assert!(last.last().unwrap().contains("mute = true"));
+    }
+
+    #[test]
+    fn apply_volume_mute_pct_sizes_channelvolumes_to_sink_channel_count() {
+        // A surround-routed channel sink is 8-channel; the volume must be applied to all
+        // 8 channelVolumes entries. A hardcoded 2-entry array would leave 6 channels at
+        // unity, so the volume slider would only attenuate the front pair (bug H1).
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // find_node_id
+            .with_output(0, "", ""); // the set
+        let spec = SinkSpec {
+            node_name: "arctis_eq".into(),
+            description: "Arctis EQ Sink".into(),
+            channels: crate::config::ChainChannels::Surround71,
+            playback_target: None,
+        };
+        let mut be = AudioBackend::new(runner, spec);
+        be.apply_volume_mute_pct(50, false).unwrap();
+        let props = be.runner().last_call().unwrap().last().unwrap().clone();
+        // pct=50 perceptual → 0.5^3 = 0.125 per channel; expect 8 entries.
+        assert_eq!(
+            props.matches("0.125").count(),
+            8,
+            "8-channel sink must emit 8 channelVolumes entries, got: {props}"
+        );
     }
 
     #[test]

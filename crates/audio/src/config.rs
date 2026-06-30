@@ -41,19 +41,30 @@ impl NodeType {
 pub enum ChainChannels {
     Mono,
     Stereo,
+    /// 8-channel 7.1. Position matches the surround convolver input exactly so a
+    /// surround-routed channel feeds the HRIR 1:1. This is also the Windows 7.1
+    /// WAVEFORMATEXTENSIBLE order (FL FR FC LFE rear-L rear-R side-L side-R), so
+    /// any game outputting 7.1 maps correctly through winepulse/Proton.
+    Surround71,
+    /// 6-channel 5.1, matching the 5.1 convolver input (Hrir51 mode).
+    Surround51,
 }
 
 impl ChainChannels {
-    fn count(&self) -> u32 {
+    pub fn count(&self) -> u32 {
         match self {
             ChainChannels::Mono => 1,
             ChainChannels::Stereo => 2,
+            ChainChannels::Surround51 => 6,
+            ChainChannels::Surround71 => 8,
         }
     }
     fn position(&self) -> &'static str {
         match self {
             ChainChannels::Mono => "MONO",
             ChainChannels::Stereo => "FL FR",
+            ChainChannels::Surround51 => "FL FR FC LFE RL RR",
+            ChainChannels::Surround71 => "FL FR FC LFE RL RR SL SR",
         }
     }
 }
@@ -99,6 +110,9 @@ pub struct ChainSpec {
 pub struct SinkSpec {
     pub node_name: String,
     pub description: String,
+    /// Channel layout of the sink. `Stereo` for normal channels; `Surround71`
+    /// for a surround-routed channel (so a game outputs discrete 7.1 into it).
+    pub channels: ChainChannels,
     /// `Some(hardware_sink_node_name)` to pin the tail; `None` follows default.
     pub playback_target: Option<String>,
 }
@@ -303,7 +317,7 @@ pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String,
     let chain_spec = ChainSpec {
         node_name: spec.node_name.clone(),
         description: spec.description.clone(),
-        channels: ChainChannels::Stereo,
+        channels: spec.channels,
         kind: ChainKind::Sink,
         capture_node_name: spec.node_name.clone(),
         capture_target: None,
@@ -332,10 +346,33 @@ mod tests {
     // ── EQ sink regression ────────────────────────────────────────────────────
 
     #[test]
+    fn render_filter_chain_conf_surround71_emits_8_channels_71_position() {
+        // A surround-routed channel sink must advertise itself as 8-channel 7.1 so a
+        // game outputs discrete surround into it (which then feeds the HRIR convolver).
+        // The position must match the convolver input layout exactly (1:1 channel map).
+        let spec = SinkSpec {
+            node_name: "Arctis_Game".into(),
+            description: "Arctis Game".into(),
+            channels: ChainChannels::Surround71,
+            playback_target: Some("effect_input.arctis_surround".into()),
+        };
+        let conf = render_filter_chain_conf(&spec, &three_band()).unwrap();
+        assert!(
+            conf.contains("audio.channels = 8"),
+            "surround channel sink must be 8-channel, got:\n{conf}"
+        );
+        assert!(
+            conf.contains("audio.position = [ FL FR FC LFE RL RR SL SR ]"),
+            "surround channel sink must use the 7.1 layout matching the convolver, got:\n{conf}"
+        );
+    }
+
+    #[test]
     fn renders_exact_fixture() {
         let spec = SinkSpec {
             node_name: "arctis_eq".into(),
             description: "Arctis EQ Sink".into(),
+            channels: ChainChannels::Stereo,
             playback_target: Some("alsa_output.hw0".into()),
         };
         let got = render_filter_chain_conf(&spec, &three_band()).unwrap();
@@ -351,6 +388,7 @@ mod tests {
         let spec = SinkSpec {
             node_name: "arctis_eq".into(),
             description: "Arctis EQ Sink".into(),
+            channels: ChainChannels::Stereo,
             playback_target: None,
         };
         let got = render_filter_chain_conf(&spec, &three_band()).unwrap();
@@ -559,6 +597,7 @@ mod tests {
         let spec = SinkSpec {
             node_name: "arctis_eq".into(),
             description: "Arctis EQ Sink".into(),
+            channels: ChainChannels::Stereo,
             playback_target: Some("alsa_output.hw0".into()),
         };
         let got = render_filter_chain_conf(

@@ -76,10 +76,48 @@ pub fn channel_def_from_cfg(c: &ChannelConfig) -> ChannelDef {
     ChannelDef::new(&c.id, &c.node_name, &c.description, c.output_device.clone())
 }
 
+/// True when `ch_id` is routed through the surround convolver in this profile:
+/// surround is enabled AND the channel is listed in `surround.channels`. This is the
+/// single source of truth for surround routing — used both to size the channel sink
+/// (8-ch 7.1) AND to keep `reconcile` Step 3 from re-pointing the channel to its
+/// `output_device` (the live convolver routing is owned by `apply_surround`; without
+/// this guard the two writers fight and silently bypass the HRIR — bug C1).
+pub fn surround_routes_channel(surround: &arctis_config::SurroundConfig, ch_id: &str) -> bool {
+    surround.enabled && surround.channels.iter().any(|c| c == ch_id)
+}
+
+/// The channel-sink layout for a surround-routed channel, by surround mode. It MUST
+/// match the convolver/bypass INPUT for that mode so the link is 1:1 (no implicit
+/// PipeWire remix): 7.1 → 8-ch, 5.1 → 6-ch, StereoBypass → 2-ch. `Auto` resolves to
+/// 7.1 (mirrors `resolve_effective_mode(Auto, None)`).
+pub fn surround_channel_layout(mode: arctis_config::SurroundMode) -> ChainChannels {
+    use arctis_config::SurroundMode::*;
+    match mode {
+        Hrir71 | Auto => ChainChannels::Surround71,
+        Hrir51 => ChainChannels::Surround51,
+        StereoBypass => ChainChannels::Stereo,
+    }
+}
+
 /// Build the full `ChannelSetConfig` for a profile's channels.
+///
+/// Reusable, profile-agnostic surround: any channel routed through surround (see
+/// [`surround_routes_channel`]) is built as an 8-channel 7.1 sink so a game outputs
+/// discrete surround into it, which then feeds the HRIR convolver. Every other
+/// channel stays stereo. No game/profile is hard-wired — membership drives it.
 pub fn channel_set_from_profile(p: &arctis_config::Profile) -> ChannelSetConfig {
     ChannelSetConfig {
-        channels: p.channels.iter().map(channel_def_from_cfg).collect(),
+        channels: p
+            .channels
+            .iter()
+            .map(|c| {
+                let mut def = channel_def_from_cfg(c);
+                if surround_routes_channel(&p.surround, &c.id) {
+                    def.channels = surround_channel_layout(p.surround.mode);
+                }
+                def
+            })
+            .collect(),
     }
 }
 
@@ -751,6 +789,90 @@ mod tests {
             output_device: None, eq: vec![], volume_db: 0.0, volume_pct: 100, muted: false,
         };
         assert_eq!(dense_eq_bands(&ch), default_eq_band_configs());
+    }
+
+    #[test]
+    fn surround_routes_channel_reflects_enabled_and_membership() {
+        // The single source of truth for "is this channel routed through the surround
+        // convolver" — used both to size the channel sink (8-ch) AND to keep reconcile
+        // Step 3 from clobbering the convolver routing (C1).
+        let mut s = arctis_config::SurroundConfig {
+            enabled: true,
+            channels: vec!["game".into()],
+            ..Default::default()
+        };
+        assert!(surround_routes_channel(&s, "game"), "enabled + member → routed");
+        assert!(!surround_routes_channel(&s, "chat"), "non-member → not routed");
+        s.enabled = false;
+        assert!(
+            !surround_routes_channel(&s, "game"),
+            "surround disabled → no channel is surround-routed"
+        );
+    }
+
+    #[test]
+    fn channel_set_marks_surround_routed_channel_8ch_else_stereo() {
+        // Reusable, profile-agnostic surround: any channel listed in surround.channels
+        // (when surround is enabled) becomes an 8-channel 7.1 sink so a game outputs
+        // discrete surround into it; every other channel stays stereo.
+        let mut p = profile_default();
+        p.surround.enabled = true;
+        p.surround.channels = vec!["game".into()];
+        let set = channel_set_from_profile(&p);
+        let game = set.channels.iter().find(|c| c.id == "game").unwrap();
+        let chat = set.channels.iter().find(|c| c.id == "chat").unwrap();
+        assert_eq!(
+            game.channels,
+            ChainChannels::Surround71,
+            "surround-routed channel must be 8-channel 7.1"
+        );
+        assert_eq!(
+            chat.channels,
+            ChainChannels::Stereo,
+            "non-surround channel must stay stereo"
+        );
+    }
+
+    #[test]
+    fn channel_set_surround_channel_layout_follows_mode() {
+        // The channel sink's channel count must match the convolver INPUT for the
+        // active mode (8-ch for 7.1, 6-ch for 5.1) — and StereoBypass must stay 2-ch
+        // so apps don't see a phantom 7.1 device. Always-8ch (bug H2) mismatches the
+        // 5.1 convolver and defeats StereoBypass.
+        let mut p = profile_default();
+        p.surround.enabled = true;
+        p.surround.channels = vec!["game".into()];
+        let game_layout = |p: &Profile| {
+            channel_set_from_profile(p)
+                .channels
+                .iter()
+                .find(|c| c.id == "game")
+                .unwrap()
+                .channels
+        };
+
+        p.surround.mode = arctis_config::SurroundMode::Hrir71;
+        assert_eq!(game_layout(&p), ChainChannels::Surround71, "7.1 → 8-ch");
+        p.surround.mode = arctis_config::SurroundMode::Auto;
+        assert_eq!(game_layout(&p), ChainChannels::Surround71, "Auto resolves to 7.1 → 8-ch");
+        p.surround.mode = arctis_config::SurroundMode::Hrir51;
+        assert_eq!(game_layout(&p), ChainChannels::Surround51, "5.1 → 6-ch");
+        p.surround.mode = arctis_config::SurroundMode::StereoBypass;
+        assert_eq!(game_layout(&p), ChainChannels::Stereo, "StereoBypass → 2-ch");
+    }
+
+    #[test]
+    fn channel_set_all_stereo_when_surround_disabled() {
+        let mut p = profile_default();
+        p.surround.enabled = false;
+        p.surround.channels = vec!["game".into()]; // listed, but surround OFF
+        let set = channel_set_from_profile(&p);
+        assert!(
+            set.channels
+                .iter()
+                .all(|c| c.channels == ChainChannels::Stereo),
+            "surround disabled → every channel stays stereo"
+        );
     }
 
     #[test]
