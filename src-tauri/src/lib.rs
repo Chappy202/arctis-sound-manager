@@ -223,7 +223,31 @@ pub fn run() {
                 });
             }
 
+            // ── System tray ────────────────────────────────────────────────
+            // Non-fatal: if the tray fails to build (e.g. no appindicator at
+            // runtime) the app still runs as a normal window.
+            match tray::build_tray(&app.handle().clone()) {
+                Ok(handles) => {
+                    app.manage(handles);
+                }
+                Err(e) => eprintln!("tray: build failed (continuing without tray): {e}"),
+            }
+
+            // Temporary (Task 6 replaces with --hidden-aware logic): always show.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+            }
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // X hides to tray instead of quitting; the process stays resident.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

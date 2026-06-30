@@ -1,4 +1,78 @@
 //! System-tray icon for the GUI: pure helpers + (later tasks) the Tauri wiring.
+// Several pub items here are APIs for Tasks 4–6 and are not yet called within
+// this crate; suppress the lint rather than cluttering each item.
+#![allow(dead_code)]
+
+use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, Wry};
+
+/// Handles kept in managed state so the poll task can update the tray live.
+pub struct TrayHandles {
+    pub tray: tauri::tray::TrayIcon,
+    pub mute: tauri::menu::CheckMenuItem<Wry>,
+    pub profile: tauri::menu::Submenu<Wry>,
+    pub last_profiles: std::sync::Mutex<Vec<String>>,
+}
+
+/// Show the main window if hidden (and focus it), or hide it if visible.
+pub fn toggle_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        match win.is_visible() {
+            Ok(true) => {
+                let _ = win.hide();
+            }
+            _ => {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }
+    }
+}
+
+/// Build the tray icon + menu. Menu actions are attached by `attach_menu_handlers`
+/// (Task 4); this task wires only the left-click toggle.
+pub fn build_tray(app: &AppHandle) -> tauri::Result<TrayHandles> {
+    let show = MenuItemBuilder::with_id("show", "Show/Hide Window").build(app)?;
+    let mute = CheckMenuItemBuilder::with_id("mute", "Mute")
+        .checked(false)
+        .build(app)?;
+    let profile = SubmenuBuilder::with_id(app, "profile_menu", "Profile").build()?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&show)
+        .separator()
+        .item(&mute)
+        .item(&profile)
+        .separator()
+        .item(&quit)
+        .build()?;
+
+    let tray = TrayIconBuilder::with_id("main")
+        .icon(app.default_window_icon().expect("bundle icon present").clone())
+        .tooltip("Arctis Sound Manager")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+
+    Ok(TrayHandles {
+        tray,
+        mute,
+        profile,
+        last_profiles: std::sync::Mutex::new(Vec::new()),
+    })
+}
 
 /// What the tray should currently display, derived from engine state.
 #[derive(Debug, Clone, PartialEq, Eq)]
