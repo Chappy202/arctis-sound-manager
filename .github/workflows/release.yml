@@ -39,7 +39,8 @@ jobs:
             libfuse2 \
             file \
             clang \
-            libpipewire-0.3-dev
+            libpipewire-0.3-dev \
+            libayatana-appindicator3-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v4

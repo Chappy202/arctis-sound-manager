@@ -27,7 +27,7 @@ engine-first (headless): build/test the Rust core + `asm-cli` before the UI.
   dedicated thread; `pw-metadata`/`wpctl` as subprocess for discrete actions). HID via `hidraw` using
   the `hidapi` **C backend** (`linux-static-hidraw`); the pure-Rust `linux-native` backend does NOT
   enumerate the Nova Pro Wireless. Build deps: `libudev` (`systemd-devel`) + a C toolchain (`gcc`); the
-  optional `pw-watcher` feature (live route re-apply) additionally needs `pipewire-devel` + `clang`.
+  optional `pw-watcher` feature (live route re-apply) additionally needs `pipewire-devel` + `clang`. The system tray additionally needs `libayatana-appindicator3-dev` (`libayatana-appindicator-gtk3-devel` on Fedora/Nobara).
 - Crates: `domain`, `device`, `audio`, `config`, `engine`, `cli`, (future `daemon`); `src-tauri` + `ui`.
 - Dependency rule: `tauri` only in `src-tauri`; `engine` and below are UI-agnostic. See ARCHITECTURE §2.
 
