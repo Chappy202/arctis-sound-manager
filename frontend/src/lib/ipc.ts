@@ -96,8 +96,6 @@ export interface SurroundSnapshot {
   negotiated_channels?: number | null;
   /** Pinned HRIR stem requested but not installed (fallback in use); null/absent when OK. */
   hrir_missing?: string | null;
-  /** Explicit post-convolution EQ on the binaural tail (empty/absent = none). */
-  output_eq?: EqBandSnapshot[];
   /** Pinned convolver blocksize, or null/absent for PipeWire default. */
   blocksize?: number | null;
 }
@@ -377,10 +375,6 @@ export const surroundSetHwSink = (hwSink: string | null): Promise<EngineState> =
 /** List the static factory-profile catalog for the data-driven create-profile UI. */
 export const listFactoryProfiles = (): Promise<FactoryProfileInfo[]> =>
   invoke<FactoryProfileInfo[]>("list_factory_profiles");
-
-/** Set the explicit post-convolution surround EQ bands. Returns updated EngineState. */
-export const surroundSetOutputEq = (bands: EqBandSnapshot[]): Promise<EngineState> =>
-  invoke<EngineState>("surround_set_output_eq", { bands });
 
 /** Pin (or clear) the convolver blocksize. null = PipeWire default. */
 export const surroundSetBlocksize = (blocksize: number | null): Promise<EngineState> =>

@@ -26,7 +26,6 @@
     surroundSetHwSink,
     surroundImportHrirs,
     surroundFetchHrirs,
-    surroundSetOutputEq,
     profileCreateFromFactory,
     listOutputs,
     listFactoryProfiles,
@@ -41,13 +40,9 @@
     sinkSelectValue,
     sinkValueToHwSink,
     groupHrirOptionsByTonality,
-    outputEqToBands,
-    bandsToOutputEq,
     factoryProfileLabel,
-    flatOutputEq,
     formatBlocksize,
   } from "../surround.js";
-  import EqEditor from "./EqEditor.svelte";
   import Switch from "../ui/Switch.svelte";
   import Select from "../ui/Select.svelte";
   import type { SelectOption } from "../ui/selectUtils.js";
@@ -101,15 +96,11 @@
   const sinkOptions = $derived(buildSinkOptions(outputs, null));
 
   // ---------------------------------------------------------------------------
-  // Missing-HRIR prompt + post-convolution ("spatial correction") EQ state
+  // Missing-HRIR prompt state
   // ---------------------------------------------------------------------------
 
   const hrirMissing = $derived(surround?.hrir_missing ?? null);
   let missingDismissed = $state(false);
-
-  const postEqBands = $derived(outputEqToBands(surround?.output_eq ?? []));
-  let postSelected = $state(0);
-  const postEnabled = $derived((surround?.output_eq ?? []).length > 0);
 
   // ---------------------------------------------------------------------------
   // Import / fetch HRIR feedback state
@@ -190,22 +181,6 @@
     }
   }
 
-  // Update one band of the post-convolution EQ; the engine returns the new state.
-  function onPostBandChange(index: number, band: import("../eq.js").Band) {
-    const next = postEqBands.map((b, i) => (i === index ? band : b));
-    surroundSetOutputEq(bandsToOutputEq(next)).then(applyState).catch((err) => {
-      console.warn("[SpatialPage] surroundSetOutputEq failed:", err);
-    });
-  }
-
-  // Toggle the post EQ: on → seed a flat 10-band curve so the editor is usable;
-  // off → clear the curve entirely (empty output_eq = no post EQ).
-  function onPostToggle(on: boolean) {
-    const bands = on ? flatOutputEq() : [];
-    surroundSetOutputEq(bands).then(applyState).catch((err) => {
-      console.warn("[SpatialPage] surroundSetOutputEq toggle failed:", err);
-    });
-  }
 </script>
 
 <div class="spatial-page">
@@ -341,51 +316,6 @@
         <div class="field-row">
           <span class="field-label">BLOCKSIZE</span>
           <span class="field-value">{blocksizeLabel}</span>
-        </div>
-      </div>
-    </div>
-
-    <!-- ===== Spatial correction (post-convolution EQ) ===== -->
-    <div
-      class="device-card device-card--live"
-      class:controls-layout--dimmed={!masterEnabled}
-      inert={!masterEnabled || undefined}
-    >
-      <div class="card-header">
-        <span class="card-icon" aria-hidden="true">▦</span>
-        <h2 class="card-title">SPATIAL CORRECTION (POST)</h2>
-        <span class="pill {postEnabled ? 'pill--live' : 'pill--coming'}">
-          {postEnabled ? "ACTIVE" : "OFF"}
-        </span>
-      </div>
-      <div class="card-body">
-        <div class="control-row">
-          <span class="field-label">ENABLE POST EQ</span>
-          <span title="Apply a corrective EQ on the binaural (post-convolution) output">
-            <Switch
-              checked={postEnabled}
-              disabled={!masterEnabled}
-              onCheckedChange={onPostToggle}
-              ariaLabel="Enable spatial correction post EQ"
-            />
-          </span>
-        </div>
-        {#if postEnabled}
-          <div class="control-row control-row--eq">
-            <EqEditor
-              bands={postEqBands}
-              selectedIndex={postSelected}
-              onBandChange={onPostBandChange}
-              onSelect={(i) => (postSelected = i)}
-              onFlush={onPostBandChange}
-            />
-          </div>
-        {/if}
-        <div class="field-row">
-          <span class="field-label--hint">
-            A single corrective EQ applied after HRIR convolution on the binaural tail.
-            Use it to tame any tonal coloration the HRIR introduces.
-          </span>
         </div>
       </div>
     </div>
@@ -766,12 +696,6 @@
   .ss-btn--ghost {
     background: transparent;
     color: var(--ss-text-secondary);
-  }
-
-  /* EQ editor spans the full card width instead of the label/control split. */
-  .control-row--eq {
-    display: block;
-    padding: var(--ss-space-3) var(--ss-space-4);
   }
 
   .hrir-msg {

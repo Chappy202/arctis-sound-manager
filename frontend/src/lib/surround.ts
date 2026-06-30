@@ -5,9 +5,8 @@
  * SpatialPage.svelte is a thin view that delegates logic here.
  */
 
-import type { OutputDeviceSnapshot, HrirEntrySnapshot, EqBandSnapshot, FactoryProfileInfo } from "./ipc.js";
+import type { OutputDeviceSnapshot, HrirEntrySnapshot, FactoryProfileInfo } from "./ipc.js";
 import type { SelectOption } from "./ui/selectUtils.js";
-import { DEFAULT_BAND_FREQS, type Band } from "./eq.js";
 
 // ---------------------------------------------------------------------------
 // Hardware-sink Select helpers
@@ -118,37 +117,6 @@ export function groupHrirOptionsByTonality(entries: HrirEntrySnapshot[]): Select
       value: e.stem,
       label: e.group ? `${e.group} — ${e.display}` : e.display,
     }));
-}
-
-// ---------------------------------------------------------------------------
-// Post-convolution output EQ mapping (Task 12)
-// ---------------------------------------------------------------------------
-
-/** Map engine output_eq snapshot bands to editor Band[] (snake → camel). */
-export function outputEqToBands(snap: EqBandSnapshot[]): Band[] {
-  return snap.map((b) => ({ kind: b.kind as Band["kind"], freqHz: b.freq_hz, q: b.q, gainDb: b.gain_db }));
-}
-
-/** Inverse of outputEqToBands: editor Band[] → engine output_eq snapshot bands. */
-export function bandsToOutputEq(bands: Band[]): EqBandSnapshot[] {
-  return bands.map((b) => ({ kind: b.kind, freq_hz: b.freqHz, q: b.q, gain_db: b.gainDb }));
-}
-
-/**
- * Seed a flat 10-band output-EQ curve at the canonical EQ frequencies, matching
- * the engine's EqModel::default_10band() (eq.rs) exactly: band 0 is a low-shelf
- * (31 Hz), band 9 a high-shelf (16 kHz), and the middle eight peaking — so
- * bass/treble adjustments move real energy at the extremes. All bands gain 0 dB,
- * Q 1.0 (the engine default).
- * Used when the "Spatial correction (post)" toggle is switched on so the editor
- * has manipulable bands rather than an empty curve.
- */
-export function flatOutputEq(): EqBandSnapshot[] {
-  const last = DEFAULT_BAND_FREQS.length - 1;
-  return DEFAULT_BAND_FREQS.map((freq, i) => {
-    const kind: Band["kind"] = i === 0 ? "lowshelf" : i === last ? "highshelf" : "peaking";
-    return { kind, freq_hz: freq, q: 1, gain_db: 0 };
-  });
 }
 
 // ---------------------------------------------------------------------------

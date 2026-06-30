@@ -7,8 +7,8 @@
 
 import { describe, it, expect } from "vitest";
 import { hrirDisplayName, channelChecked, toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink } from "./surround.js";
-import { groupHrirOptionsByTonality, outputEqToBands, bandsToOutputEq, factoryProfileLabel, flatOutputEq, formatBlocksize } from "./surround.js";
-import type { OutputDeviceSnapshot, HrirEntrySnapshot, EqBandSnapshot, FactoryProfileInfo } from "./ipc.js";
+import { groupHrirOptionsByTonality, factoryProfileLabel, formatBlocksize } from "./surround.js";
+import type { OutputDeviceSnapshot, HrirEntrySnapshot, FactoryProfileInfo } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
 // hrirDisplayName
@@ -238,15 +238,6 @@ describe("groupHrirOptionsByTonality", () => {
   });
 });
 
-describe("outputEqToBands / bandsToOutputEq round-trip", () => {
-  const snap: EqBandSnapshot[] = [{ kind: "peaking", freq_hz: 250, q: 1, gain_db: 3 }];
-  it("maps snake_case to camelCase and back", () => {
-    const bands = outputEqToBands(snap);
-    expect(bands[0]).toEqual({ kind: "peaking", freqHz: 250, q: 1, gainDb: 3 });
-    expect(bandsToOutputEq(bands)).toEqual(snap);
-  });
-});
-
 describe("factoryProfileLabel", () => {
   it("shows name and hrir", () => {
     const info: FactoryProfileInfo = { name: "DayZ", hrir: "04-gsx-sennheiser-gsx", mode: "hrir71" };
@@ -255,23 +246,6 @@ describe("factoryProfileLabel", () => {
   it("shows just the name when hrir is null", () => {
     const info: FactoryProfileInfo = { name: "Plain", hrir: null, mode: "stereo_bypass" };
     expect(factoryProfileLabel(info)).toBe("Plain");
-  });
-});
-
-describe("flatOutputEq", () => {
-  it("seeds a flat 10-band curve with shelves at the extremes (matches engine default_10band)", () => {
-    const bands = flatOutputEq();
-    expect(bands).toHaveLength(10);
-    // Band 0 = low-shelf, band 9 = high-shelf, the middle eight = peaking.
-    expect(bands[0].kind).toBe("lowshelf");
-    expect(bands[9].kind).toBe("highshelf");
-    expect(bands.slice(1, 9).every((b) => b.kind === "peaking")).toBe(true);
-    // All bands flat (gain 0 dB).
-    expect(bands.every((b) => b.gain_db === 0)).toBe(true);
-    expect(bands.map((b) => b.freq_hz)).toEqual([31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]);
-  });
-  it("round-trips through outputEqToBands", () => {
-    expect(bandsToOutputEq(outputEqToBands(flatOutputEq()))).toEqual(flatOutputEq());
   });
 });
 
