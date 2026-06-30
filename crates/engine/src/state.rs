@@ -157,6 +157,11 @@ pub struct SurroundSnapshot {
     /// `None` = not yet probed. Old engine versions omit this field.
     #[serde(default)]
     pub negotiated_channels: Option<u8>,
+    /// Whether the negotiated surround input has a rear/side channel (true 7.1/5.1)
+    /// vs only stereo. `None` = no probe / no source feeding a surround channel.
+    /// Old engine versions omit this field.
+    #[serde(default)]
+    pub negotiated_surround: Option<bool>,
     /// Pinned HRIR stem that was requested but not installed (a fallback is in use).
     /// `None` = the pinned/selected HRIR resolved normally. UI shows an import prompt when set.
     #[serde(default)]

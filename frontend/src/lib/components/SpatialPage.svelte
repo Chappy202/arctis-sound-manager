@@ -42,6 +42,7 @@
     groupHrirOptionsByTonality,
     factoryProfileLabel,
     formatBlocksize,
+    surroundInputStatus,
   } from "../surround.js";
   import Switch from "../ui/Switch.svelte";
   import Select from "../ui/Select.svelte";
@@ -61,6 +62,9 @@
   // resolved mode after fallback; blocksize null → "auto" (PipeWire default).
   const effectiveMode     = $derived(surround?.effective_mode ?? surround?.mode ?? "—");
   const blocksizeLabel    = $derived(formatBlocksize(surround?.blocksize));
+  const inputStatus       = $derived(
+    surroundInputStatus(surround?.negotiated_channels, surround?.negotiated_surround),
+  );
   const availableHrirs    = $derived(surround?.available_hrirs ?? []);
   const availableHrirEntries = $derived(surround?.available_hrir_entries ?? []);
   const activeChannels    = $derived(surround?.channels ?? []);
@@ -317,6 +321,12 @@
           <span class="field-label">BLOCKSIZE</span>
           <span class="field-value">{blocksizeLabel}</span>
         </div>
+        {#if masterEnabled}
+          <div class="field-row">
+            <span class="field-label">INPUT</span>
+            <span class="field-value input-status input-status--{inputStatus.tone}">{inputStatus.text}</span>
+          </div>
+        {/if}
       </div>
     </div>
 
@@ -618,6 +628,10 @@
     color: var(--ss-text-primary);
     text-transform: none;
   }
+
+  .input-status--ok { color: var(--ss-accent); }
+  .input-status--warn { color: var(--ss-warning); }
+  .input-status--muted { color: var(--ss-text-tertiary); }
 
   .field-label--hint {
     font-size: var(--ss-type-caption-size);

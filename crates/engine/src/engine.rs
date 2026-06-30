@@ -1,9 +1,9 @@
 use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
-    move_stream_argv, parse_node_volume, query_pw_version, supports_builtin_noisegate, AppMatch,
-    AudioBackend, ChannelManager, CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe,
-    RouteRule, Router, StageKind, SurroundBackend, DEEPFILTER_PLUGIN_BASENAME,
-    RNNOISE_PLUGIN_BASENAME,
+    move_stream_argv, parse_app_streams, parse_node_volume, query_pw_version,
+    richest_surround_input, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
+    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
+    SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig, SurroundMode};
 use arctis_domain::{
@@ -610,6 +610,21 @@ impl<R: CommandRunner> Engine<R> {
                     (hrirs, entries)
                 })
                 .unwrap_or_default();
+            // Probe the negotiated input layout of whatever app feeds a surround
+            // channel (reuses the cached pw-dump; read-only). Richest source wins.
+            let surround_sinks: Vec<String> = p
+                .channels
+                .iter()
+                .filter(|c| sc.channels.iter().any(|id| id == &c.id))
+                .map(|c| c.node_name.clone())
+                .collect();
+            let neg = parse_app_streams(&pw_dump_json)
+                .ok()
+                .and_then(|streams| richest_surround_input(&streams, &surround_sinks));
+            let (negotiated_channels, negotiated_surround) = match &neg {
+                Some(si) => (Some(si.channels), Some(si.is_true_surround)),
+                None => (None, None),
+            };
             crate::state::SurroundSnapshot {
                 enabled: sc.enabled,
                 hrir: sc.hrir.clone(),
@@ -619,7 +634,8 @@ impl<R: CommandRunner> Engine<R> {
                 hw_sink: sc.hw_sink.clone(),
                 mode: surround_mode_str(sc.mode).to_string(),
                 effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
-                negotiated_channels: None,
+                negotiated_channels,
+                negotiated_surround,
                 hrir_missing: surround_hrir_missing,
                 blocksize: sc.blocksize,
             }
@@ -8855,5 +8871,43 @@ mod tests {
         let _ = std::fs::remove_file(&conf_path);
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn state_reports_negotiated_surround_input_for_game_channel() {
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround.enabled = true;
+        cfg.profiles[0].surround.channels = vec!["game".into()];
+
+        // DayZ 7.1 stream linked to the Arctis_Game sink.
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "DayZ", "application.process.binary": "DayZ" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } }
+        ]"#;
+        let runner = MockRunner::new().with_output(0, dump, "");
+        let mut engine = Engine::new(runner, cfg);
+        let st = engine.state();
+        assert_eq!(st.surround.negotiated_channels, Some(8));
+        assert_eq!(st.surround.negotiated_surround, Some(true));
+    }
+
+    #[test]
+    fn state_reports_none_surround_input_when_no_game_stream() {
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].surround.enabled = true;
+        cfg.profiles[0].surround.channels = vec!["game".into()];
+        // pw-dump with no app streams.
+        let runner = MockRunner::new().with_output(0, "[]", "");
+        let mut engine = Engine::new(runner, cfg);
+        let st = engine.state();
+        assert_eq!(st.surround.negotiated_channels, None);
+        assert_eq!(st.surround.negotiated_surround, None);
     }
 }

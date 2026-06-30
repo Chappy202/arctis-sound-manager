@@ -18,6 +18,10 @@ pub struct ParsedStream {
     pub icon_name: Option<String>,
     pub media_name: Option<String>,
     pub sink_node_name: Option<String>,
+    /// Negotiated channel count from the node's format, if known.
+    pub channels: Option<u8>,
+    /// Negotiated channel position map (e.g. ["FL","FR","FC",…]); empty if unknown.
+    pub positions: Vec<String>,
 }
 
 /// Always-on system/infrastructure streams that should never appear in the app
@@ -66,6 +70,39 @@ fn resolve_app_name(app_name: &str, binary: &str, media_name: Option<&str>) -> S
     app_name.to_string()
 }
 
+/// Read a node's negotiated audio format from its `info` object: channel count
+/// and channel position map. Count precedence: `props["audio.channels"]`
+/// (number or numeric string) → `params.Format[0].channels`. Positions come
+/// from `params.Format[0].position`. Never panics.
+fn parse_node_format(info: &serde_json::Value) -> (Option<u8>, Vec<String>) {
+    let count = info
+        .get("props")
+        .and_then(|p| p.get("audio.channels"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+        })
+        .or_else(|| {
+            info.get("params")
+                .and_then(|p| p.get("Format"))
+                .and_then(|f| f.as_array())
+                .and_then(|a| a.first())
+                .and_then(|e| e.get("channels"))
+                .and_then(|c| c.as_u64())
+        })
+        .map(|c| c as u8);
+    let positions = info
+        .get("params")
+        .and_then(|p| p.get("Format"))
+        .and_then(|f| f.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| e.get("position"))
+        .and_then(|p| p.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    (count, positions)
+}
+
 /// Parse `pw-dump` JSON into the list of application output streams, each with
 /// its currently-linked sink `node.name` (resolved via Link objects).
 ///
@@ -105,7 +142,11 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
         if ty != "PipeWire:Interface:Node" {
             continue;
         }
-        let props = match obj.get("info").and_then(|i| i.get("props")) {
+        let info = match obj.get("info") {
+            Some(i) => i,
+            None => continue,
+        };
+        let props = match info.get("props") {
             Some(p) => p,
             None => continue,
         };
@@ -176,6 +217,7 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
         // Electron/Chromium apps report a generic application.name ("Chromium");
         // prefer the process binary so they show their real name (Discord, …).
         let app_name = resolve_app_name(&raw_app_name, &binary, media_name.as_deref());
+        let (channels, positions) = parse_node_format(info);
         streams.push(ParsedStream {
             id,
             binary,
@@ -184,6 +226,8 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
             icon_name,
             media_name,
             sink_node_name: None,
+            channels,
+            positions,
         });
     }
 
@@ -194,6 +238,53 @@ pub fn parse_app_streams(pw_dump_json: &str) -> Result<Vec<ParsedStream>, AudioE
         }
     }
     Ok(streams)
+}
+
+/// A negotiated surround input layout, classified for UI display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurroundInput {
+    pub channels: u8,
+    /// Human label by channel count: "Mono" | "Stereo" | "Quad" | "5.1" | "7.1" | "Multichannel".
+    pub label: &'static str,
+    /// True only when a rear/side channel (RL/RR/SL/SR) is present in the position map.
+    pub is_true_surround: bool,
+}
+
+/// Classify a negotiated `(channels, positions)` pair. `is_true_surround` is
+/// true only when a rear/side channel is present, so a padded layout carrying
+/// only front channels does not read as surround.
+pub fn classify_surround_input(channels: u8, positions: &[String]) -> SurroundInput {
+    let label = match channels {
+        1 => "Mono",
+        2 => "Stereo",
+        4 => "Quad",
+        6 => "5.1",
+        8 => "7.1",
+        _ => "Multichannel",
+    };
+    let is_true_surround = positions
+        .iter()
+        .any(|p| matches!(p.to_ascii_uppercase().as_str(), "RL" | "RR" | "SL" | "SR"));
+    SurroundInput { channels, label, is_true_surround }
+}
+
+/// Pick the richest (highest channel count) negotiated input among the app
+/// streams currently linked to one of `surround_sinks` (matched on
+/// `sink_node_name`). `None` when no such stream has a known channel count.
+pub fn richest_surround_input(
+    streams: &[ParsedStream],
+    surround_sinks: &[String],
+) -> Option<SurroundInput> {
+    streams
+        .iter()
+        .filter(|s| {
+            s.sink_node_name
+                .as_ref()
+                .is_some_and(|n| surround_sinks.iter().any(|x| x == n))
+        })
+        .filter_map(|s| s.channels.map(|c| (c, s)))
+        .max_by_key(|(c, s)| (*c, classify_surround_input(*c, &s.positions).is_true_surround))
+        .map(|(c, s)| classify_surround_input(c, &s.positions))
 }
 
 #[cfg(test)]
@@ -312,5 +403,157 @@ mod tests {
         assert!(!bins.iter().any(|b| b.contains(".output")),
             "filter-chain infra must be excluded: {bins:?}");
         assert!(bins.contains(&"firefox"), "real apps must remain: {bins:?}");
+    }
+
+    // Inline pw-dump: one DayZ stream (8ch 7.1) linked to the Arctis_Game sink.
+    const DAYZ_8CH: &str = r#"[
+      { "id": 50, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+      { "id": 51, "type": "PipeWire:Interface:Node",
+        "info": { "props": {
+            "media.class": "Stream/Output/Audio",
+            "application.name": "DayZ",
+            "application.process.binary": "DayZ" },
+          "params": { "Format": [ { "channels": 8,
+            "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+      { "id": 99, "type": "PipeWire:Interface:Link",
+        "info": { "output-node-id": 51, "input-node-id": 50 } }
+    ]"#;
+
+    #[test]
+    fn parses_negotiated_channels_and_positions_from_format() {
+        let streams = parse_app_streams(DAYZ_8CH).unwrap();
+        let dz = streams.iter().find(|s| s.binary == "DayZ").unwrap();
+        assert_eq!(dz.channels, Some(8));
+        assert!(dz.positions.contains(&"RL".to_string()));
+        assert_eq!(dz.sink_node_name.as_deref(), Some("Arctis_Game"));
+    }
+
+    #[test]
+    fn channels_from_audio_channels_prop_takes_precedence() {
+        // props.audio.channels as a numeric string; no params.Format.
+        let dump = r#"[
+          { "id": 1, "type": "PipeWire:Interface:Node",
+            "info": { "props": {
+                "media.class": "Stream/Output/Audio",
+                "application.name": "DayZ",
+                "application.process.binary": "DayZ",
+                "audio.channels": "2" } } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let dz = streams.iter().find(|s| s.binary == "DayZ").unwrap();
+        assert_eq!(dz.channels, Some(2));
+        assert!(dz.positions.is_empty());
+    }
+
+    #[test]
+    fn missing_format_yields_none_channels_and_empty_positions() {
+        let dump = r#"[
+          { "id": 1, "type": "PipeWire:Interface:Node",
+            "info": { "props": {
+                "media.class": "Stream/Output/Audio",
+                "application.name": "DayZ",
+                "application.process.binary": "DayZ" } } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let dz = streams.iter().find(|s| s.binary == "DayZ").unwrap();
+        assert_eq!(dz.channels, None);
+        assert!(dz.positions.is_empty());
+    }
+
+    #[test]
+    fn classify_true_surround_requires_rear_or_side_channel() {
+        let p71 = ["FL","FR","FC","LFE","RL","RR","SL","SR"].map(String::from);
+        let c = classify_surround_input(8, &p71);
+        assert_eq!(c.label, "7.1");
+        assert!(c.is_true_surround);
+
+        let p51 = ["FL","FR","FC","LFE","RL","RR"].map(String::from);
+        assert_eq!(classify_surround_input(6, &p51).label, "5.1");
+        assert!(classify_surround_input(6, &p51).is_true_surround);
+
+        // Padded 8ch with only front channels → NOT true surround.
+        let padded = ["FL","FR"].map(String::from);
+        let c = classify_surround_input(8, &padded);
+        assert_eq!(c.label, "7.1");
+        assert!(!c.is_true_surround);
+
+        let stereo = ["FL","FR"].map(String::from);
+        let c = classify_surround_input(2, &stereo);
+        assert_eq!(c.label, "Stereo");
+        assert!(!c.is_true_surround);
+
+        assert_eq!(classify_surround_input(1, &[]).label, "Mono");
+    }
+
+    #[test]
+    fn richest_input_picks_max_channels_on_surround_sink() {
+        // DayZ 7.1 on Arctis_Game + Discord stereo on Arctis_Game → richest = DayZ.
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "DayZ", "application.process.binary": "DayZ" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+          { "id": 52, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "Discord", "application.process.binary": "Discord" },
+              "params": { "Format": [ { "channels": 2, "position": ["FL","FR"] } ] } } },
+          { "id": 98, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 52, "input-node-id": 50 } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
+        assert_eq!(si.channels, 8);
+        assert!(si.is_true_surround);
+    }
+
+    #[test]
+    fn richest_input_tie_breaks_toward_true_surround() {
+        // TRUE-surround stream (full 7.1 positions) listed FIRST; padded 8ch listed LAST.
+        // Old max_by_key (last-wins) would pick the padded/false one → is_true_surround==false.
+        // The tie-break fix must pick the true-surround stream regardless of order.
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "GameA", "application.process.binary": "GameA" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+          { "id": 52, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "GameB", "application.process.binary": "GameB" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR"] } ] } } },
+          { "id": 98, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 52, "input-node-id": 50 } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
+        assert!(si.is_true_surround, "tie-break must favour true surround (padded was last → old code would pick it)");
+    }
+
+    #[test]
+    fn richest_input_none_when_no_stream_on_surround_sink() {
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Chat" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "DayZ", "application.process.binary": "DayZ" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR","FC","LFE","RL","RR","SL","SR"] } ] } } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        assert!(richest_surround_input(&streams, &["Arctis_Game".to_string()]).is_none());
     }
 }

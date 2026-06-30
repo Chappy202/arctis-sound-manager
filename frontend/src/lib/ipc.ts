@@ -94,6 +94,8 @@ export interface SurroundSnapshot {
   effective_mode?: string;
   /** Hardware-negotiated channel count from pw-dump probe, or null if not yet probed. */
   negotiated_channels?: number | null;
+  /** Whether the negotiated surround input has rear/side channels (true 7.1/5.1) vs stereo. null = no source. */
+  negotiated_surround?: boolean | null;
   /** Pinned HRIR stem requested but not installed (fallback in use); null/absent when OK. */
   hrir_missing?: string | null;
   /** Pinned convolver blocksize, or null/absent for PipeWire default. */
