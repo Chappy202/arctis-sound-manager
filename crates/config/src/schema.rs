@@ -310,12 +310,13 @@ pub struct RouteConfig {
 
 /// Selects how the virtual-surround stage processes the signal.
 /// `Default = Auto` — the engine picks the best available mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SurroundMode {
     /// Engine chooses the best available mode (default). Currently equivalent
     /// to HRIR 7.1 if a compatible HRIR file is present, otherwise falls back
     /// to stereo passthrough.
+    #[default]
     Auto,
     /// Force 7.1-channel HRIR convolution.
     Hrir71,
@@ -323,12 +324,6 @@ pub enum SurroundMode {
     Hrir51,
     /// Bypass the HRIR; output stereo with optional crossfeed blending.
     StereoBypass,
-}
-
-impl Default for SurroundMode {
-    fn default() -> Self {
-        SurroundMode::Auto
-    }
 }
 
 fn default_surround_channels() -> Vec<String> {
@@ -1758,6 +1753,7 @@ volume_db = -6.0
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // q: 0.7071 is a deliberate Butterworth Q literal, not 1/√2 by intent.
     fn mic_preset_round_trips_via_toml() {
         let p = MicPreset {
             name: "Less Nasal".into(),

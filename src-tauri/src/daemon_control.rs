@@ -537,7 +537,7 @@ mod tests {
         // systemctl --version default status 0 (available)
         start(&env, Path::new("/run/x.sock"), Path::new("/usr/bin/asm-cli"), Path::new("/home/x")).unwrap();
         let runs = env.runs.borrow();
-        assert!(runs.iter().any(|(p, a)| p == "systemctl" && a == &vec!["--user","start","arctis-sound-manager.service"]
+        assert!(runs.iter().any(|(p, a)| p == "systemctl" && a == &["--user","start","arctis-sound-manager.service"]
             .iter().map(|s| s.to_string()).collect::<Vec<_>>()));
         assert!(env.spawns.borrow().is_empty());
     }

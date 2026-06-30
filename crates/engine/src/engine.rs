@@ -6551,7 +6551,7 @@ mod tests {
         std::fs::write(profiles_dir.join(format!("{}.wav", convert::FALLBACK_HRIR_STEM)), b"").unwrap();
         let cfg = arctis_config::SurroundConfig { hrir: Some("04-gsx-sennheiser-gsx".into()), ..Default::default() };
         let (path, missing) = convert::resolve_hrir_path_or_fallback(&cfg, &base).expect("falls back");
-        assert!(path.ends_with(&format!("{}.wav", convert::FALLBACK_HRIR_STEM)));
+        assert!(path.ends_with(format!("{}.wav", convert::FALLBACK_HRIR_STEM)));
         assert_eq!(missing, Some("04-gsx-sennheiser-gsx".to_string()));
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -7636,7 +7636,7 @@ mod tests {
                 .runner
                 .calls
                 .iter()
-                .any(|c| c.get(0).map(|s| s.as_str()) == Some("pw-metadata")),
+                .any(|c| c.first().map(|s| s.as_str()) == Some("pw-metadata")),
             "pw-metadata must be called for live move"
         );
 
@@ -8068,8 +8068,8 @@ mod tests {
     /// The test uses `Engine::new(MockRunner::new(), cfg)` (empty queue).
     /// MockRunner returns (0,"","") for all calls — so the live rebuild path succeeds:
     ///   - ensure_pw_version(): pipewire --version → "" → version stays None (OK)
-    ///   - recreate(): remove() source_exists → "" → absent (skip destroy)
-    ///                 create() source_exists → "" → absent → write conf → spawn
+    ///   - recreate(): remove() source_exists → "" → absent (skip destroy);
+    ///     create() source_exists → "" → absent → write conf → spawn
     #[test]
     fn apply_mic_preset_overlays_and_preserves_enabled_and_hwmic() {
         let _l = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,5 +1,7 @@
 //! Read-only factory preset catalog. Channel EQ = oratory1990-measured Nova Pro Wireless
 //! curves; mic presets = verbatim Sonar voice presets. See the design spec for provenance.
+// q: 0.7071 throughout is a deliberate Butterworth Q literal; keep exact values (not 1/√2 from consts).
+#![allow(clippy::approx_constant)]
 use arctis_config::{EqBandConfig, EqPreset, MicCompressorStage, MicGainStage, MicGateStage,
     MicHighpassStage, MicPreset, MicSuppressionStage};
 

@@ -510,6 +510,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // q: 0.7071 is a deliberate Butterworth Q literal, not 1/√2 by intent.
     fn request_set_channel_eq_round_trips() {
         let req = Request::SetChannelEq {
             channel: "game".into(),
