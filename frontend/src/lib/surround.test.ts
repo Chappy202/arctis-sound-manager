@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import { hrirDisplayName, channelChecked, toggleChannel, buildSinkOptions, sinkSelectValue, sinkValueToHwSink } from "./surround.js";
 import { groupHrirOptionsByTonality, factoryProfileLabel, formatBlocksize } from "./surround.js";
+import { surroundInputStatus } from "./surround.js";
 import type { OutputDeviceSnapshot, HrirEntrySnapshot, FactoryProfileInfo } from "./ipc.js";
 
 // ---------------------------------------------------------------------------
@@ -257,5 +258,36 @@ describe("formatBlocksize", () => {
   it("shows the sample count for a pinned blocksize", () => {
     expect(formatBlocksize(128)).toBe("128");
     expect(formatBlocksize(0)).toBe("0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// surroundInputStatus
+// ---------------------------------------------------------------------------
+
+describe("surroundInputStatus", () => {
+  it("reports true surround as ok with the layout label", () => {
+    expect(surroundInputStatus(8, true)).toEqual({ text: "Input: 7.1 surround ✓", tone: "ok" });
+    expect(surroundInputStatus(6, true)).toEqual({ text: "Input: 5.1 surround ✓", tone: "ok" });
+  });
+  it("warns when the source is only stereo / has no rear channels", () => {
+    expect(surroundInputStatus(2, false)).toEqual({
+      text: "Input: Stereo — game not sending surround",
+      tone: "warn",
+    });
+    expect(surroundInputStatus(8, false)).toEqual({
+      text: "Input: Stereo — game not sending surround",
+      tone: "warn",
+    });
+  });
+  it("is muted when nothing is feeding a surround channel", () => {
+    expect(surroundInputStatus(null, null)).toEqual({
+      text: "Input: no surround source active",
+      tone: "muted",
+    });
+    expect(surroundInputStatus(undefined, undefined)).toEqual({
+      text: "Input: no surround source active",
+      tone: "muted",
+    });
   });
 });

@@ -139,3 +139,36 @@ export function factoryProfileLabel(info: FactoryProfileInfo): string {
 export function formatBlocksize(blocksize: number | null | undefined): string {
   return blocksize == null ? "auto" : String(blocksize);
 }
+
+// ---------------------------------------------------------------------------
+// Surround input indicator (true 7.1 vs stereo)
+// ---------------------------------------------------------------------------
+
+/** Map channel count to a layout label for the input banner. */
+function inputLayoutLabel(channels: number): string {
+  switch (channels) {
+    case 8: return "7.1";
+    case 6: return "5.1";
+    case 4: return "Quad";
+    default: return "Surround";
+  }
+}
+
+/**
+ * Status line for the Spatial page showing whether the game routed into a
+ * surround channel is actually sending surround (rear/side channels present)
+ * vs stereo. `channels`/`isTrueSurround` come from the engine snapshot's
+ * negotiated_channels / negotiated_surround.
+ */
+export function surroundInputStatus(
+  channels: number | null | undefined,
+  isTrueSurround: boolean | null | undefined,
+): { text: string; tone: "ok" | "warn" | "muted" } {
+  if (channels == null) {
+    return { text: "Input: no surround source active", tone: "muted" };
+  }
+  if (isTrueSurround) {
+    return { text: `Input: ${inputLayoutLabel(channels)} surround ✓`, tone: "ok" };
+  }
+  return { text: "Input: Stereo — game not sending surround", tone: "warn" };
+}
