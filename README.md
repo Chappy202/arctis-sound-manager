@@ -15,7 +15,9 @@ What works today:
 - Multi-channel software routing: Game/Chat/Media virtual PipeWire sinks
 - Per-channel parametric EQ (10 bands, live, no restart)
 - Channel volume (dB) and mute; per-channel output device pinning
-- Channel add/remove; route set/clear/list with live WirePlumber rules
+- Channel add/remove; route set/clear/list with live WirePlumber rules. Routes re-apply
+  automatically when an app's stream reappears (idle → resume) with the optional `pw-watcher`
+  build feature (see Build, step 7)
 - Profiles: list/show/switch/new/save/rename/delete/export/import; EQ presets
 - Mic DSP chain (Clean Mic virtual source): gain, highpass, suppression, compressor, gate, EQ
   — DeepFilterNet default suppressor; RNNoise fallback; all stages opt-in
@@ -172,6 +174,26 @@ cargo test --workspace
 
 Live-PipeWire and real-hardware tests are out of the default CI gate.
 
+#### Optional: the `pw-watcher` feature (auto re-apply routes on stream resume)
+
+By default a remembered route is applied to an app's current stream once. When the app goes
+idle PipeWire destroys that stream, so on resume it can fall back to the default sink. The
+optional **`pw-watcher`** feature runs a `pipewire-rs` registry listener on a dedicated thread
+that re-applies remembered routes by app binary whenever a stream (re)appears — so routes stick
+across idle/resume. It is **off by default** because it links libpipewire and needs extra build
+deps:
+
+```sh
+# Fedora / Nobara — bindgen (libspa-sys/pipewire-sys) needs the clang resource headers,
+# and pkg-config needs the PipeWire dev headers:
+sudo dnf install pipewire-devel clang
+
+cargo build -p arctis-cli --release --features pw-watcher
+```
+
+Then restart the daemon from this binary. Without the feature, routing still works on explicit
+moves; only the automatic re-apply-on-resume is inactive (it compiles to a no-op stub).
+
 ### 8. Start the daemon
 
 The daemon must be running before the GUI and before any command that writes to PipeWire or
@@ -256,6 +278,7 @@ cargo run -p arctis-cli -- surround hrir set 02-dh-dolby-headphone
 | libudev + C compiler | `sudo dnf install systemd-devel gcc` | `sudo apt install libudev-dev gcc` | `sudo pacman -S systemd-libs gcc` |
 | WebKitGTK (GUI) | `sudo dnf install webkit2gtk4.1-devel libsoup3-devel javascriptcoregtk4.1-devel openssl-devel` | `sudo apt install libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libssl-dev` | `sudo pacman -S webkit2gtk-4.1` |
 | PipeWire + WirePlumber | `sudo dnf install pipewire wireplumber pipewire-utils` | `sudo apt install pipewire wireplumber pipewire-bin` | `sudo pacman -S pipewire wireplumber` |
+| `pw-watcher` feature (optional, build-time) | `sudo dnf install pipewire-devel clang` | `sudo apt install libpipewire-0.3-dev clang` | `sudo pacman -S pipewire clang` |
 | DeepFilterNet | `sudo dnf copr enable mavit/DeepFilterNet && sudo dnf install deep-filter-ladspa` | Download `.so` from [github.com/Rikorose/DeepFilterNet/releases](https://github.com/Rikorose/DeepFilterNet/releases) | AUR: `yay -S libdeep_filter_ladspa-bin` |
 | RNNoise | `sudo dnf copr enable lkiesow/noise-suppression-for-voice && sudo dnf install ladspa-realtime-noise-suppression-plugin` | `sudo apt install noise-suppression-for-voice` | AUR: `yay -S noise-suppression-for-voice` |
 | swh-plugins | `sudo dnf install ladspa-swh-plugins` | `sudo apt install swh-plugins` | `sudo pacman -S swh-plugins` |

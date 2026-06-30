@@ -9,8 +9,10 @@ Nova Pro Wireless**) with a SteelSeries Sonar-style experience: per-app audio ro
 parametric EQ, per-profile HRIR surround, and headset hardware control. It replaces a community Python
 app the owner found unmaintainable.
 
-**Status:** greenfield, in setup. **Build order is engine-first (headless)** — build and test the Rust
-core + `asm-cli` before any UI.
+**Status:** functional (v0.2.1). Engine/daemon, the `asm-cli` CLI, and the Tauri v2 GUI all work —
+per-app routing, per-channel EQ, mic DSP chain, virtual surround/HRIR, and device reads are live.
+Device **writes** remain gated until each control is validated on real hardware. Build order is still
+engine-first (headless): build/test the Rust core + `asm-cli` before the UI.
 
 ## Authoritative documents (read these first)
 
@@ -24,7 +26,8 @@ core + `asm-cli` before any UI.
 - **Rust** Cargo workspace (engine) + **Tauri v2** web UI. Audio via **PipeWire** (`pipewire-rs` on a
   dedicated thread; `pw-metadata`/`wpctl` as subprocess for discrete actions). HID via `hidraw` using
   the `hidapi` **C backend** (`linux-static-hidraw`); the pure-Rust `linux-native` backend does NOT
-  enumerate the Nova Pro Wireless. Build deps: `libudev` (`systemd-devel`) + a C toolchain (`gcc`/`clang`).
+  enumerate the Nova Pro Wireless. Build deps: `libudev` (`systemd-devel`) + a C toolchain (`gcc`); the
+  optional `pw-watcher` feature (live route re-apply) additionally needs `pipewire-devel` + `clang`.
 - Crates: `domain`, `device`, `audio`, `config`, `engine`, `cli`, (future `daemon`); `src-tauri` + `ui`.
 - Dependency rule: `tauri` only in `src-tauri`; `engine` and below are UI-agnostic. See ARCHITECTURE §2.
 
@@ -44,12 +47,16 @@ core + `asm-cli` before any UI.
 
 ## Build / run / test
 
-Not yet scaffolded. Once the workspace exists:
-- `cargo build --workspace` / `cargo test --workspace`
-- `cargo run -p cli -- <cmd>` — drive the engine headless
-- Live-PipeWire integration tests are gated behind a flag; real-hardware tests live in `cli` and are out
-  of the default CI gate.
-(Update this section as commands become real — do not leave stale instructions.)
+- `cargo build --workspace` / `cargo test --workspace` (prefer `-- --test-threads=1`: a shared
+  `/tmp` surround-conf test can race under parallelism).
+- `cargo run -p arctis-cli -- <cmd>` — drive the engine headless (installed binary: `asm-cli`).
+- GUI: `pnpm gui` from the repo root, daemon running. `src-tauri` needs the asm-cli sidecar staged
+  first: `./scripts/stage-sidecar.sh`.
+- Optional `pw-watcher` feature: `cargo build -p arctis-cli --features pw-watcher` (needs
+  `pipewire-devel` + `clang`; off by default → no-op stub; re-applies routes on stream resume).
+- Live-PipeWire/real-hardware tests are out of the default CI gate. CI runs clippy `-D warnings` +
+  `cargo test`; **rustfmt is advisory/non-blocking** (the codebase uses a deliberately compact style —
+  no rustfmt.toml preserves it, so it is not enforced).
 
 ## Working conventions
 

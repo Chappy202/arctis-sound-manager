@@ -51,3 +51,28 @@ there. Follow-up: write to `~/.config/arctis-sound-manager/` or use `tempfile::N
 stable rename. Also: the conf filename doubles the name (`arctis_eq.arctis_eq.conf`) when node_name ==
 the literal prefix — cosmetic. And `AudioError::Spawn{program:"write-conf"}` is reused for file-I/O
 errors; add a dedicated `AudioError::Io` variant in a later pass. Revisit in the engine-orchestrator plan.
+
+## KI-3 — Route re-apply on stream resume requires the `pw-watcher` build feature (OPEN, by design)
+
+Remembered routes are applied to an app's current stream on an explicit move. When the app goes idle
+PipeWire destroys that stream, so on resume it can fall back to the default sink. The fix — a
+`pipewire-rs` registry watcher that re-applies routes by app binary on stream (re)appearance — is
+behind the **off-by-default `pw-watcher` Cargo feature** (`crates/cli`), because the `pipewire` crate
+links libpipewire and needs `pipewire-devel` + `clang` at build time (libspa-sys bindgen). Without the
+feature, `RouteWatcher` compiles to a no-op stub and routes do not auto-recover on resume. Build with
+`cargo build -p arctis-cli --features pw-watcher` to enable it. The pure route-lookup logic is always
+compiled and unit-tested; the live registry loop is owner-verified (it needs a real PipeWire session).
+
+## KI-4 — Surround render test races on a shared `/tmp` conf path under parallel `cargo test` (LOW, OPEN)
+
+One surround-backend test (`apply_surround_game_eq_*_channel_sink_flat`) and a couple of siblings write
+to the shared `/tmp/arctis_arctis_surround.conf` path, so they can intermittently fail when `cargo test`
+runs them in parallel. They pass deterministically with `cargo test -- --test-threads=1` or in
+isolation. Follow-up: give each test a unique temp conf path (per KI-2's tempfile direction).
+
+## KI-5 — CI rustfmt is advisory, not enforced (OPEN, by design)
+
+The codebase uses a deliberately dense/compact style. `cargo fmt --check` would reformat ~22 files
+(191 hunks at minimum), and no stable `rustfmt.toml` preserves the style (every config tested increased
+churn). The CI `cargo fmt --all -- --check` step is therefore `continue-on-error: true` — it still runs
+for visibility but does not gate merges. Run `cargo fmt` deliberately if/when adopting rustfmt wholesale.
