@@ -122,6 +122,7 @@ pub fn run() {
                                 if let Some(engine_state) = resp.state {
                                     if last_state.as_ref() != Some(&engine_state) {
                                         let _ = handle.emit("state-changed", &engine_state);
+                                        tray::apply_view(&handle, &tray::tray_view(&engine_state));
                                         last_state = Some(engine_state);
                                     }
                                 }

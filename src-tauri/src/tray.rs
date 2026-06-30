@@ -198,6 +198,45 @@ pub fn parse_menu_id(id: &str) -> MenuAction {
     }
 }
 
+/// Push a view-model onto the live tray: mute check, profile submenu (rebuilt
+/// only when the profile set changes), active-profile check, and tooltip.
+pub fn apply_view(app: &AppHandle, view: &TrayView) {
+    let Some(handles) = app.try_state::<TrayHandles>() else { return };
+    let _ = handles.mute.set_checked(view.mute_checked);
+    let _ = handles.tray.set_tooltip(Some(&view.tooltip));
+
+    // Rebuild the profile submenu items only when the set of names changed.
+    let mut last = handles.last_profiles.lock().unwrap();
+    if *last != view.profiles {
+        // Remove existing items, then append a CheckMenuItem per profile.
+        if let Ok(items) = handles.profile.items() {
+            for it in items {
+                let _ = handles.profile.remove(&it);
+            }
+        }
+        for name in &view.profiles {
+            if let Ok(item) = CheckMenuItemBuilder::with_id(profile_item_id(name), name)
+                .checked(*name == view.active_profile)
+                .build(app)
+            {
+                let _ = handles.profile.append(&item);
+            }
+        }
+        *last = view.profiles.clone();
+    } else {
+        // Profile set unchanged — just refresh which item is checked.
+        if let Ok(items) = handles.profile.items() {
+            for it in items {
+                if let Some(check) = it.as_check_menuitem() {
+                    if let MenuAction::SwitchProfile(name) = parse_menu_id(check.id().as_ref()) {
+                        let _ = check.set_checked(name == view.active_profile);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// True when the process was launched with `--hidden` (autostart-into-tray).
 pub fn should_start_hidden(args: &[String]) -> bool {
     args.iter().any(|a| a == "--hidden")
