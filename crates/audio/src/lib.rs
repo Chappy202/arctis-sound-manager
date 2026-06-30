@@ -45,7 +45,9 @@ pub use sinks::{
     parse_default_sink_name, parse_node_volume, parse_output_sinks, parse_stream_channels,
     OutputSink,
 };
-pub use streams::{parse_app_streams, ParsedStream};
+pub use streams::{
+    classify_surround_input, parse_app_streams, richest_surround_input, ParsedStream, SurroundInput,
+};
 pub use surround::{
     render_surround_conf, render_surround_conf_ex, SurroundBackend, SurroundRender, SurroundSpec,
 };
