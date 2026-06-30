@@ -441,10 +441,18 @@ where
         };
         let resp_str = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
-        writeln!(writer, "{resp_str}")?;
+        let write_res = writeln!(writer, "{resp_str}");
         if is_shutdown {
+            // Honor shutdown REGARDLESS of the response-write result. The signal
+            // watcher sends `{"cmd":"shutdown"}` and closes the socket without
+            // reading the reply, so this write often fails with EPIPE. If that
+            // error were propagated, the accept loop would treat it as a transient
+            // "connection error (continuing)", loop back into a blocking accept(),
+            // and hang until systemd's TimeoutStopFailureMode=abort SIGABRTs the
+            // daemon (intermittent crash-on-stop). The reply is best-effort.
             return Ok(true);
         }
+        write_res?;
     }
 }
 
@@ -1167,6 +1175,34 @@ mod tests {
         assert!(
             result.is_err(),
             "I/O error must propagate out of serve_connection"
+        );
+    }
+
+    #[test]
+    fn serve_connection_shutdown_honored_when_response_write_fails() {
+        // Reproduces the SIGABRT-on-shutdown bug: the signal-watcher sends the
+        // shutdown command, then closes the socket WITHOUT reading the reply, so
+        // the daemon's response write hits EPIPE. A failed response write must NOT
+        // discard the shutdown signal — otherwise the accept loop never breaks, it
+        // blocks in accept() forever, and systemd SIGABRTs the hung daemon on stop.
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "EPIPE"))
+            }
+        }
+        let input = b"{\"cmd\":\"shutdown\"}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input.as_ref()));
+        let mut output = BrokenPipeWriter;
+        let mut engine = make_engine();
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+        assert!(
+            matches!(result, Ok(true)),
+            "shutdown must be honored even when the response write fails (EPIPE): got {result:?}"
         );
     }
 
