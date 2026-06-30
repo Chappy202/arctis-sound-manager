@@ -193,8 +193,8 @@ mod live {
     /// message arrives. All callbacks are written to never panic (G7).
     fn run_loop(receiver: pw::channel::Receiver<Terminate>) -> Result<(), pw::Error> {
         pw::init();
-        let mainloop = pw::MainLoop::new(None)?;
-        let context = pw::Context::new(&mainloop)?;
+        let mainloop = pw::main_loop::MainLoop::new(None)?;
+        let context = pw::context::Context::new(&mainloop)?;
         let core = context.connect(None)?;
         let registry = core.get_registry()?;
 
