@@ -206,12 +206,13 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 Err(e) => Response::err(e.to_string()),
             }
         }
-        Request::SetChannelVolume { channel, volume_pct } => {
-            match engine.set_channel_volume(&channel, volume_pct) {
-                Ok(()) => Response::ok_with_state(engine.state()),
-                Err(e) => Response::err(e.to_string()),
-            }
-        }
+        Request::SetChannelVolume {
+            channel,
+            volume_pct,
+        } => match engine.set_channel_volume(&channel, volume_pct) {
+            Ok(()) => Response::ok_with_state(engine.state()),
+            Err(e) => Response::err(e.to_string()),
+        },
         Request::SetChannelMute { channel, muted } => {
             match engine.set_channel_mute(&channel, muted) {
                 Ok(()) => Response::ok_with_state(engine.state()),
@@ -436,9 +437,7 @@ where
             handle_request(engine, req)
         })) {
             Ok(r) => r,
-            Err(payload) => {
-                Response::err(format!("internal error: {}", panic_msg(&*payload)))
-            }
+            Err(payload) => Response::err(format!("internal error: {}", panic_msg(&*payload))),
         };
         let resp_str = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
@@ -680,7 +679,8 @@ pub fn run_daemon() -> Result<(), EngineError> {
     if path.exists() {
         if socket_is_live(&path) {
             return Err(EngineError::Ipc(format!(
-                "daemon already running (socket {} is live)", path.display()
+                "daemon already running (socket {} is live)",
+                path.display()
             )));
         }
         // Stale socket from a previous crash — remove and rebind.
@@ -700,7 +700,10 @@ pub fn run_daemon() -> Result<(), EngineError> {
     match arctis_engine::convert::hrir_base_dir() {
         Ok(base) => match arctis_engine::hrir_import::ensure_bundled(&base) {
             Ok(stems) if !stems.is_empty() => {
-                eprintln!("daemon: installed bundled HRIR profiles: {}", stems.join(", "));
+                eprintln!(
+                    "daemon: installed bundled HRIR profiles: {}",
+                    stems.join(", ")
+                );
             }
             Ok(_) => {}
             Err(e) => eprintln!("daemon: bundled HRIR install skipped: {e}"),
@@ -779,7 +782,10 @@ pub fn run_daemon() -> Result<(), EngineError> {
                 // KNOB (station_volume) from shared device state in one lock take.
                 let (mix_opt, station_opt): (Option<(i64, i64)>, Option<i64>) = {
                     if let Ok(g) = device_shared_for_dial.lock() {
-                        let media = g.fields.get("media_mix").and_then(|s| s.parse::<i64>().ok());
+                        let media = g
+                            .fields
+                            .get("media_mix")
+                            .and_then(|s| s.parse::<i64>().ok());
                         let chat = g.fields.get("chat_mix").and_then(|s| s.parse::<i64>().ok());
                         let station = g
                             .fields
@@ -877,6 +883,15 @@ pub fn run_daemon() -> Result<(), EngineError> {
         })
         .map_err(|e| EngineError::Ipc(format!("failed to spawn signal watcher: {e}")))?;
 
+    // ── Route stream-watcher ────────────────────────────────────────────────
+    // Re-applies remembered per-app routes when an application output stream
+    // (re)appears on the PipeWire graph (e.g. an app resumes from idle with a
+    // new node id). Fully DECOUPLED: its own thread + its own PipeWire
+    // connection + RealRunner; it reads the persisted routes config directly and
+    // never touches the Engine, its mutex, or any HID/device state (G2). When
+    // the daemon is built without the `pw-watcher` feature this is a no-op stub.
+    let route_watcher = crate::route_watcher::RouteWatcher::start();
+
     // ── Accept loop ─────────────────────────────────────────────────────────
     // Bind the listener here (not via run_daemon_with_engine) so we can release
     // the engine lock between accept() calls, letting the dial-consumer thread
@@ -884,6 +899,10 @@ pub fn run_daemon() -> Result<(), EngineError> {
     let result = run_daemon_accept_loop(engine_arc.clone(), &path);
 
     // ── Teardown ────────────────────────────────────────────────────────────
+    // Stop the route watcher first: quit its MainLoop and join its thread so it
+    // never leaks past daemon exit (no-op when built without `pw-watcher`).
+    route_watcher.stop();
+
     // Signal the worker + dial threads to stop.
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -1660,7 +1679,12 @@ mod tests {
 
         let cfg = two_profile_config();
         let mut engine = Engine::new(MockRunner::new(), cfg);
-        let resp = handle_request(&mut engine, Request::SurroundSetBlocksize { blocksize: Some(128) });
+        let resp = handle_request(
+            &mut engine,
+            Request::SurroundSetBlocksize {
+                blocksize: Some(128),
+            },
+        );
         assert!(
             resp.ok,
             "SurroundSetBlocksize must return ok:true, got: {:?}",
@@ -2453,7 +2477,12 @@ mod tests {
         let cfg = two_profile_config();
         let mut engine = Engine::new(runner, cfg);
 
-        let resp = handle_request(&mut engine, Request::ChannelAdd { id: "stream".into() });
+        let resp = handle_request(
+            &mut engine,
+            Request::ChannelAdd {
+                id: "stream".into(),
+            },
+        );
         assert!(
             resp.ok,
             "channel-add must return ok:true, got: {:?}",
@@ -2629,7 +2658,12 @@ mod tests {
             .split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
             .collect();
-        assert_eq!(lines.len(), 2, "expected two response lines, got {}", lines.len());
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected two response lines, got {}",
+            lines.len()
+        );
 
         // Both responses must have ok:false (PanicRunner panics on every runner call,
         // including the pw-dump call that engine.state() makes since A2).
@@ -2657,12 +2691,11 @@ mod tests {
     #[test]
     fn socket_is_live_true_when_listener_bound() {
         // Create a unique temp socket path per test.
-        let tmp_path = std::env::temp_dir()
-            .join(format!("asm_sock_live_{}", std::process::id()));
+        let tmp_path = std::env::temp_dir().join(format!("asm_sock_live_{}", std::process::id()));
 
         // Bind a UnixListener at the temp path.
-        let _listener = std::os::unix::net::UnixListener::bind(&tmp_path)
-            .expect("failed to bind listener");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&tmp_path).expect("failed to bind listener");
 
         // Assert that socket_is_live returns true (listener is present).
         assert!(
@@ -2678,14 +2711,13 @@ mod tests {
     #[test]
     fn socket_is_live_false_when_stale() {
         // Create a unique temp socket path per test.
-        let tmp_path = std::env::temp_dir()
-            .join(format!("asm_sock_stale_{}", std::process::id()));
+        let tmp_path = std::env::temp_dir().join(format!("asm_sock_stale_{}", std::process::id()));
 
         // Bind a UnixListener, then drop it without removing the file.
         // std UnixListener does NOT unlink on drop, so the file remains.
         {
-            let _listener = std::os::unix::net::UnixListener::bind(&tmp_path)
-                .expect("failed to bind listener");
+            let _listener =
+                std::os::unix::net::UnixListener::bind(&tmp_path).expect("failed to bind listener");
             // Listener is dropped here, but the file persists.
         }
 
@@ -2702,8 +2734,7 @@ mod tests {
     #[test]
     fn socket_is_live_false_when_absent() {
         // Create a path that does not exist.
-        let tmp_path = std::env::temp_dir()
-            .join(format!("asm_sock_absent_{}", std::process::id()));
+        let tmp_path = std::env::temp_dir().join(format!("asm_sock_absent_{}", std::process::id()));
 
         // Ensure the path does not exist.
         let _ = std::fs::remove_file(&tmp_path);
@@ -2741,7 +2772,11 @@ mod tests {
             },
         );
 
-        assert!(resp.ok, "import from empty dir must return ok:true, got: {:?}", resp.error);
+        assert!(
+            resp.ok,
+            "import from empty dir must return ok:true, got: {:?}",
+            resp.error
+        );
         assert!(resp.state.is_some(), "response must include state");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2763,10 +2798,7 @@ mod tests {
             },
         );
 
-        assert!(
-            !resp.ok,
-            "import from missing dir must return ok:false"
-        );
+        assert!(!resp.ok, "import from missing dir must return ok:false");
         assert!(resp.error.is_some(), "error message must be present");
     }
 
@@ -2838,7 +2870,11 @@ mod tests {
                 template: "dayz".into(),
             },
         );
-        assert!(resp.ok, "lowercase 'dayz' must return ok:true, got: {:?}", resp.error);
+        assert!(
+            resp.ok,
+            "lowercase 'dayz' must return ok:true, got: {:?}",
+            resp.error
+        );
         let state = resp.state.expect("state must be present");
         assert_eq!(state.active_profile, "DayZ");
 

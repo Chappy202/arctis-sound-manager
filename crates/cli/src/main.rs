@@ -1,6 +1,7 @@
 mod coexist;
 mod daemon;
 mod dial;
+mod route_watcher;
 mod setup_udev;
 
 use arctis_audio::{
@@ -15,7 +16,11 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "asm-cli", version, about = "Arctis Sound Manager CLI (read-only probe)")]
+#[command(
+    name = "asm-cli",
+    version,
+    about = "Arctis Sound Manager CLI (read-only probe)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -101,9 +106,7 @@ enum Command {
         action: MasterAction,
     },
     /// ChatMix Game<->Chat balance (0=chat .. 9=game).
-    Chatmix {
-        position: i64,
-    },
+    Chatmix { position: i64 },
     /// System default-output channel (apps auto-land here).
     DefaultSink {
         #[command(subcommand)]
@@ -400,9 +403,7 @@ enum MicPresetAction {
     /// List all available mic presets.
     List,
     /// Apply a named mic preset.
-    Apply {
-        name: String,
-    },
+    Apply { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -483,9 +484,7 @@ enum MasterAction {
         pct: u8,
     },
     /// Mute or unmute the master output (`on` to mute, `off` to unmute).
-    Mute {
-        state: String,
-    },
+    Mute { state: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -797,11 +796,11 @@ fn dispatch_device(action: DeviceAction) -> ExitCode {
         DeviceAction::ChatmixEnable { validate } => {
             if !validate {
                 // Safety guard: never send the opcode without the explicit flag.
-                println!("ChatMix validation requires --validate to send the (owner-gated) opcode.");
-                println!("Run: asm-cli device chatmix-enable --validate");
                 println!(
-                    "This sends [0x06,0x49,0x01] once and watches for dial frames (~6 s)."
+                    "ChatMix validation requires --validate to send the (owner-gated) opcode."
                 );
+                println!("Run: asm-cli device chatmix-enable --validate");
+                println!("This sends [0x06,0x49,0x01] once and watches for dial frames (~6 s).");
                 return ExitCode::SUCCESS;
             }
             if !daemon::socket_path().exists() {
@@ -1342,31 +1341,29 @@ fn main() -> ExitCode {
         Command::Apply => dispatch_apply(),
         Command::SetupUdev { dry_run } => setup_udev::dispatch_setup_udev(&mut RealRunner, dry_run),
         Command::Streams { action } => match action {
-            StreamsAction::List => {
-                match daemon::send_request(&daemon::Request::ListStreams) {
-                    Ok(resp) if resp.ok => {
-                        let streams = resp.streams.unwrap_or_default();
-                        if streams.is_empty() {
-                            println!("no running app streams");
-                        } else {
-                            for s in &streams {
-                                let ch = s.current_channel.as_deref().unwrap_or("(unrouted)");
-                                let pin = if s.routed { " [pinned]" } else { "" };
-                                println!("{:>5}  {:<20} -> {}{}", s.id, s.app_name, ch, pin);
-                            }
+            StreamsAction::List => match daemon::send_request(&daemon::Request::ListStreams) {
+                Ok(resp) if resp.ok => {
+                    let streams = resp.streams.unwrap_or_default();
+                    if streams.is_empty() {
+                        println!("no running app streams");
+                    } else {
+                        for s in &streams {
+                            let ch = s.current_channel.as_deref().unwrap_or("(unrouted)");
+                            let pin = if s.routed { " [pinned]" } else { "" };
+                            println!("{:>5}  {:<20} -> {}{}", s.id, s.app_name, ch, pin);
                         }
-                        ExitCode::SUCCESS
                     }
-                    Ok(resp) => {
-                        eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
-                        ExitCode::FAILURE
-                    }
-                    Err(e) => {
-                        eprintln!("error sending request: {e}");
-                        ExitCode::FAILURE
-                    }
+                    ExitCode::SUCCESS
                 }
-            }
+                Ok(resp) => {
+                    eprintln!("error: {}", resp.error.unwrap_or_else(|| "unknown".into()));
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("error sending request: {e}");
+                    ExitCode::FAILURE
+                }
+            },
             StreamsAction::Move { stream, channel } => {
                 let req = daemon::Request::MoveStream {
                     stream: stream.clone(),
@@ -1390,7 +1387,9 @@ fn main() -> ExitCode {
         },
         Command::Master { action } => {
             let req = match action {
-                MasterAction::Volume { pct } => daemon::Request::SetMasterVolume { volume_pct: pct },
+                MasterAction::Volume { pct } => {
+                    daemon::Request::SetMasterVolume { volume_pct: pct }
+                }
                 MasterAction::Mute { state } => {
                     let muted = match state.as_str() {
                         "on" => true,
@@ -1410,9 +1409,9 @@ fn main() -> ExitCode {
         }
         Command::DefaultSink { action } => {
             let req = match action {
-                DefaultSinkAction::Set { channel } => {
-                    daemon::Request::SetDefaultSinkChannel { channel: Some(channel) }
-                }
+                DefaultSinkAction::Set { channel } => daemon::Request::SetDefaultSinkChannel {
+                    channel: Some(channel),
+                },
                 DefaultSinkAction::Clear => {
                     daemon::Request::SetDefaultSinkChannel { channel: None }
                 }
@@ -2467,8 +2466,7 @@ mod tests {
 
     #[test]
     fn channel_volume_set() {
-        let cmd =
-            parse(&["channel", "volume", "game", "75"]).expect("channel volume should parse");
+        let cmd = parse(&["channel", "volume", "game", "75"]).expect("channel volume should parse");
         match cmd {
             super::Command::Channel {
                 action: super::ChannelCmd::Volume { channel, pct },
@@ -2668,12 +2666,14 @@ mod tests {
 
     #[test]
     fn device_chatmix_enable_no_validate_parses() {
-        let cmd =
-            parse(&["device", "chatmix-enable"]).expect("device chatmix-enable should parse");
+        let cmd = parse(&["device", "chatmix-enable"]).expect("device chatmix-enable should parse");
         match cmd {
             super::Command::Device {
                 action: super::DeviceAction::ChatmixEnable { validate },
-            } => assert!(!validate, "validate must default to false without --validate"),
+            } => assert!(
+                !validate,
+                "validate must default to false without --validate"
+            ),
             other => panic!("unexpected: {other:?}"),
         }
     }

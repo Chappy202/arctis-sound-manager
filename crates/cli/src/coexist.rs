@@ -262,7 +262,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(
-            report.legacy_services.contains(&"arctis-manager.service".to_string()),
+            report
+                .legacy_services
+                .contains(&"arctis-manager.service".to_string()),
             "arctis-manager.service must appear in legacy_services when unit file exists"
         );
         assert!(

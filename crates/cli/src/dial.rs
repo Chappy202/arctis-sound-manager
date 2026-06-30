@@ -256,8 +256,7 @@ mod tests {
     fn apply_dial_balance_graceful_when_channels_absent() {
         // remove_channel calls save_config → needs a real config dir.
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp =
-            std::env::temp_dir().join(format!("asm_dial_absent_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("asm_dial_absent_{}", std::process::id()));
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         // Build config with only "media" channel (no game/chat).
@@ -275,9 +274,15 @@ mod tests {
 
         let mut engine = Engine::new(arctis_audio::MockRunner::new(), cfg);
         // Remove any standard channels seeded by Engine::new.
-        engine.remove_channel("game").expect("remove game must succeed");
-        engine.remove_channel("chat").expect("remove chat must succeed");
-        engine.remove_channel("aux").expect("remove aux must succeed");
+        engine
+            .remove_channel("game")
+            .expect("remove game must succeed");
+        engine
+            .remove_channel("chat")
+            .expect("remove chat must succeed");
+        engine
+            .remove_channel("aux")
+            .expect("remove aux must succeed");
 
         let mut last: Option<(i64, i64)> = None;
 
