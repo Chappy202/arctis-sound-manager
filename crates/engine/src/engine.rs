@@ -2557,7 +2557,7 @@ impl<R: CommandRunner> Engine<R> {
         profile: &arctis_config::Profile,
     ) -> Result<(), crate::error::EngineError> {
         let sc = &profile.surround;
-        let spec = convert::surround_spec(sc);
+        let mut spec = convert::surround_spec(sc);
 
         if !sc.enabled {
             self.surround_hrir_missing = None;
@@ -2625,6 +2625,15 @@ impl<R: CommandRunner> Engine<R> {
                 }
             },
         };
+
+        // Default the convolver's OUTPUT sink to the detected headset when hw_sink is
+        // unset. Profiles store hw_sink=None meaning "auto → headset"; without this the
+        // convolver's playback node has no target.object and PipeWire routes the
+        // HRIR-processed audio to the SYSTEM DEFAULT sink (e.g. onboard speakers) instead
+        // of the headphones. Mirrors reconcile's overlay_default_output for channels.
+        if spec.hw_sink.is_none() {
+            spec.hw_sink = self.detect_headset_sink();
+        }
 
         // Recreate surround sink — pick the variant that matches the effective mode.
         {
@@ -6777,6 +6786,11 @@ mod tests {
         }
         // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
         r = r.with_output(0, &ls_surround_absent, "");
+        // Phase 6 start: apply_surround re-detects the headset to default the convolver
+        // output sink (hw_sink unset) → pw-metadata 0 + pw-dump (no SteelSeries → None,
+        // so the convolver output is left untargeted in this fixture).
+        r = r.with_output(0, "", ""); // apply_surround detect: pw-metadata 0
+        r = r.with_output(0, "[]", ""); // apply_surround detect: pw-dump []
         // Phase 6 (surround enabled, absent) — recreate_ex():
         //   remove: source_exists() → 1 ls (absent, no destroy needed)
         //   spawn_conf: writes conf + spawns directly (no second runner call)
@@ -8346,6 +8360,63 @@ mod tests {
         assert!(
             !conf.contains("\"eq_l_0\""),
             "no EQ tail expected when game channel has no custom EQ, got:\n{conf}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("HOME");
+    }
+
+    /// The HRIR convolver's OUTPUT must reach the headset. When `surround.hw_sink` is
+    /// unset (the common case — profiles store None = "auto → headset"), apply_surround
+    /// must default the convolver output to the DETECTED headset sink, mirroring how
+    /// reconcile defaults each channel's output via `overlay_default_output`. Otherwise
+    /// the convolver output falls to the system default sink (e.g. onboard speakers) and
+    /// the HRIR-processed audio never reaches the headphones.
+    #[test]
+    fn apply_surround_defaults_convolver_output_to_detected_headset_when_hw_sink_unset() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surround_hwsink_default");
+        let profiles_dir = tmp.join(".local/share/pipewire/hrir_hesuvi/profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(profiles_dir.join("test-hrir.wav"), b"").unwrap();
+        std::env::set_var("HOME", &tmp);
+
+        // Runner: detect_headset_sink probes first (pw-metadata 0, then a pw-dump of real
+        // sinks that includes the SteelSeries Arctis hw sink), then the recreate/set_output
+        // existence checks (absent → spawn).
+        let sinks_dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = queue_apply_surround_both_absent(
+            MockRunner::new()
+                .with_output(0, PW_METADATA_SINK, "") // detect: pw-metadata 0 (default sink)
+                .with_output(0, sinks_dump, ""), // detect: pw-dump (real sinks)
+        );
+        let cfg = make_config_surround_single_game_no_eq("test-hrir"); // surround.hw_sink = None
+        let mut engine = Engine::new(runner, cfg);
+
+        let profile = engine.config.active().unwrap().clone();
+        engine
+            .apply_surround(&profile)
+            .expect("apply_surround must succeed");
+
+        let surround_argv = engine
+            .runner
+            .spawned
+            .iter()
+            .find(|argv| {
+                argv.get(2)
+                    .map(|s| s.contains("arctis_surround"))
+                    .unwrap_or(false)
+            })
+            .expect("surround conf must have been spawned");
+        let conf =
+            std::fs::read_to_string(&surround_argv[2]).expect("surround conf file must exist");
+
+        assert!(
+            conf.contains("target.object")
+                && conf.contains(
+                    "alsa_output.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.analog-stereo"
+                ),
+            "convolver output must target the detected headset, got:\n{conf}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
