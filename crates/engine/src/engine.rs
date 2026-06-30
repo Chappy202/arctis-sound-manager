@@ -1404,6 +1404,75 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Set the FULL EQ band set for `channel_id` in the active profile in ONE shot.
+    ///
+    /// Unlike `set_eq_band` (one band per IPC round-trip, each resolving the sink
+    /// node via a full `pw-cli ls Node` enumeration), this stores all bands, saves
+    /// the config ONCE, and live-applies every band through `AudioBackend::apply_all`
+    /// — a single `find_node_id` followed by N `pw-cli s` sets. Used by bulk UI edits
+    /// (Flatten / tone curves) so the curve settles instantly instead of band-by-band.
+    /// Mirrors `apply_eq_preset` minus the preset lookup (G3: live, no restart).
+    pub fn set_channel_eq(
+        &mut self,
+        channel_id: &str,
+        bands: Vec<EqBandConfig>,
+    ) -> Result<crate::state::EngineState, EngineError> {
+        if bands.len() > arctis_audio::MAX_BANDS {
+            return Err(EngineError::BadRequest(format!(
+                "too many EQ bands: {} (max {})",
+                bands.len(),
+                arctis_audio::MAX_BANDS
+            )));
+        }
+
+        // Mutate channel EQ in active profile (store densely, same as apply_eq_preset).
+        {
+            let active_name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&active_name).ok_or_else(|| {
+                EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    active_name.clone(),
+                ))
+            })?;
+            let channel = profile
+                .channels
+                .iter_mut()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            channel.eq = bands;
+        }
+
+        self.save_config()?;
+
+        // Live-apply all bands in one shot: one find_node_id + N `pw-cli s`.
+        {
+            let profile = self.config.active()?.clone();
+            let channel = profile
+                .channels
+                .iter()
+                .find(|ch| ch.id == channel_id)
+                .ok_or_else(|| {
+                    EngineError::BadRequest(format!("channel not found: {channel_id}"))
+                })?;
+            let eq_model = convert::eq_model_for(channel)?;
+            let def = convert::channel_def_from_cfg(channel);
+            let spec = def.sink_spec();
+            let mut be = arctis_audio::AudioBackend::new(&mut self.runner, spec);
+            if let Err(e) = be.apply_all(&eq_model) {
+                eprintln!(
+                    "warning: set_channel_eq apply_all for channel '{channel_id}' failed (ignoring): {e}"
+                );
+            }
+        }
+
+        self.emit(Event::EqBandSet {
+            channel_id: channel_id.to_string(),
+            band: 0,
+        });
+        Ok(self.state())
+    }
+
     /// Delete a named EQ preset. Errors if not found.
     pub fn delete_eq_preset(&mut self, name: &str) -> Result<(), EngineError> {
         let pos = self

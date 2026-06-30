@@ -18,6 +18,7 @@ pub fn run() {
             commands::get_state,
             commands::switch_profile,
             commands::set_eq_band,
+            commands::set_channel_eq,
             commands::set_route,
             commands::clear_route,
             commands::set_channel_output,

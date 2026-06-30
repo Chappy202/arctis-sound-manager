@@ -20,6 +20,26 @@ export interface Band {
   gainDb: number;
 }
 
+/** One EQ band in the daemon wire shape (snake_case), as serialized by
+ * `arctis_engine::EqBandSnapshot`. Used by the batch `set_channel_eq` command. */
+export interface BandSnapshot {
+  kind: string;
+  freq_hz: number;
+  q: number;
+  gain_db: number;
+}
+
+/** Convert UI bands (camelCase `Band`) to the daemon wire shape (snake_case)
+ * for the batch `set_channel_eq` command. Pure; no IPC. */
+export function bandsToSnapshots(bands: Band[]): BandSnapshot[] {
+  return bands.map((b) => ({
+    kind: b.kind,
+    freq_hz: b.freqHz,
+    q: b.q,
+    gain_db: b.gainDb,
+  }));
+}
+
 export const FREQ_MIN = 20;
 export const FREQ_MAX = 20000;
 export const GAIN_MIN = -12;

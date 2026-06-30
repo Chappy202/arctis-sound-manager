@@ -54,6 +54,14 @@ pub enum Request {
         q: f32,
         gain_db: f32,
     },
+    /// Set the FULL EQ band set for a channel in one shot (batch apply).
+    /// Resolves the sink node once and applies every band — used by bulk UI
+    /// edits (Flatten / tone curves) so the curve settles instantly. Single-band
+    /// live drags keep using `SetEqBand`.
+    SetChannelEq {
+        channel: String,
+        bands: Vec<arctis_engine::EqBandSnapshot>,
+    },
     Route {
         app_binary: String,
         target_sink: String,
@@ -497,6 +505,34 @@ mod tests {
             gain_db: -3.0,
         };
         let json = serde_json::to_string(&req).unwrap();
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn request_set_channel_eq_round_trips() {
+        let req = Request::SetChannelEq {
+            channel: "game".into(),
+            bands: vec![
+                arctis_engine::EqBandSnapshot {
+                    kind: "peaking".into(),
+                    freq_hz: 1000.0,
+                    q: 1.0,
+                    gain_db: 0.0,
+                },
+                arctis_engine::EqBandSnapshot {
+                    kind: "lowshelf".into(),
+                    freq_hz: 100.0,
+                    q: 0.7071,
+                    gain_db: -3.0,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"cmd\":\"set-channel-eq\""),
+            "cmd tag must be set-channel-eq, got: {json}"
+        );
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
     }

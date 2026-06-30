@@ -14,8 +14,8 @@
   import { connectionStatus } from "../stores/connection.js";
   import { currentPage } from "../stores/page.js";
   import { eqEditing, pulseEditing } from "../stores/eqEditing.js";
-  import { reconcileBands, type Band } from "../eq.js";
-  import { setEqBand, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
+  import { reconcileBands, bandsToSnapshots, type Band } from "../eq.js";
+  import { setEqBand, setChannelEq, eqPresetSave, eqPresetApply, eqPresetDelete } from "../ipc.js";
   import { groupPresets } from "./eqPresetUtils.js";
   import DaemonUnavailable from "./DaemonUnavailable.svelte";
   import EqEditor from "./EqEditor.svelte";
@@ -74,10 +74,10 @@
     pulseEditing();
     const flat = bands.map((b) => ({ ...b, gainDb: 0 }));
     bands = flat;
-    for (let i = 0; i < flat.length; i++) {
-      try { await setEqBand(channelId, i, flat[i].kind, flat[i].freqHz, flat[i].q, 0); }
-      catch (e) { console.warn("[EqPage] flatten band failed:", e); }
-    }
+    // Single batch call: the daemon resolves the sink node ONCE and applies all
+    // bands, so the curve flattens instantly instead of settling band-by-band.
+    try { await setChannelEq(channelId, bandsToSnapshots(flat)); }
+    catch (e) { console.warn("[EqPage] flatten failed:", e); }
   }
 
   // ---------------------------------------------------------------------------
@@ -132,9 +132,10 @@
       });
     }
     if (commit) {
-      for (const i of indices) {
-        if (i < bands.length) flushBand(i, bands[i]);
-      }
+      // Tone slider release touches up to 3 bands — flush them in ONE batch call
+      // (resolves the sink node once) instead of a per-band loop.
+      setChannelEq(channelId, bandsToSnapshots(bands))
+        .catch((e) => console.warn("[EqPage] tone commit failed:", e));
     }
   }
   const setToneLive = (which: "bass" | "treble", v: number) => applyTone(which, v, false);

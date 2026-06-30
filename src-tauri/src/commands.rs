@@ -2,7 +2,7 @@ use crate::error::CommandError;
 use crate::state::{DaemonState, MeterSubscribers};
 use arctis_client::{send_request_to, Request};
 use arctis_engine::{
-    AppStream, EngineState, FactoryProfileInfo, OutputDeviceSnapshot,
+    AppStream, EngineState, EqBandSnapshot, FactoryProfileInfo, OutputDeviceSnapshot,
 };
 use std::sync::atomic::Ordering;
 use tauri::State;
@@ -141,6 +141,15 @@ pub async fn set_eq_band(
         },
     )
     .await
+}
+
+#[tauri::command]
+pub async fn set_channel_eq(
+    channel: String,
+    bands: Vec<EqBandSnapshot>,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<EngineState, CommandError> {
+    call(&state, Request::SetChannelEq { channel, bands }).await
 }
 
 #[tauri::command]

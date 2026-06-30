@@ -81,6 +81,21 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::SetChannelEq { channel, bands } => {
+            let cfg_bands: Vec<EqBandConfig> = bands
+                .into_iter()
+                .map(|b| EqBandConfig {
+                    kind: b.kind,
+                    freq_hz: b.freq_hz,
+                    q: b.q,
+                    gain_db: b.gain_db,
+                })
+                .collect();
+            match engine.set_channel_eq(&channel, cfg_bands) {
+                Ok(state) => Response::ok_with_state(state),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::Route {
             app_binary,
             target_sink,

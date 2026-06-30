@@ -301,6 +301,15 @@ export const setEqBand = (
 ): Promise<EngineState> =>
   invoke<EngineState>("set_eq_band", buildSetEqBandArgs(channel, band, kind, freq_hz, q, gain_db));
 
+/**
+ * Set the FULL EQ band set for a channel in ONE batch call; returns updated
+ * EngineState. The daemon resolves the sink node once and applies every band,
+ * so bulk edits (Flatten / tone curves) settle instantly instead of band-by-band.
+ * Single-band live drags keep using {@link setEqBand}.
+ */
+export const setChannelEq = (channel: string, bands: EqBandSnapshot[]): Promise<EngineState> =>
+  invoke<EngineState>("set_channel_eq", { channel, bands });
+
 /** Route an app binary to a target sink; returns updated EngineState. */
 export const setRoute = (app_binary: string, target_sink: string): Promise<EngineState> =>
   invoke<EngineState>("set_route", buildSetRouteArgs(app_binary, target_sink));
