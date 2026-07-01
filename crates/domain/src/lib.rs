@@ -7,7 +7,7 @@ pub mod status;
 pub use capability::Capability;
 pub use device::DeviceId;
 pub use eq_bounds::{
-    db_to_volume_pct, CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, EQ_FREQ_MAX_HZ,
+    db_to_volume_pct, db_to_volume_pct_cubic, CHANNEL_VOLUME_MAX_DB, CHANNEL_VOLUME_MIN_DB, EQ_FREQ_MAX_HZ,
     EQ_FREQ_MIN_HZ, EQ_GAIN_MAX_DB, EQ_GAIN_MIN_DB, EQ_Q_MAX, EQ_Q_MIN,
     MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB, MIC_COMP_MAKEUP_MAX_DB,
     MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,

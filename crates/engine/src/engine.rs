@@ -7,7 +7,7 @@ use arctis_audio::{
 };
 use arctis_config::{Config, EqBandConfig, SurroundMode};
 use arctis_domain::{
-    db_to_volume_pct, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    db_to_volume_pct_cubic, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
     MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
     MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
     MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
@@ -95,12 +95,20 @@ pub fn mix_to_chatmix_position(media_mix: u8, chat_mix: u8) -> i64 {
 }
 
 /// Map a ChatMix position 0..=9 to (game_db, chat_db) attenuations.
-/// center = 4.5 is the true midpoint of the 0..=9 range and matches the hardware
-/// Nova Pro dial mapping in `crates/cli/src/dial.rs`, so the GUI ChatMix slider and
-/// the physical dial behave identically. Because the center is 4.5, no integer
-/// position is exactly neutral: position 4 leans slightly toward chat (game ~-4.4 dB)
-/// and position 5 slightly toward game; true balance sits between 4 and 5.
+/// center = 4.5 is the true midpoint of the 0..=9 range and matches the position
+/// readback mapping in `mix_to_chatmix_position` (used by the hardware dial path in
+/// `crates/cli/src/dial.rs`). Because the center is 4.5, no integer position is
+/// exactly neutral: position 4 leans slightly toward chat (game ~-4.4 dB) and
+/// position 5 slightly toward game; true balance sits between 4 and 5.
 /// Endpoints: 9 => full game (chat fully attenuated), 0 => full chat (game attenuated).
+///
+/// GUI-slider vs hardware-dial guarantee: both write through the SAME perceptual
+/// (cubic) channelVolumes path, and both derive the reported position via
+/// `mix_to_chatmix_position`. The curves differ on the losing side, though: the
+/// slider realises an exact dB ramp (0 → CHATMIX_FULL_ATTEN_DB, converted for the
+/// cubic path by `db_to_volume_pct_cubic`), while `apply_dial_mix` applies the
+/// firmware-reported mix percentages verbatim (the dial's taper is owned by the
+/// headset firmware and may reach 0 % = silence at full tilt).
 fn chatmix_to_volumes(position: i64) -> (f32, f32) {
     let p = position.clamp(0, 9) as f32;
     let center = 4.5_f32;
@@ -115,6 +123,20 @@ fn chatmix_to_volumes(position: i64) -> (f32, f32) {
         let t = (center - p) / center; // 0..1
         (CHATMIX_FULL_ATTEN_DB * t, 0.0)
     }
+}
+
+/// Map a ChatMix position to the (game_pct, chat_pct) pair to write through the
+/// perceptual (cubic) volume path. The dB targets from `chatmix_to_volumes` MUST
+/// be converted with `db_to_volume_pct_cubic` (pct = 100·10^(dB/60)): the write
+/// path cubes pct/100, so the linear `db_to_volume_pct` (pct = 100·10^(dB/20))
+/// would triple the intended attenuation (position 5 ≈ −13.3 dB instead of −4.4;
+/// "full" would be −120 dB instead of −40).
+pub(crate) fn chatmix_to_volume_pcts(position: i64) -> (u8, u8) {
+    let (game_db, chat_db) = chatmix_to_volumes(position);
+    (
+        db_to_volume_pct_cubic(game_db),
+        db_to_volume_pct_cubic(chat_db),
+    )
 }
 
 /// Map a configured surround mode + negotiated channel count to the effective render mode.
@@ -1775,11 +1797,11 @@ impl<R: CommandRunner> Engine<R> {
             })?;
             p.chatmix_position = pos;
         }
-        let (game_db, chat_db) = chatmix_to_volumes(pos);
+        let (game_pct, chat_pct) = chatmix_to_volume_pcts(pos);
         // Reuse set_channel_volume (live + persist) for each side; ignore "channel
         // not found" so profiles lacking game/chat don't hard-fail.
-        let _ = self.set_channel_volume("game", db_to_volume_pct(game_db));
-        let _ = self.set_channel_volume("chat", db_to_volume_pct(chat_db));
+        let _ = self.set_channel_volume("game", game_pct);
+        let _ = self.set_channel_volume("chat", chat_pct);
         self.save_config()?;
         self.emit(Event::ChatmixSet { position: pos });
         Ok(())
@@ -7870,6 +7892,103 @@ mod tests {
         let mut engine = Engine::new(runner, cfg);
         engine.set_chatmix(9).unwrap(); // full game
         assert_eq!(engine.state().chatmix_position, 9);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// The dB targets from chatmix_to_volumes must reach the cubic write path as
+    /// pct = 100·10^(dB/60). The old linear conversion (100·10^(dB/20)) tripled
+    /// the attenuation: position 5 played at ≈ −13.3 dB instead of −4.4, and
+    /// "full" (position 9/0) at −120 dB (pct 1) instead of −40 dB (pct 22).
+    #[test]
+    fn chatmix_to_volume_pcts_uses_cubic_conversion() {
+        // (game_pct, chat_pct) per position; winner side is always 0 dB = 100 %.
+        assert_eq!(chatmix_to_volume_pcts(9), (100, 22)); // chat at −40 dB
+        assert_eq!(chatmix_to_volume_pcts(7), (100, 43)); // chat at −22.2 dB
+        assert_eq!(chatmix_to_volume_pcts(5), (100, 84)); // chat at −4.44 dB
+        assert_eq!(chatmix_to_volume_pcts(4), (84, 100)); // game at −4.44 dB
+        assert_eq!(chatmix_to_volume_pcts(0), (22, 100)); // game at −40 dB
+    }
+
+    /// End-to-end argv check: set_chatmix(9) must write pct 100 (game) and pct 22
+    /// (chat) through the cubic Props path — i.e. chat channelVolumes = 0.22^3,
+    /// NOT the old linear pct 1 (channelVolumes = 0.01^3 ≈ −120 dB).
+    #[test]
+    fn set_chatmix_applies_cubic_pcts_via_props_argv() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("chatmix_cubic");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present();
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "") // game: find_node_id
+            .with_output(0, "", "") // game: pw-cli s Props
+            .with_output(0, &ls, "") // chat: find_node_id
+            .with_output(0, "", ""); // chat: pw-cli s Props
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_chatmix(9).unwrap(); // full game
+
+        let game_vol = 1.0f32; // pct 100
+        let chat_frac = 22.0f32 / 100.0;
+        let chat_vol = chat_frac * chat_frac * chat_frac; // cubic write
+        let want_game =
+            arctis_audio::set_node_volume_props_argv("10", &[game_vol, game_vol], false).unwrap();
+        let want_chat =
+            arctis_audio::set_node_volume_props_argv("11", &[chat_vol, chat_vol], false).unwrap();
+        let calls = &engine.runner.calls;
+        let props_calls: Vec<&Vec<String>> =
+            calls.iter().filter(|c| c.get(1).map(String::as_str) == Some("s")).collect();
+        assert_eq!(props_calls.len(), 2, "one Props set per side: {calls:?}");
+        assert_eq!(props_calls[0][1..], want_game[..], "game side argv");
+        assert_eq!(props_calls[1][1..], want_chat[..], "chat side argv");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Slider/dial parity: the GUI slider (set_chatmix) and the hardware dial
+    /// (apply_dial_mix) share the SAME cubic write path — equal percent in,
+    /// byte-identical Props argv out. (The losing-side CURVES differ by design:
+    /// the slider ramps 0→−40 dB; the dial applies firmware percentages verbatim.)
+    #[test]
+    fn slider_and_dial_share_cubic_write_path() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("chatmix_parity");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // Slider at position 9 → (game 100 %, chat 22 %).
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let mut slider = Engine::new(runner, make_config_no_eq_no_routes());
+        slider.set_chatmix(9).unwrap();
+
+        // Dial reporting the same percentages (game 100 %, chat 22 %).
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let mut dial = Engine::new(runner, make_config_no_eq_no_routes());
+        dial.apply_dial_mix(100, 22).unwrap();
+
+        let props_of = |calls: &[Vec<String>]| -> Vec<Vec<String>> {
+            calls
+                .iter()
+                .filter(|c| c.get(1).map(String::as_str) == Some("s"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            props_of(&slider.runner.calls),
+            props_of(&dial.runner.calls),
+            "equal pct through slider and dial must produce identical Props argv"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
