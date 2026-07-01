@@ -2,7 +2,7 @@ use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
     move_stream_argv, parse_app_streams, parse_node_volume, query_pw_version,
     richest_surround_input, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
-    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
+    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, Router, StageKind,
     SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig, SurroundMode};
@@ -811,11 +811,23 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Project the active profile's routes — the single source of truth (G4) —
+    /// into `routes.json` + the persistent conf fragments via Router. Building
+    /// the Router from the FULL route set is what keeps sibling rules intact:
+    /// constructing it empty and applying one rule used to clobber every other
+    /// persisted route on each GUI route change.
+    fn project_routes(&mut self) -> Result<(), EngineError> {
+        let rules = convert::route_rules_from_profile(self.config.active()?);
+        let router = Router::with_rules(&mut self.runner, rules);
+        router.save_persistent()?;
+        Ok(())
+    }
+
     /// Persist a route rule without doing a live move.
     ///
     /// Upserts the route in the active profile's in-memory config, writes the unified
-    /// config to disk, and updates the WirePlumber persistent fragment via Router.
-    /// Emits `RouteSet`. Does NOT call `apply_live`.
+    /// config to disk, and re-projects ALL profile routes into the persistent
+    /// fragments via Router. Emits `RouteSet`. Does NOT call `apply_live`.
     fn persist_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
         // Update in-memory config
         {
@@ -840,12 +852,8 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Persist unified config
         self.save_config()?;
-        // Write persistent WirePlumber fragment via Router (no live move)
-        {
-            let mut router = Router::new(&mut self.runner);
-            router.set_rule(RouteRule::new(app_binary, target_sink));
-            router.save_persistent()?;
-        }
+        // Re-project the FULL route set (no live move)
+        self.project_routes()?;
         // Emit event
         self.emit(Event::RouteSet {
             app_binary: app_binary.to_string(),
@@ -867,9 +875,17 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Remove the routing rule for `app_binary`.
     ///
-    /// Drops the rule from in-memory config + persists, removes the WirePlumber
-    /// fragment entry, and attempts a best-effort live clear (moves the stream back
-    /// to the default sink by deleting its `target.object` metadata key).
+    /// Drops the rule from in-memory config + persists, re-projects the remaining
+    /// routes into the persistent fragments (siblings survive), and attempts a
+    /// best-effort live clear (moves the stream back to the default sink by
+    /// deleting its `target.object` metadata key).
+    ///
+    /// KNOWN LIMITATION: WirePlumber's restore-stream module
+    /// (`node.stream.restore-target`, default true) remembers the app's last
+    /// manual target in `~/.local/state/wireplumber/restore-stream`; there is no
+    /// supported way to clear a single app's entry without restarting
+    /// WirePlumber, so the app's NEXT stream may reappear on the old sink until
+    /// the user moves it once. See KNOWN_ISSUES.md (KI-6).
     pub fn clear_route(&mut self, app_binary: &str) -> Result<(), EngineError> {
         // Update in-memory config
         {
@@ -883,12 +899,12 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Persist unified config
         self.save_config()?;
-        // Update Router (remove from persistent fragment)
+        // Re-project the REMAINING routes (clear_route used to write an empty
+        // rule set here, wiping every other persisted route).
+        self.project_routes()?;
+        // Best-effort live clear (ignore error if app not running)
         {
             let mut router = Router::new(&mut self.runner);
-            router.remove_rule(app_binary);
-            router.save_persistent()?;
-            // Best-effort live clear (ignore error if app not running)
             let _ = router.clear_live(&AppMatch::Binary(app_binary.to_string()));
         }
         // Emit event
@@ -2058,13 +2074,13 @@ impl<R: CommandRunner> Engine<R> {
             }
         }
 
-        // Step 4: routing rules — persistent only (apply_live is best-effort and needs live streams)
-        if !route_rules.is_empty() {
-            let mut router = Router::new(&mut self.runner);
-            for rule in route_rules {
-                router.set_rule(rule);
-            }
-            // save_persistent writes WirePlumber fragment to disk (no runner calls needed)
+        // Step 4: routing rules — persistent projection only (apply_live is
+        // best-effort and needs live streams). Always save, even when empty:
+        // routes.json and the conf fragments are pure projections of
+        // profile.routes (G4), so an empty profile must clear them rather than
+        // leave stale rules behind. save_persistent is disk-only (no runner calls).
+        {
+            let router = Router::with_rules(&mut self.runner, route_rules);
             router.save_persistent()?;
         }
 
@@ -3733,18 +3749,22 @@ mod tests {
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
 
-        // The WirePlumber fragment should exist.
-        let frag_path = tmp_home.join(".config/wireplumber/wireplumber.conf.d/90-asm-routing.conf");
-        assert!(frag_path.exists(), "WirePlumber fragment should be written");
-        let content = std::fs::read_to_string(&frag_path).unwrap();
-        assert!(
-            content.contains("firefox"),
-            "fragment should contain firefox rule"
-        );
-        assert!(
-            content.contains("Arctis_Media"),
-            "fragment should contain Arctis_Media"
-        );
+        // Both persistent routing fragments should exist (client + pulse).
+        for frag_path in [
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+            tmp_home.join(".config/pipewire/pipewire-pulse.conf.d/90-asm-routing.conf"),
+        ] {
+            assert!(frag_path.exists(), "fragment should be written: {frag_path:?}");
+            let content = std::fs::read_to_string(&frag_path).unwrap();
+            assert!(
+                content.contains("firefox"),
+                "fragment should contain firefox rule"
+            );
+            assert!(
+                content.contains("Arctis_Media"),
+                "fragment should contain Arctis_Media"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_home);
         std::env::remove_var("HOME");
@@ -5510,6 +5530,93 @@ mod tests {
                 target_sink: "Arctis_Media".to_string(),
             }
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    /// Regression (route-clobber): persist_route used to build an EMPTY Router,
+    /// apply one set_rule and save — wiping every sibling rule from routes.json
+    /// and the persistent fragments on each route change. The projection must
+    /// carry ALL of profile.routes (G4: profile is the single source of truth).
+    #[test]
+    fn set_route_preserves_sibling_persisted_rules() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("route_sib");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("route_sib_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].routes.push(arctis_config::RouteConfig {
+            app_binary: "discord".into(),
+            target_sink: "Arctis_Chat".into(),
+        });
+        // apply_live best-effort: pw-dump returns empty array → live move skipped.
+        let runner = MockRunner::new().with_output(0, "[]", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_route("firefox", "Arctis_Media").unwrap();
+
+        let routes_json = std::fs::read_to_string(
+            tmp_home.join(".config/arctis-sound-manager/routes.json"),
+        )
+        .expect("routes.json written");
+        assert!(routes_json.contains("firefox"), "new rule present: {routes_json}");
+        assert!(routes_json.contains("discord"), "sibling rule survives: {routes_json}");
+
+        let frag = std::fs::read_to_string(
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+        )
+        .expect("client fragment written");
+        assert!(frag.contains("firefox") && frag.contains("discord"), "fragment: {frag}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    /// Regression (route-clobber): clear_route used to save an EMPTY rule set
+    /// even when other routes existed. Clearing one app must re-project the
+    /// remaining profile routes.
+    #[test]
+    fn clear_route_preserves_sibling_persisted_rules() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("route_clear_sib");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("route_clear_sib_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].routes = vec![
+            arctis_config::RouteConfig {
+                app_binary: "discord".into(),
+                target_sink: "Arctis_Chat".into(),
+            },
+            arctis_config::RouteConfig {
+                app_binary: "firefox".into(),
+                target_sink: "Arctis_Media".into(),
+            },
+        ];
+        // clear_live best-effort: pw-dump returns empty array → skipped.
+        let runner = MockRunner::new().with_output(0, "[]", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.clear_route("firefox").unwrap();
+
+        let routes_json = std::fs::read_to_string(
+            tmp_home.join(".config/arctis-sound-manager/routes.json"),
+        )
+        .expect("routes.json written");
+        assert!(!routes_json.contains("firefox"), "cleared rule gone: {routes_json}");
+        assert!(routes_json.contains("discord"), "sibling rule survives: {routes_json}");
+
+        let frag = std::fs::read_to_string(
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+        )
+        .expect("client fragment written");
+        assert!(!frag.contains("firefox") && frag.contains("discord"), "fragment: {frag}");
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_dir_all(&tmp_home);
