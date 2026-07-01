@@ -3,7 +3,10 @@
 pub mod client;
 pub mod protocol;
 
-pub use client::{send_request, send_request_to, ClientError};
+pub use client::{
+    send_request, send_request_to, send_request_to_with_timeout, ClientError,
+    CHATMIX_VALIDATE_TIMEOUT, DEFAULT_IPC_TIMEOUT,
+};
 pub use protocol::{
     socket_path, CoexistActionResult, CoexistDisableResult, CoexistReport, Request, Response,
 };
