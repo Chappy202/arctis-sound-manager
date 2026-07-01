@@ -740,7 +740,10 @@ impl<R: CommandRunner> SurroundBackend<R> {
         let out = self.runner.run("pw-cli", &["destroy", &id])?;
         Self::check(out, "pw-cli")?;
         let conf_path_str = self.conf_path().to_string_lossy().into_owned();
-        let _ = self.runner.run("pkill", &["-f", &conf_path_str]);
+        if let Err(e) = self.runner.run("pkill", &["-f", &conf_path_str]) {
+            // Surface spawn failures (a non-zero pkill exit just means "no match").
+            eprintln!("audio: pkill for {conf_path_str} failed: {e}");
+        }
         let _ = std::fs::remove_file(self.conf_path());
         Ok(())
     }
