@@ -268,6 +268,11 @@ pub struct Response {
     /// Factory-profile catalog payload. Populated only for ListFactoryProfiles responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub factory_profiles: Option<Vec<arctis_engine::FactoryProfileInfo>>,
+    /// Version of the daemon that produced this response (IPC handshake).
+    /// `None` when talking to an older daemon that predates the field; clients
+    /// may compare it against their own version and warn on mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
 }
 
 impl Response {
@@ -282,6 +287,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -296,6 +302,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -310,6 +317,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -324,6 +332,7 @@ impl Response {
             coexist_report: Some(report),
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -338,6 +347,7 @@ impl Response {
             coexist_report: None,
             coexist_result: Some(result),
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -352,6 +362,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -366,6 +377,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         }
     }
 
@@ -380,6 +392,7 @@ impl Response {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: Some(profiles),
+            daemon_version: None,
         }
     }
 }
@@ -459,12 +472,29 @@ mod tests {
             coexist_report: None,
             coexist_result: None,
             factory_profiles: None,
+            daemon_version: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert!(back.ok);
         assert!(back.state.is_none());
         assert!(back.error.is_none());
+    }
+
+    /// IPC version-handshake back-compat: responses from an OLD daemon (no
+    /// daemon_version on the wire) must still deserialize, yielding None; and
+    /// a stamped version round-trips.
+    #[test]
+    fn response_daemon_version_defaults_and_round_trips() {
+        let back: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(back.daemon_version, None, "old peers must default to None");
+
+        let mut resp = Response::ok_with_text("x".into());
+        resp.daemon_version = Some("9.9.9".into());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("daemon_version"), "{json}");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.daemon_version.as_deref(), Some("9.9.9"));
     }
 
     #[test]

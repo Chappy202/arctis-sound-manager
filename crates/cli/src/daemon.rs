@@ -388,6 +388,14 @@ fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
     "<non-string panic>".to_string()
 }
 
+/// Stamp the daemon's build version onto every outgoing response (IPC version
+/// handshake): clients can compare it against their own version and warn on
+/// mismatch. Old clients simply ignore the extra field.
+fn stamp_version(mut resp: Response) -> Response {
+    resp.daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    resp
+}
+
 /// Maximum accepted request-line length (bytes). Without a cap, one endless
 /// line (no newline) would grow the read buffer unboundedly → OOM.
 const MAX_REQUEST_LINE: u64 = 1 << 20; // 1 MiB
@@ -445,9 +453,9 @@ where
         }
         if n as u64 > MAX_REQUEST_LINE {
             // Oversized request line — refuse (best-effort write) and close.
-            let resp = Response::err(format!(
+            let resp = stamp_version(Response::err(format!(
                 "request line too long (> {MAX_REQUEST_LINE} bytes)"
-            ));
+            )));
             let resp_str = serde_json::to_string(&resp)
                 .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
             let _ = writeln!(writer, "{resp_str}");
@@ -460,7 +468,7 @@ where
         let req: Request = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response::err(format!("parse error: {e}"));
+                let resp = stamp_version(Response::err(format!("parse error: {e}")));
                 let resp_str = serde_json::to_string(&resp)
                     .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
                 writeln!(writer, "{resp_str}")?;
@@ -479,6 +487,7 @@ where
             Ok(r) => r,
             Err(payload) => Response::err(format!("internal error: {}", panic_msg(&*payload))),
         };
+        let resp = stamp_version(resp);
         let resp_str = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
         let write_res = writeln!(writer, "{resp_str}");
@@ -1290,6 +1299,25 @@ mod tests {
         assert!(
             matches!(result, Ok(true)),
             "shutdown must be honored even when the response write fails (EPIPE): got {result:?}"
+        );
+    }
+
+    /// IPC version handshake: every daemon response carries daemon_version so
+    /// the GUI can compare it against its own version.
+    #[test]
+    fn serve_connection_stamps_daemon_version() {
+        let input = b"{\"cmd\":\"get-state\"}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input.as_ref()));
+        let mut output = Vec::<u8>::new();
+        let mut engine = make_engine();
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+        assert!(matches!(result, Ok(false)));
+        let response: Response = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert_eq!(
+            response.daemon_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "every response must carry the daemon's version"
         );
     }
 
