@@ -102,6 +102,9 @@ pub fn restart(env: &impl DaemonEnv, socket: &Path, binary: &Path, home: &Path) 
     start(env, socket, binary, home)
 }
 
+/// Render the systemd user unit. AUTHORITATIVE source of the unit text:
+/// `packaging/systemd/arctis-sound-manager.service` must carry the exact same
+/// body (a test asserts the two stay in sync — G1 single source of truth).
 pub fn render_unit(binary_path: &Path) -> String {
     format!(
 "[Unit]
@@ -115,8 +118,14 @@ ExecStart={bin} daemon
 Restart=on-failure
 RestartSec=3s
 Environment=XDG_RUNTIME_DIR=%t
-RuntimeDirectory=arctis-sound-manager
-RuntimeDirectoryMode=0700
+# The socket lives at $XDG_RUNTIME_DIR/arctis-sound-manager.sock — directly in
+# the runtime dir, NOT in a RuntimeDirectory subdir. Do not add that directive:
+# it created an unused directory and implied the wrong socket location.
+# Bounded stop: the daemon reaps its pipewire children on SIGTERM; after
+# TimeoutStopSec systemd SIGKILLs any survivor in the cgroup (KillMode=mixed
+# sends SIGTERM to the main process only, keeping child teardown orderly).
+TimeoutStopSec=15
+KillMode=mixed
 
 [Install]
 WantedBy=default.target
@@ -547,6 +556,34 @@ mod tests {
         let u = render_unit(Path::new("/usr/bin/asm-cli"));
         assert!(u.contains("ExecStart=/usr/bin/asm-cli daemon"));
         assert!(u.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn render_unit_has_bounded_stop_and_no_runtime_directory() {
+        let u = render_unit(Path::new("/usr/bin/asm-cli"));
+        assert!(u.contains("TimeoutStopSec=15"), "stop must be time-bounded");
+        assert!(u.contains("KillMode=mixed"), "cgroup survivors must be cleaned up");
+        assert!(
+            !u.contains("RuntimeDirectory="),
+            "the socket lives directly in $XDG_RUNTIME_DIR — no RuntimeDirectory subdir"
+        );
+    }
+
+    /// G1: the packaged unit file and render_unit are the same text — the file's
+    /// body must be exactly render_unit("/usr/bin/asm-cli") (comments only above it).
+    #[test]
+    fn packaged_unit_file_matches_render_unit() {
+        let packaged = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/systemd/arctis-sound-manager.service"
+        ))
+        .expect("packaging/systemd/arctis-sound-manager.service must exist");
+        let rendered = render_unit(Path::new("/usr/bin/asm-cli"));
+        assert!(
+            packaged.ends_with(&rendered),
+            "packaged unit body must equal render_unit output (edit render_unit \
+             first, then regenerate the packaged file)\n--- rendered ---\n{rendered}\n--- packaged ---\n{packaged}"
+        );
     }
 
     #[test]

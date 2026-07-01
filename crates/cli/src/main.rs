@@ -624,8 +624,12 @@ fn dispatch_mic(action: MicAction) -> ExitCode {
         MicAction::HwMic { device } => daemon::Request::MicHwMic { device },
         MicAction::Backend { backend } => daemon::Request::MicSuppressionBackend { backend },
         MicAction::Volume { pct } => daemon::Request::SetMicVolume { volume_pct: pct },
-        // Preset is handled before the daemon check above; this arm is unreachable.
-        MicAction::Preset { .. } => unreachable!(),
+        // Preset is dispatched before the daemon check above — reaching this arm
+        // is a programming error, but fail soft instead of panicking (G7).
+        MicAction::Preset { .. } => {
+            eprintln!("error: internal: mic preset action must be dispatched before the daemon path");
+            return ExitCode::FAILURE;
+        }
     };
 
     match daemon::send_request(&req) {
