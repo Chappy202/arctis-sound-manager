@@ -8,6 +8,7 @@
   import ProfilesDropdown from "./ProfilesDropdown.svelte";
   import NewProfileModal from "./NewProfileModal.svelte";
   import CoexistBanner from "./CoexistBanner.svelte";
+  import UpdateBanner from "./UpdateBanner.svelte";
 
   interface Props {
     children?: Snippet;
@@ -75,7 +76,12 @@
   );
 </script>
 
-<div class="app-shell">
+<div class="app-root">
+  <!-- Update notification — full window width, pinned to the very top,
+       above the nav rail. Self-contained: owns its own check/install state. -->
+  <UpdateBanner />
+
+  <div class="app-shell">
   <!-- ===== Left nav rail ===== -->
   <nav class="nav-rail" aria-label="Main navigation">
     <div class="nav-logo" aria-label="Arctis Sound Manager">
@@ -144,13 +150,24 @@
       </div>
     </main>
   </div>
+  </div>
 </div>
 
 <style>
-  .app-shell {
+  /* Vertical stack: full-width update banner on top, app row below. */
+  .app-root {
     display: flex;
+    flex-direction: column;
     width: 100%;
     height: 100vh;
+    overflow: hidden;
+  }
+
+  .app-shell {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
     background: var(--ss-bg-root);
     overflow: hidden;
   }
