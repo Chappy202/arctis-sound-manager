@@ -1206,7 +1206,11 @@ fn main() -> ExitCode {
                 match router.save_persistent() {
                     Ok(()) => {
                         println!("persistent: rule saved ({app} → {sink})");
-                        println!("note: run `systemctl --user restart wireplumber` to load it now");
+                        println!(
+                            "note: the rule applies to apps launched from now on \
+                             (native clients read it at startup; pulse clients after \
+                             pipewire-pulse restarts); running apps were moved live above"
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(e) => {

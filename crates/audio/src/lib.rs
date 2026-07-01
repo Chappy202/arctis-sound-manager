@@ -37,8 +37,8 @@ pub use props::{
 };
 pub use pw_version::{parse_pw_version, query_pw_version, supports_builtin_noisegate};
 pub use routing::{
-    clear_stream_target_argv, move_stream_argv, node_rules_fragment, parse_stream_id,
-    wireplumber_fragment_path, AppMatch, RouteRule, Router,
+    clear_stream_target_argv, client_fragment_path, move_stream_argv, parse_stream_id,
+    pulse_fragment_path, pulse_rules_fragment, stream_rules_fragment, AppMatch, RouteRule, Router,
 };
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
 pub use sinks::{parse_default_sink_name, parse_node_volume, parse_output_sinks, OutputSink};
