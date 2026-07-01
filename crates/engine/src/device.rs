@@ -62,6 +62,28 @@ fn drain_commands<T: Transport>(
     }
 }
 
+/// Drain all pending [`DeviceCommand`]s while the device is ABSENT, replying an
+/// error to each so callers blocked on the reply channel never hang.
+///
+/// Without this, commands queued while no headset is connected would sit in the
+/// channel forever (`run_read_loop` only drains inside the controller-open inner
+/// loop) and `Engine::device_set` would block on `recv()` — wedging the daemon
+/// accept loop while it holds the engine mutex.
+fn fail_pending_commands(cmd_rx: &std::sync::mpsc::Receiver<DeviceCommand>) {
+    const NOT_CONNECTED: &str = "device not connected";
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(DeviceCommand::Set { reply, .. }) => {
+                let _ = reply.send(Err(NOT_CONNECTED.to_string()));
+            }
+            Ok(DeviceCommand::ValidateChatmix { reply }) => {
+                let _ = reply.send(Err(NOT_CONNECTED.to_string()));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// On attach, send the ChatMix dial-enable init burst IFF the opener enabled it
 /// ("chatmix_dial_init" in `enabled`). No-op otherwise. Surfaces failures via
 /// eprintln (G2 — never swallow). The burst is sent via
@@ -126,10 +148,17 @@ pub fn run_read_loop<O: DeviceOpener>(
                 if let Ok(mut g) = shared.lock() {
                     g.present = false;
                 }
+                // Fail queued commands instead of leaving callers blocked forever.
+                if let Some(rx) = &cmd_rx {
+                    fail_pending_commands(rx);
+                }
             }
             Err(_) => {
                 if let Ok(mut g) = shared.lock() {
                     g.present = false;
+                }
+                if let Some(rx) = &cmd_rx {
+                    fail_pending_commands(rx);
                 }
             }
         }
@@ -484,6 +513,88 @@ mod tests {
             c.transport().written.is_empty(),
             "wrong key 'chatmix_enable' must not trigger the dial-enable init burst"
         );
+    }
+
+    /// Deadlock fix: with NO device present (opener returns Ok(None)), a queued
+    /// DeviceSet must receive an Err reply promptly instead of hanging forever.
+    #[test]
+    fn absent_device_fails_pending_set_command_promptly() {
+        let shared = Arc::new(Mutex::new(crate::DeviceShared::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (open_tx, open_rx) = std::sync::mpsc::channel::<()>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+
+        let shared_clone = Arc::clone(&shared);
+        let stop_clone = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            run_read_loop(
+                AbsentOpener { tx: open_tx },
+                shared_clone,
+                None,
+                Duration::from_millis(1),
+                stop_clone,
+                Some(cmd_rx),
+            );
+        });
+
+        // Queue a write command while the device is absent.
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(DeviceCommand::Set {
+                name: "sidetone".into(),
+                value: 2,
+                reply: reply_tx,
+            })
+            .expect("send must succeed while worker is alive");
+
+        // The reply must arrive promptly (bounded) and be an error.
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("absent-device Set must be replied to within 3s (deadlock fix)");
+        let msg = result.expect_err("absent device must reply Err");
+        assert!(
+            msg.contains("not connected"),
+            "error must say the device is not connected: {msg}"
+        );
+
+        let _ = open_rx.recv_timeout(Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("worker must not panic");
+    }
+
+    /// Same for ValidateChatmix: absent device (opener errors) → prompt Err reply.
+    #[test]
+    fn errored_device_fails_pending_validate_chatmix_promptly() {
+        let shared = Arc::new(Mutex::new(crate::DeviceShared::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (open_tx, _open_rx) = std::sync::mpsc::channel::<()>();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<DeviceCommand>();
+
+        let shared_clone = Arc::clone(&shared);
+        let stop_clone = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            run_read_loop(
+                ErrorOpener { tx: open_tx },
+                shared_clone,
+                None,
+                Duration::from_millis(1),
+                stop_clone,
+                Some(cmd_rx),
+            );
+        });
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        cmd_tx
+            .send(DeviceCommand::ValidateChatmix { reply: reply_tx })
+            .expect("send must succeed while worker is alive");
+
+        let result = reply_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("absent-device ValidateChatmix must be replied to within 3s");
+        assert!(result.is_err(), "absent device must reply Err, got: {result:?}");
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("worker must not panic");
     }
 
     /// send device-set for an ENABLED control → reply must be Ok(()).
