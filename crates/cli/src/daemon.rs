@@ -709,6 +709,39 @@ unsafe fn install_signal_pipe(write_fd: libc::c_int) {
 /// Global write-end fd for the signal self-pipe. -1 = not installed.
 static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Load the persisted config, degrading gracefully when it is unreadable:
+/// log the ConfigError, move the corrupt file aside (so a later save cannot
+/// silently overwrite the user's data with defaults), and return
+/// `(defaults, degraded=true)`. The `degraded` flag is surfaced via
+/// `EngineState.config_degraded` so clients can warn.
+fn load_config_or_default() -> (Config, bool) {
+    match arctis_config::store::load() {
+        Ok(cfg) => (cfg, false),
+        Err(e) => {
+            eprintln!("daemon: failed to load config: {e}; starting with defaults");
+            let path = arctis_config::store::config_path();
+            if path.exists() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_file_name(format!("config.toml.corrupt-{ts}"));
+                match std::fs::rename(&path, &backup) {
+                    Ok(()) => eprintln!(
+                        "daemon: unreadable config preserved at {}",
+                        backup.display()
+                    ),
+                    Err(re) => eprintln!(
+                        "daemon: could not move unreadable config aside ({}): {re}",
+                        path.display()
+                    ),
+                }
+            }
+            (Config::default_config(), true)
+        }
+    }
+}
+
 /// Check if a unix socket file has a live listener.
 ///
 /// Attempts to connect to the socket. If the connection succeeds, something is listening
@@ -748,10 +781,11 @@ pub fn run_daemon() -> Result<(), EngineError> {
         let _ = std::fs::remove_file(&path);
     }
 
-    let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
+    let (cfg, config_degraded) = load_config_or_default();
     let dial_controls_balance = cfg.dial_controls_balance;
     let knob_controls_master = cfg.knob_controls_master;
     let mut engine = Engine::new(RealRunner, cfg);
+    engine.set_config_degraded(config_degraded);
     if let Err(e) = engine.reconcile() {
         eprintln!("warning: reconcile on start failed: {e}");
     }
@@ -1257,6 +1291,64 @@ mod tests {
             matches!(result, Ok(true)),
             "shutdown must be honored even when the response write fails (EPIPE): got {result:?}"
         );
+    }
+
+    // ── Corrupt-config handling (load_config_or_default) ─────────────────────
+
+    /// A corrupt config must NOT be silently replaced: the error is logged, the
+    /// unreadable file is preserved as config.toml.corrupt-<ts>, defaults are
+    /// used, and the degraded flag is reported (surfaced in EngineState).
+    #[test]
+    fn corrupt_config_is_preserved_and_flagged_degraded() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_corrupt_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg_path = tmp.join("config.toml");
+        std::fs::write(&cfg_path, "this is [ not valid toml = = =").unwrap();
+
+        let (cfg, degraded) = load_config_or_default();
+        assert!(degraded, "unreadable config must set the degraded flag");
+        assert_eq!(cfg.active_profile, Config::default_config().active_profile);
+        assert!(
+            !cfg_path.exists(),
+            "the corrupt config must be moved aside, not left to be overwritten"
+        );
+        let preserved = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.corrupt-")
+            });
+        assert!(preserved, "a config.toml.corrupt-<ts> backup must exist");
+
+        // The degraded flag flows through EngineState.
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_config_degraded(degraded);
+        assert!(engine.state().config_degraded, "state must expose config_degraded");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// A valid (or absent) config loads normally with degraded=false.
+    #[test]
+    fn absent_config_loads_defaults_not_degraded() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_absent_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let (_cfg, degraded) = load_config_or_default();
+        assert!(!degraded, "an absent config is first-run, not degraded");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
     }
 
     /// A read timeout (WouldBlock/TimedOut from SO_RCVTIMEO) must be treated as

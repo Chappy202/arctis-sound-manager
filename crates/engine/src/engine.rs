@@ -230,6 +230,9 @@ pub struct Engine<R: CommandRunner> {
     /// Set by `apply_surround` when a pinned HRIR stem was missing and a fallback was
     /// substituted; surfaced in `state().surround.hrir_missing` so the UI can prompt to import.
     surround_hrir_missing: Option<String>,
+    /// True when the persisted config could not be read at startup and the engine is
+    /// running on defaults. Surfaced via `state().config_degraded` so clients can warn.
+    config_degraded: bool,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -252,6 +255,7 @@ impl<R: CommandRunner> Engine<R> {
             volume_dump_cache: None,
             last_volume_write: None,
             surround_hrir_missing: None,
+            config_degraded: false,
         }
     }
 
@@ -276,6 +280,7 @@ impl<R: CommandRunner> Engine<R> {
             volume_dump_cache: None,
             last_volume_write: None,
             surround_hrir_missing: None,
+            config_degraded: false,
         }
     }
 
@@ -313,6 +318,12 @@ impl<R: CommandRunner> Engine<R> {
     /// to the single-owner worker thread. Called after the worker is spawned.
     pub fn set_device_tx(&mut self, tx: std::sync::mpsc::Sender<crate::device::DeviceCommand>) {
         self.device_tx = Some(tx);
+    }
+
+    /// Mark the engine as running on a default config because the persisted one
+    /// was unreadable at startup (see the daemon's load path). Surfaced in state().
+    pub fn set_config_degraded(&mut self, degraded: bool) {
+        self.config_degraded = degraded;
     }
 
     /// Send a validated device write through the worker thread.
@@ -724,6 +735,7 @@ impl<R: CommandRunner> Engine<R> {
             default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
             dial_controls_balance: self.config.dial_controls_balance,
             knob_controls_master: self.config.knob_controls_master,
+            config_degraded: self.config_degraded,
         }
     }
 

@@ -75,7 +75,6 @@ fn reap_exited(children: &mut Vec<std::process::Child>) {
 fn drain_pipe<R: std::io::Read>(pipe: Option<R>) -> String {
     let mut buf = Vec::new();
     if let Some(mut p) = pipe {
-        use std::io::Read as _;
         let _ = p.read_to_end(&mut buf);
     }
     String::from_utf8_lossy(&buf).into_owned()
