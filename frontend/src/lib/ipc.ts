@@ -290,6 +290,15 @@ export const setChannelVolume = (channel: string, volumePct: number): Promise<En
 export const setChannelMute = (channel: string, muted: boolean): Promise<EngineState> =>
   invoke<EngineState>("set_channel_mute", buildSetChannelMuteArgs(channel, muted));
 
+/**
+ * Ack-only twin of {@link setChannelVolume} for intermediate drag ticks: the
+ * daemon still applies the volume, but the EngineState echo is discarded in
+ * Rust before it can cross the webview bridge as JSON. Use setChannelVolume
+ * for the commit/release call so state convergence still happens.
+ */
+export const setChannelVolumeAck = (channel: string, volumePct: number): Promise<void> =>
+  invoke("set_channel_volume_ack", buildSetChannelVolumeArgs(channel, volumePct));
+
 /** Update a parametric EQ band; returns updated EngineState. */
 export const setEqBand = (
   channel: string,
@@ -300,6 +309,21 @@ export const setEqBand = (
   gain_db: number,
 ): Promise<EngineState> =>
   invoke<EngineState>("set_eq_band", buildSetEqBandArgs(channel, band, kind, freq_hz, q, gain_db));
+
+/**
+ * Ack-only twin of {@link setEqBand} for intermediate drag ticks (~20/s):
+ * applies the band but discards the EngineState echo Rust-side. Use setEqBand
+ * for the release/commit flush so convergence still happens.
+ */
+export const setEqBandAck = (
+  channel: string,
+  band: number,
+  kind: string,
+  freq_hz: number,
+  q: number,
+  gain_db: number,
+): Promise<void> =>
+  invoke("set_eq_band_ack", buildSetEqBandArgs(channel, band, kind, freq_hz, q, gain_db));
 
 /**
  * Set the FULL EQ band set for a channel in ONE batch call; returns updated
@@ -574,6 +598,15 @@ export const guiAutostartEnabled = (): Promise<boolean> =>
  */
 export const onStateChanged = (cb: (s: EngineState) => void): Promise<UnlistenFn> =>
   listen<EngineState>("state-changed", (e) => cb(e.payload));
+
+/**
+ * Subscribe to the `daemon-down` event, emitted ONCE by the Rust state poll
+ * when a daemon request fails after previously succeeding (edge-triggered).
+ * The payload is a human-readable error message. Recovery needs no event:
+ * the poll re-emits `state-changed` as soon as the daemon answers again.
+ */
+export const onDaemonDown = (cb: (msg: string) => void): Promise<UnlistenFn> =>
+  listen<string>("daemon-down", (e) => cb(e.payload));
 
 // ---------------------------------------------------------------------------
 // R3: Level-meter event (levels)

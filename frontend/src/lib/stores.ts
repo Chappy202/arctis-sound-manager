@@ -5,7 +5,7 @@
  * a one-shot getState() call on init and kept fresh via the state-changed event.
  */
 import { writable } from "svelte/store";
-import { getState, onStateChanged, type EngineState } from "./ipc.js";
+import { getState, onStateChanged, onDaemonDown, type EngineState } from "./ipc.js";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 // NOTE: connectionStatus is DERIVED from engineState + loadError (see
 // stores/connection.ts), so init() only writes those two stores — there is no
@@ -18,6 +18,7 @@ export const engineState = writable<EngineState | null>(null);
 export const loadError = writable<string | null>(null);
 
 let unlistenFn: UnlistenFn | null = null;
+let unlistenDownFn: UnlistenFn | null = null;
 
 /**
  * Initialise the state store.
@@ -61,13 +62,29 @@ export async function init(): Promise<void> {
   } catch (e) {
     console.warn("[stores] Failed to subscribe to state-changed events:", e);
   }
+
+  // Edge-triggered outage push from the Rust state poll — flips the derived
+  // connection status to "disconnected" within a poll tick instead of waiting
+  // for the slow JS fallback poll (stores/connection.ts). Recovery flows back
+  // through state-changed above (the poll force re-emits after an outage).
+  try {
+    unlistenDownFn = await onDaemonDown((msg) => {
+      loadError.set(msg || "Daemon unavailable");
+    });
+  } catch (e) {
+    console.warn("[stores] Failed to subscribe to daemon-down events:", e);
+  }
 }
 
-/** Tear down the event subscription (e.g. on component destroy). */
+/** Tear down the event subscriptions (e.g. on component destroy). */
 export function destroy(): void {
   if (unlistenFn) {
     unlistenFn();
     unlistenFn = null;
+  }
+  if (unlistenDownFn) {
+    unlistenDownFn();
+    unlistenDownFn = null;
   }
   initialised = false;
 }

@@ -21,10 +21,12 @@ pub fn toggle_main_window(app: &AppHandle) {
         match win.is_visible() {
             Ok(true) => {
                 let _ = win.hide();
+                crate::mark_visible(app, false);
             }
             _ => {
                 let _ = win.show();
                 let _ = win.set_focus();
+                crate::mark_visible(app, true);
             }
         }
     }

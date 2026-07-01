@@ -32,6 +32,19 @@ async fn call(
     }
 }
 
+/// Ack-only variant of `call`: the daemon still applies the request (and still
+/// returns the full EngineState — the protocol is unchanged), but we discard
+/// the state here in Rust so it never crosses the webview bridge as JSON.
+/// Used by high-frequency drag ticks (EQ band drags ~20/s, the 80 ms volume
+/// throttle) where the UI throws the response away anyway; the commit/release
+/// call keeps using the state-returning command so convergence still happens.
+async fn call_ack(
+    state: &State<'_, Mutex<DaemonState>>,
+    req: Request,
+) -> Result<(), CommandError> {
+    call(state, req).await.map(|_| ())
+}
+
 /// Variant of `call` for verbs that return a text payload (e.g. ProfileExport).
 /// Extracts `resp.text` instead of `resp.state`.
 async fn call_text(
@@ -130,6 +143,31 @@ pub async fn set_eq_band(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(
+        &state,
+        Request::SetEqBand {
+            channel,
+            band,
+            kind,
+            freq_hz,
+            q,
+            gain_db,
+        },
+    )
+    .await
+}
+
+/// Ack-only twin of `set_eq_band` for intermediate drag ticks. See `call_ack`.
+#[tauri::command]
+pub async fn set_eq_band_ack(
+    channel: String,
+    band: usize,
+    kind: String,
+    freq_hz: f32,
+    q: f32,
+    gain_db: f32,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<(), CommandError> {
+    call_ack(
         &state,
         Request::SetEqBand {
             channel,
@@ -275,6 +313,16 @@ pub async fn set_channel_volume(
     state: State<'_, Mutex<DaemonState>>,
 ) -> Result<EngineState, CommandError> {
     call(&state, Request::SetChannelVolume { channel, volume_pct }).await
+}
+
+/// Ack-only twin of `set_channel_volume` for intermediate drag ticks. See `call_ack`.
+#[tauri::command]
+pub async fn set_channel_volume_ack(
+    channel: String,
+    volume_pct: u8,
+    state: State<'_, Mutex<DaemonState>>,
+) -> Result<(), CommandError> {
+    call_ack(&state, Request::SetChannelVolume { channel, volume_pct }).await
 }
 
 #[tauri::command]
@@ -685,6 +733,28 @@ pub async fn gui_set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<b
 #[tauri::command]
 pub async fn gui_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+// ── Deferred first show (cold-launch white-flash fix) ────────────────────────
+//
+// The main window is created hidden (tauri.conf.json `"visible": false`) and
+// nothing shows it eagerly. The frontend invokes this after its first paint
+// (double requestAnimationFrame in main.ts); we then show the window unless it
+// should stay hidden — a `--hidden` tray launch starts the WindowVisibility
+// flag at false, and only a tray/single-instance show flips it to true.
+
+#[tauri::command]
+pub fn show_when_ready(
+    app: tauri::AppHandle,
+    visibility: State<'_, crate::state::WindowVisibility>,
+) {
+    use tauri::Manager;
+    if visibility.0.load(Ordering::Relaxed) {
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+    }
 }
 
 // ── Level-meter subscriber gate (perf) ───────────────────────────────────────

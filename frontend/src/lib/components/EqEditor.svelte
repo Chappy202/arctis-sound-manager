@@ -5,8 +5,8 @@
    * present identically (this is what kept the mic graph from being stretched).
    *
    * Two sizing modes:
-   *   - default: aspect-locked to the EqGraph viewBox (1000x360) — never
-   *     distorts; height follows width. Used for secondary/inline EQs (mic).
+   *   - default: aspect-locked to the EqGraph design ratio (1000x360);
+   *     height follows width. Used for secondary/inline EQs (mic).
    *   - fill:    grows to fill its flex parent (the EQ page hero graph).
    *
    * The band list and gesture hints are opt-in so each page composes only the
@@ -77,8 +77,10 @@
     flex: 1;
   }
 
-  /* Aspect-locked to the EqGraph viewBox so the SVG (preserveAspectRatio="none")
-     never flattens — height is derived from width and scales with the viewport. */
+  /* Aspect-locked to the EqGraph design ratio (1000x360) so inline EQs keep a
+     pleasant shape — height follows width. (The graph's viewBox now tracks its
+     rendered size via ResizeObserver, so any ratio renders undistorted; this
+     ratio is a layout choice, not a distortion guard.) */
   .eq-editor-graph {
     width: 100%;
     aspect-ratio: 1000 / 360;

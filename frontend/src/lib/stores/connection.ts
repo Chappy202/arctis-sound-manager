@@ -45,6 +45,12 @@ let started = false;
 /**
  * Start a periodic health monitor that calls getState() every `intervalMs`.
  *
+ * This is a SLOW FALLBACK: primary outage detection is the Rust state poll's
+ * edge-triggered `daemon-down` event (subscribed in stores.ts init()), which
+ * flips the status within a poll tick. This poll only catches whatever slips
+ * past it (e.g. the event subscription itself failed) and drives recovery from
+ * a cold/offline start — hence the relaxed 15 s default cadence.
+ *
  * On failure it sets `loadError` (→ status "disconnected"). On success it clears
  * `loadError` and, if `engineState` is still null (recovery from a cold/offline
  * start), populates it so the status derives to "connected" immediately. It does
@@ -54,7 +60,7 @@ let started = false;
  *
  * Returns a stop function. A second call while one is running is a no-op.
  */
-export function startConnectionMonitor(intervalMs = 5000): () => void {
+export function startConnectionMonitor(intervalMs = 15000): () => void {
   if (started) return () => {};
   started = true;
 
