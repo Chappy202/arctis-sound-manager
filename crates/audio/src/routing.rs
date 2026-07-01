@@ -216,6 +216,18 @@ pub fn clear_stream_target_argv(stream_id: &str) -> Result<Vec<String>, AudioErr
 ///   - `AppMatch::Binary(v)` → `props["node.name"] == v` OR
 ///     `props["application.process.binary"] == v`
 pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<String, AudioError> {
+    parse_stream_ids(pw_dump_json, app_match).map(|ids| ids[0].clone())
+}
+
+/// Find ALL stream node ids whose props match `app_match` in `pw-dump` JSON
+/// (same selection rules as [`parse_stream_id`]). Multi-node apps (browsers
+/// hold one output node per tab/stream) must be moved node-by-node; acting on
+/// only the first leaves the siblings on the old sink. Errors when no node
+/// matches, so the returned Vec is never empty.
+pub fn parse_stream_ids(
+    pw_dump_json: &str,
+    app_match: &AppMatch,
+) -> Result<Vec<String>, AudioError> {
     let array: serde_json::Value =
         serde_json::from_str(pw_dump_json).map_err(|e| AudioError::Parse {
             what: "pw-dump JSON".to_string(),
@@ -227,6 +239,7 @@ pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<Strin
         detail: "expected a top-level JSON array".to_string(),
     })?;
 
+    let mut ids = Vec::new();
     for obj in objects {
         // Must be a Node.
         if obj.get("type").and_then(|v| v.as_str()) != Some("PipeWire:Interface:Node") {
@@ -269,18 +282,21 @@ pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<Strin
                     what: "stream id".to_string(),
                     detail: "matched node has no numeric top-level `id`".to_string(),
                 })?;
-            return Ok(id.to_string());
+            ids.push(id.to_string());
         }
     }
 
-    Err(AudioError::Parse {
-        what: "stream id".to_string(),
-        detail: format!(
-            "no Stream/Output/Audio Node matching {} = {}",
-            app_match.key(),
-            app_match.value()
-        ),
-    })
+    if ids.is_empty() {
+        return Err(AudioError::Parse {
+            what: "stream id".to_string(),
+            detail: format!(
+                "no Stream/Output/Audio Node matching {} = {}",
+                app_match.key(),
+                app_match.value()
+            ),
+        });
+    }
+    Ok(ids)
 }
 
 use crate::runner::CommandRunner;
@@ -376,16 +392,25 @@ impl<R: CommandRunner> Router<R> {
         }
     }
 
-    /// Move a running app's stream to `target_sink` LIVE. Returns the id moved.
-    pub fn apply_live(&mut self, app: &AppMatch, target_sink: &str) -> Result<String, AudioError> {
+    /// Move a running app's streams to `target_sink` LIVE. Moves EVERY matching
+    /// output node (browsers hold several; moving only the first left siblings
+    /// on the old sink — same rationale as the engine's `move_stream`).
+    /// Returns the ids moved (never empty on Ok).
+    pub fn apply_live(
+        &mut self,
+        app: &AppMatch,
+        target_sink: &str,
+    ) -> Result<Vec<String>, AudioError> {
         let dump = self.runner.run("pw-dump", &[])?;
         let dump = Self::check(dump, "pw-dump")?;
-        let id = parse_stream_id(&dump.stdout, app)?;
-        let argv = move_stream_argv(&id, target_sink)?;
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.runner.run("pw-metadata", &args)?;
-        Self::check(out, "pw-metadata")?;
-        Ok(id)
+        let ids = parse_stream_ids(&dump.stdout, app)?;
+        for id in &ids {
+            let argv = move_stream_argv(id, target_sink)?;
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.runner.run("pw-metadata", &args)?;
+            Self::check(out, "pw-metadata")?;
+        }
+        Ok(ids)
     }
 
     /// Upsert a persistent rule by app binary (no duplicates).
@@ -407,17 +432,19 @@ impl<R: CommandRunner> Router<R> {
         self.rules.retain(|r| r.app_binary != app_binary);
     }
 
-    /// Best-effort live clear: move the stream for `app` back to the default sink
-    /// by deleting its `target.object` metadata key.  Errors are silently ignored
-    /// at the call site (same pattern as `apply_live` for route-set).
+    /// Best-effort live clear: move the app's streams back to the default sink
+    /// by deleting the `target.object` metadata key on EVERY matching node
+    /// (multi-node symmetry with `apply_live`). Errors are silently ignored at
+    /// the call site (same pattern as `apply_live` for route-set).
     pub fn clear_live(&mut self, app: &AppMatch) -> Result<(), AudioError> {
         let dump = self.runner.run("pw-dump", &[])?;
         let dump = Self::check(dump, "pw-dump")?;
-        let id = parse_stream_id(&dump.stdout, app)?;
-        let argv = clear_stream_target_argv(&id)?;
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.runner.run("pw-metadata", &args)?;
-        Self::check(out, "pw-metadata")?;
+        for id in parse_stream_ids(&dump.stdout, app)? {
+            let argv = clear_stream_target_argv(&id)?;
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.runner.run("pw-metadata", &args)?;
+            Self::check(out, "pw-metadata")?;
+        }
         Ok(())
     }
 
@@ -645,10 +672,10 @@ mod tests {
             .with_output(0, dump, "") // pw-dump
             .with_output(0, "", ""); // pw-metadata move
         let mut router = Router::new(runner);
-        let id = router
+        let ids = router
             .apply_live(&AppMatch::Binary("firefox".into()), "Arctis_Media")
             .unwrap();
-        assert_eq!(id, "73");
+        assert_eq!(ids, vec!["73"]);
         let calls = &router.runner().calls;
         assert_eq!(calls[0], vec!["pw-dump"]);
         assert_eq!(
@@ -662,6 +689,42 @@ mod tests {
                 "Arctis_Media"
             ]
         );
+    }
+
+    /// A multi-node app (browsers) must have EVERY output node moved/cleared,
+    /// not just the first — matching the engine's move_stream behaviour.
+    #[test]
+    fn apply_live_and_clear_live_act_on_every_node_of_a_binary() {
+        let dump = r#"[
+          {"id":73,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.process.binary":"vivaldi"}}},
+          {"id":91,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.process.binary":"vivaldi"}}}
+        ]"#;
+        let runner = MockRunner::new()
+            .with_output(0, dump, "") // pw-dump
+            .with_output(0, "", "") // move node 73
+            .with_output(0, "", ""); // move node 91
+        let mut router = Router::new(runner);
+        let ids = router
+            .apply_live(&AppMatch::Binary("vivaldi".into()), "Arctis_Media")
+            .unwrap();
+        assert_eq!(ids, vec!["73", "91"]);
+        let calls = &router.runner().calls;
+        assert_eq!(calls.len(), 3, "pw-dump + one move per node");
+        assert_eq!(calls[1][3], "73");
+        assert_eq!(calls[2][3], "91");
+
+        let runner = MockRunner::new()
+            .with_output(0, dump, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "");
+        let mut router = Router::new(runner);
+        router.clear_live(&AppMatch::Binary("vivaldi".into())).unwrap();
+        let calls = &router.runner().calls;
+        assert_eq!(calls.len(), 3, "pw-dump + one clear per node");
+        assert_eq!(calls[1], vec!["pw-metadata", "-d", "73", "target.object"]);
+        assert_eq!(calls[2], vec!["pw-metadata", "-d", "91", "target.object"]);
     }
 
     #[test]

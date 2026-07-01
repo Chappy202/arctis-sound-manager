@@ -1241,7 +1241,10 @@ fn main() -> ExitCode {
                 }
                 // Live move first (best-effort — warn on failure, continue).
                 match router.apply_live(&matcher, &sink) {
-                    Ok(id) => println!("live: moved stream {id} ({app}) → {sink}"),
+                    Ok(ids) => println!(
+                        "live: moved stream(s) {} ({app}) → {sink}",
+                        ids.join(", ")
+                    ),
                     Err(e) => {
                         eprintln!("warning: live move failed (is the app playing?): {e}");
                         // Still persist the rule so it applies next launch.

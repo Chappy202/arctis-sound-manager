@@ -23,6 +23,11 @@ pub struct OutputSink {
 /// `update: id:0 key:'default.audio.sink' value:'{"name":"..."}' type:...`
 /// and returns the inner `name` string.  Returns `None` if the key is absent,
 /// the line is malformed, or the embedded JSON cannot be parsed.
+///
+/// NOTE: the default sink is also present in `pw-dump` JSON (Metadata object),
+/// but the engine's discovery seam is a two-step `pw-metadata 0` + `pw-dump`
+/// sequence that many exact-argv tests and the volume-read TTL cache assume;
+/// folding this into the pw-dump parse is deliberately deferred.
 pub fn parse_default_sink_name(pw_metadata_stdout: &str) -> Option<String> {
     for line in pw_metadata_stdout.lines() {
         if !line.contains("key:'default.audio.sink'") {
