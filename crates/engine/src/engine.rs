@@ -995,11 +995,12 @@ impl<R: CommandRunner> Engine<R> {
         Ok(deduped)
     }
 
-    /// Discover real output devices (physical sinks) via `pw-metadata 0` + `pw-dump`.
+    /// Discover real output sinks (physical devices) via `pw-metadata 0` + `pw-dump`.
     ///
-    /// Returns a best-effort `Vec` for the UI output selector: on any subprocess
-    /// failure an empty `Vec` is returned.  Never panics; never returns `Err`.
-    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+    /// Best-effort: on any subprocess failure an empty `Vec` is returned.
+    /// Never panics; never returns `Err`. Shared by the UI output selector and
+    /// the headset-sink detection helpers below (G1).
+    fn list_output_sinks(&mut self) -> Vec<arctis_audio::OutputSink> {
         // Step 1: get default sink name from pw-metadata 0.
         let default_sink = match self.runner.run("pw-metadata", &["0"]) {
             Ok(out) if out.status == 0 => arctis_audio::parse_default_sink_name(&out.stdout),
@@ -1015,32 +1016,49 @@ impl<R: CommandRunner> Engine<R> {
             return Vec::new();
         }
 
-        // Step 3: parse and map OutputSink → OutputDeviceSnapshot.
-        match arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref()) {
-            Ok(sinks) => sinks
-                .into_iter()
-                .map(|s| crate::state::OutputDeviceSnapshot {
-                    node_name: s.node_name,
-                    description: s.description,
-                    is_default: s.is_default,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        // Step 3: parse.
+        arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref())
+            .unwrap_or_default()
     }
 
-    /// Detect the headset hardware sink by scanning `list_output_devices()` for a
+    /// Discover real output devices (physical sinks) for the UI output selector.
+    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+        self.list_output_sinks()
+            .into_iter()
+            .map(|s| crate::state::OutputDeviceSnapshot {
+                node_name: s.node_name,
+                description: s.description,
+                is_default: s.is_default,
+            })
+            .collect()
+    }
+
+    /// True when the sink looks like the headset hardware sink.
+    fn is_headset_sink(node_name: &str) -> bool {
+        let lower = node_name.to_lowercase();
+        // Virtual channel sinks are "Arctis_<Channel>" — parse_output_sinks
+        // already excludes them, so a plain "arctis" match is safe here.
+        lower.contains("steelseries") || lower.contains("arctis")
+    }
+
+    /// Detect the headset hardware sink by scanning the real output sinks for a
     /// node_name that contains "steelseries" or "arctis" (case-insensitive).
     /// Returns `None` if no hardware headset sink is found or on any subprocess
     /// failure. Never panics.
     pub fn detect_headset_sink(&mut self) -> Option<String> {
-        self.list_output_devices()
+        self.list_output_sinks()
             .into_iter()
-            .find(|d| {
-                let lower = d.node_name.to_lowercase();
-                lower.contains("steelseries") || lower.contains("arctis")
-            })
+            .find(|d| Self::is_headset_sink(&d.node_name))
             .map(|d| d.node_name)
+    }
+
+    /// Detect the headset hardware sink's PipeWire object id (for `wpctl <id>`,
+    /// which does not accept node names). Same discovery as `detect_headset_sink`.
+    fn detect_headset_sink_id(&mut self) -> Option<u32> {
+        self.list_output_sinks()
+            .into_iter()
+            .find(|d| Self::is_headset_sink(&d.node_name))
+            .map(|d| d.id)
     }
 
     /// Route a running stream to a channel: resolve channel id → sink node.name,
@@ -1712,8 +1730,23 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Set the master output gain (dB) on the headset output via wpctl, persist,
-    /// and emit MasterVolumeSet.
+    /// Resolve the wpctl target for master volume/mute: the REAL hardware
+    /// headset sink by object id when present, else `@DEFAULT_AUDIO_SINK@`.
+    ///
+    /// Master must always control the hardware tail: `set_default_sink_channel`
+    /// lets the user point the system default at one of OUR virtual sinks
+    /// (e.g. Arctis_Game), and targeting @DEFAULT_AUDIO_SINK@ there would stack
+    /// master gain multiplicatively on that channel's own volume (double
+    /// attenuation) while leaving the hardware sink uncontrolled.
+    fn master_wpctl_target(&mut self) -> String {
+        match self.detect_headset_sink_id() {
+            Some(id) => id.to_string(),
+            None => "@DEFAULT_AUDIO_SINK@".to_string(),
+        }
+    }
+
+    /// Set the master output gain on the headset hardware sink via wpctl,
+    /// persist, and emit MasterVolumeSet.
     pub fn set_master_volume(&mut self, pct: u8) -> Result<(), EngineError> {
         {
             let name = self.config.active_profile.clone();
@@ -1723,12 +1756,12 @@ impl<R: CommandRunner> Engine<R> {
             p.master_volume_pct = pct;
         }
         self.save_config()?;
-        // wpctl set-volume on @DEFAULT_AUDIO_SINK@ using a linear factor.
-        let linear = pct as f32 / 100.0;
-        let factor = format!("{linear:.4}");
-        let out = self
-            .runner
-            .run("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &factor])?;
+        let target = self.master_wpctl_target();
+        // wpctl interprets the 0..1 factor on the CUBIC user scale (WirePlumber
+        // module-mixer-api) — the same perceptual scale as our channel sliders,
+        // which is exactly what a master volume slider should feel like.
+        let factor = format!("{:.4}", pct as f32 / 100.0);
+        let out = self.runner.run("wpctl", &["set-volume", &target, &factor])?;
         if out.status != 0 {
             return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
                 program: "wpctl".into(),
@@ -1741,7 +1774,9 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Mute/unmute the master output via wpctl, persist, emit MasterMuteSet.
+    /// Mute/unmute the master output (headset hardware sink, with the same
+    /// @DEFAULT_AUDIO_SINK@ fallback as volume) via wpctl, persist, emit
+    /// MasterMuteSet.
     pub fn set_master_mute(&mut self, muted: bool) -> Result<(), EngineError> {
         {
             let name = self.config.active_profile.clone();
@@ -1751,10 +1786,9 @@ impl<R: CommandRunner> Engine<R> {
             p.master_mute = muted;
         }
         self.save_config()?;
+        let target = self.master_wpctl_target();
         let arg = if muted { "1" } else { "0" };
-        let out = self
-            .runner
-            .run("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", arg])?;
+        let out = self.runner.run("wpctl", &["set-mute", &target, arg])?;
         if out.status != 0 {
             return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
                 program: "wpctl".into(),
@@ -7972,11 +8006,100 @@ mod tests {
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         let cfg = make_config_no_eq_no_routes();
-        // wpctl call for the gain (status 0).
-        let runner = arctis_audio::MockRunner::new().with_output(0, "", "");
+        // headset detect: pw-metadata 0 + pw-dump (empty → fallback), then wpctl.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, "[]", "")
+            .with_output(0, "", "");
         let mut engine = Engine::new(runner, cfg);
         engine.set_master_volume(50).unwrap();
         assert_eq!(engine.state().master_volume_pct, 50);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Master volume must target the REAL hardware headset sink (by object id):
+    /// @DEFAULT_AUDIO_SINK@ is wrong once set_default_sink_channel points the
+    /// system default at one of our virtual sinks — master would then stack on
+    /// the channel volume (double attenuation) and stop controlling the
+    /// hardware tail.
+    #[test]
+    fn set_master_volume_targets_headset_sink_id_when_present() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_vol_hw");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "") // pw-metadata 0 (no default key)
+            .with_output(0, dump, "") // pw-dump (headset sink id 10)
+            .with_output(0, "", ""); // wpctl set-volume
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_volume(50).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-volume", "10", "0.5000"],
+            "must target the headset sink id, not @DEFAULT_AUDIO_SINK@"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Without a detectable headset sink, master volume falls back to
+    /// @DEFAULT_AUDIO_SINK@ (better than doing nothing).
+    #[test]
+    fn set_master_volume_falls_back_to_default_sink_when_no_headset() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_vol_fb");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "") // pw-metadata 0
+            .with_output(0, "[]", "") // pw-dump: no sinks at all
+            .with_output(0, "", ""); // wpctl set-volume
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_volume(75).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "0.7500"]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Master mute has the same targeting rule as master volume.
+    #[test]
+    fn set_master_mute_targets_headset_sink_id_with_default_fallback() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_mute_hw");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, dump, "")
+            .with_output(0, "", ""); // wpctl set-mute
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_mute(true).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-mute", "10", "1"]
+        );
+
+        // Fallback path.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, "[]", "")
+            .with_output(0, "", "");
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_mute(false).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"]
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
