@@ -7970,7 +7970,7 @@ mod tests {
             app_binary: "firefox".into(),
             target_sink: "Arctis_Game".into(),
         }];
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_app_streams.json");
         let runner = arctis_audio::MockRunner::new().with_output(0, dump, ""); // pw-dump
         let mut engine = Engine::new(runner, cfg);
         let streams = engine.list_streams().unwrap();
@@ -8019,7 +8019,7 @@ mod tests {
 
     #[test]
     fn list_output_devices_returns_real_sinks_and_marks_default() {
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         // Runner queue: [0] pw-metadata 0, [1] pw-dump
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
@@ -8066,7 +8066,7 @@ mod tests {
     #[test]
     fn detect_headset_sink_returns_steelseries_sink() {
         // Queue: [0] pw-metadata 0, [1] pw-dump (contains SteelSeries sink)
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, PW_METADATA_SINK, "") // pw-metadata 0
             .with_output(0, dump, "");             // pw-dump
@@ -8119,7 +8119,7 @@ mod tests {
         std::env::set_var("HOME", &tmp_home);
 
         let cfg = make_config_no_eq_no_routes();
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_app_streams.json");
         // Exact 2-call sequence: (1) pw-dump for list_streams, (2) pw-metadata for the id move.
         // persist_route (called after the live move) writes config + WP fragment only — no runner calls.
         let runner = arctis_audio::MockRunner::new()
@@ -8206,7 +8206,7 @@ mod tests {
     #[test]
     fn move_stream_unknown_channel_errors() {
         let cfg = make_config_no_eq_no_routes();
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_app_streams.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_app_streams.json");
         let runner = arctis_audio::MockRunner::new().with_output(0, dump, "");
         let mut engine = Engine::new(runner, cfg);
         let result = engine.move_stream("70", "nope");
@@ -8272,7 +8272,7 @@ mod tests {
         let tmp = unique_cfg_tmp("master_vol_hw");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, "", "") // pw-metadata 0 (no default key)
             .with_output(0, dump, "") // pw-dump (headset sink id 10)
@@ -8319,7 +8319,7 @@ mod tests {
         let tmp = unique_cfg_tmp("master_mute_hw");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, "", "")
             .with_output(0, dump, "")
@@ -9000,7 +9000,7 @@ mod tests {
         // Runner: detect_headset_sink probes first (pw-metadata 0, then a pw-dump of real
         // sinks that includes the SteelSeries Arctis hw sink), then the recreate/set_output
         // existence checks (absent → spawn).
-        let sinks_dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let sinks_dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = queue_apply_surround_both_absent(
             MockRunner::new()
                 .with_output(0, "[]", "") // Auto probe: pw-dump (no streams)
@@ -9425,7 +9425,7 @@ mod tests {
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         let cfg = make_config_no_eq_no_routes();
-        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let dump = include_str!("../../../audio/tests/fixtures/pw_dump_sinks.json");
         // Three queued run() outputs; spawn_owned is not from the queue.
         let runner = arctis_audio::MockRunner::new()
             .with_output(0, PW_METADATA_SINK, "") // [0] pw-metadata 0
