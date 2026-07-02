@@ -283,7 +283,9 @@ pub fn richest_surround_input(
                 .is_some_and(|n| surround_sinks.iter().any(|x| x == n))
         })
         .filter_map(|s| s.channels.map(|c| (c, s)))
-        .max_by_key(|(c, s)| (*c, classify_surround_input(*c, &s.positions).is_true_surround))
+        // Rank genuineness FIRST, then channel count: a real 5.1 (rear/side
+        // present) must outrank an 8-ch front-padded stream.
+        .max_by_key(|(c, s)| (classify_surround_input(*c, &s.positions).is_true_surround, *c))
         .map(|(c, s)| classify_surround_input(c, &s.positions))
 }
 
@@ -538,6 +540,35 @@ mod tests {
         let streams = parse_app_streams(dump).unwrap();
         let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
         assert!(si.is_true_surround, "tie-break must favour true surround (padded was last → old code would pick it)");
+    }
+
+    #[test]
+    fn richest_input_true_5_1_outranks_padded_8ch() {
+        // A REAL 5.1 stream (rear channels present) must outrank an 8-channel
+        // stream padded with only front positions — genuineness ranks before
+        // channel count.
+        let dump = r#"[
+          { "id": 50, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+          { "id": 51, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "Padded", "application.process.binary": "Padded" },
+              "params": { "Format": [ { "channels": 8,
+                "position": ["FL","FR"] } ] } } },
+          { "id": 52, "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Output/Audio",
+                "application.name": "Real51", "application.process.binary": "Real51" },
+              "params": { "Format": [ { "channels": 6,
+                "position": ["FL","FR","FC","LFE","RL","RR"] } ] } } },
+          { "id": 98, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 51, "input-node-id": 50 } },
+          { "id": 99, "type": "PipeWire:Interface:Link",
+            "info": { "output-node-id": 52, "input-node-id": 50 } }
+        ]"#;
+        let streams = parse_app_streams(dump).unwrap();
+        let si = richest_surround_input(&streams, &["Arctis_Game".to_string()]).unwrap();
+        assert_eq!(si.channels, 6, "real 5.1 must outrank the padded 8-ch stream");
+        assert!(si.is_true_surround);
     }
 
     #[test]

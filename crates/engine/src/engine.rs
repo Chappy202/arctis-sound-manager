@@ -655,7 +655,14 @@ impl<R: CommandRunner> Engine<R> {
                 channels: sc.channels.clone(),
                 hw_sink: sc.hw_sink.clone(),
                 mode: surround_mode_str(sc.mode).to_string(),
-                effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
+                // Feed the PROBED negotiated channel count so Auto reports what the
+                // DSP actually does (bypass for stereo input, HRIR for surround) —
+                // hardcoding None made Auto always claim HRIR 7.1.
+                effective_mode: surround_mode_str(resolve_effective_mode(
+                    sc.mode,
+                    negotiated_channels,
+                ))
+                .to_string(),
                 negotiated_channels,
                 negotiated_surround,
                 hrir_missing: surround_hrir_missing,
@@ -2700,9 +2707,35 @@ impl<R: CommandRunner> Engine<R> {
         // Each surround-routed channel keeps its own EQ on its channel sink, applied
         // BEFORE convolution. There is no config-driven post-convolution tail EQ.
         //
+        // Auto adapts to what the feeding app actually negotiated: probe the richest
+        // input among streams on the surround-routed channel sinks (read-only, reuses
+        // the TTL-cached pw-dump). Stereo-only input → StereoBypass; true surround →
+        // HRIR. Explicit modes skip the probe entirely. Probe failure → None →
+        // optimistic HRIR 7.1, the pre-probe behaviour.
+        //
+        // TODO(pw-watcher): the layout is only re-probed when apply_surround runs
+        // (reconcile / surround setters). A live re-apply when the richest negotiated
+        // layout CHANGES would need an engine hook from a stream watcher;
+        // crates/cli/src/route_watcher.rs only rewrites route metadata and has no
+        // engine handle, so wiring that is not contained — documented follow-up.
+        let negotiated: Option<u8> = if sc.mode == SurroundMode::Auto {
+            let surround_sinks: Vec<String> = profile
+                .channels
+                .iter()
+                .filter(|c| sc.channels.iter().any(|id| id == &c.id))
+                .map(|c| c.node_name.clone())
+                .collect();
+            let dump = self.volume_dump();
+            parse_app_streams(&dump)
+                .ok()
+                .and_then(|streams| richest_surround_input(&streams, &surround_sinks))
+                .map(|si| si.channels)
+        } else {
+            None
+        };
         // Enabled path: resolve HRIR first (only needed for HRIR modes).
         // StereoBypass does not use an HRIR file — resolve only when needed.
-        let effective = resolve_effective_mode(sc.mode, None);
+        let effective = resolve_effective_mode(sc.mode, negotiated);
         let hrir_path_opt: Option<std::path::PathBuf> = match effective {
             SurroundMode::StereoBypass => {
                 self.surround_hrir_missing = None;
@@ -2734,6 +2767,16 @@ impl<R: CommandRunner> Engine<R> {
             spec.hw_sink = self.detect_headset_sink();
         }
 
+        // Insertion-gain normalization: measure the HRIR's direct-path peak and
+        // emit the convolver `gain` option so every HRIR meets the same target
+        // level (unmeasurable file → None → unity, the old behaviour).
+        let conv_gain = hrir_path_opt
+            .as_deref()
+            .and_then(crate::hrir_import::normalization_gain);
+
+        // The surround route target derives from the spec (G4), not a literal.
+        let surround_target = spec.capture_node_name();
+
         // Recreate surround sink — pick the variant that matches the effective mode.
         {
             let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
@@ -2748,7 +2791,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize, conv_gain)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2758,7 +2801,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize, conv_gain)
                 }
                 SurroundMode::StereoBypass => {
                     surround_be.recreate_stereo_bypass(sc.crossfeed, None)
@@ -2795,7 +2838,6 @@ impl<R: CommandRunner> Engine<R> {
             .collect();
 
         let channel_set = convert::channel_set_from_profile(profile);
-        let surround_target = "effect_input.arctis_surround".to_string();
 
         // Restore removed channels to their configured output_device.
         for ch_id in &to_restore {
@@ -6881,9 +6923,9 @@ mod tests {
         }
         // Phase 2 + 2b interleaved: per channel (4), EQ apply then volume/mute apply
         for _ in 0..4 {
-            // Phase 2: EQ apply (1 ls + 10 band sets)
+            // Phase 2: EQ apply (1 ls + 10 band sets + 1 preamp set)
             r = r.with_output(0, &ls_channels, "");
-            for _ in 0..10 {
+            for _ in 0..11 {
                 r = r.with_output(0, "", "");
             }
             // Phase 2b: volume/mute apply (1 ls + 1 Props set)
@@ -6892,8 +6934,11 @@ mod tests {
         }
         // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
         r = r.with_output(0, &ls_surround_absent, "");
-        // Phase 6 start: apply_surround re-detects the headset to default the convolver
-        // output sink (hw_sink unset) → pw-metadata 0 + pw-dump (no SteelSeries → None,
+        // Phase 6 start: apply_surround (mode = Auto) probes the negotiated input
+        // layout first → 1 pw-dump (no streams → None → HRIR 7.1).
+        r = r.with_output(0, "[]", ""); // apply_surround Auto probe: pw-dump
+        // Then it re-detects the headset to default the convolver output sink
+        // (hw_sink unset) → pw-metadata 0 + pw-dump (no SteelSeries → None,
         // so the convolver output is left untargeted in this fixture).
         r = r.with_output(0, "", ""); // apply_surround detect: pw-metadata 0
         r = r.with_output(0, "[]", ""); // apply_surround detect: pw-dump []
@@ -6962,6 +7007,68 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("HOME");
+    }
+
+    /// pw-dump fixture: a STEREO stream linked to Arctis_Game (the surround sink).
+    const STEREO_STREAM_DUMP: &str = r#"[
+      { "id": 50, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+      { "id": 51, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Stream/Output/Audio",
+            "application.name": "Spotify", "application.process.binary": "spotify" },
+          "params": { "Format": [ { "channels": 2, "position": ["FL","FR"] } ] } } },
+      { "id": 99, "type": "PipeWire:Interface:Link",
+        "info": { "output-node-id": 51, "input-node-id": 50 } }
+    ]"#;
+
+    /// Auto + a stereo-only feeding stream → state() must report the REAL
+    /// effective mode (stereo_bypass), not the old hardcoded hrir71.
+    #[test]
+    fn state_effective_mode_auto_reports_bypass_for_stereo_input() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let runner = MockRunner::new().with_output(0, STEREO_STREAM_DUMP, ""); // state(): pw-dump
+        let cfg = make_config_surround_single_game_no_eq("test-hrir"); // mode = Auto
+        let mut engine = Engine::new(runner, cfg);
+        let st = engine.state();
+        assert_eq!(st.surround.mode, "auto");
+        assert_eq!(st.surround.negotiated_channels, Some(2));
+        assert_eq!(
+            st.surround.effective_mode, "stereo_bypass",
+            "Auto with a stereo input must report stereo_bypass"
+        );
+    }
+
+    /// Auto + a stereo-only feeding stream → apply_surround must build the
+    /// stereo-bypass graph (2-ch, no convolver), not the 7.1 HRIR graph.
+    #[test]
+    fn apply_surround_auto_with_stereo_input_builds_bypass() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let runner = queue_apply_surround_both_absent(
+            MockRunner::new()
+                .with_output(0, STEREO_STREAM_DUMP, "") // Auto probe: pw-dump (stereo stream)
+                .with_output(0, "", "") // detect: pw-metadata 0
+                .with_output(0, "[]", ""), // detect: pw-dump []
+        );
+        let cfg = make_config_surround_single_game_no_eq("test-hrir"); // mode = Auto
+        let mut engine = Engine::new(runner, cfg);
+        let profile = engine.config.active().unwrap().clone();
+        engine.apply_surround(&profile).expect("apply_surround must succeed");
+
+        let surround_argv = engine
+            .runner
+            .spawned
+            .iter()
+            .find(|argv| argv.get(2).map(|s| s.contains("arctis_surround")).unwrap_or(false))
+            .expect("surround conf must have been spawned");
+        let conf = std::fs::read_to_string(&surround_argv[2]).expect("conf exists");
+        assert!(
+            conf.contains("audio.channels = 2"),
+            "Auto+stereo must spawn the 2-ch bypass graph, got:\n{conf}"
+        );
+        assert!(
+            !conf.contains("convolver"),
+            "Auto+stereo must NOT build the HRIR convolver graph"
+        );
     }
 
     // ─────────────────────────────────────────────
@@ -8679,6 +8786,7 @@ mod tests {
         let sinks_dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = queue_apply_surround_both_absent(
             MockRunner::new()
+                .with_output(0, "[]", "") // Auto probe: pw-dump (no streams)
                 .with_output(0, PW_METADATA_SINK, "") // detect: pw-metadata 0 (default sink)
                 .with_output(0, sinks_dump, ""), // detect: pw-dump (real sinks)
         );
