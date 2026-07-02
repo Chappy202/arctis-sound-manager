@@ -114,6 +114,8 @@ pub fn run() {
             // GUI login autostart (Task 6)
             commands::gui_set_autostart,
             commands::gui_autostart_enabled,
+            // Post-update relaunch (Linux AppImage does not auto-restart)
+            commands::relaunch_app,
         ])
         .setup(|app| {
             // Make the bundled daemon durable across AppImage updates.

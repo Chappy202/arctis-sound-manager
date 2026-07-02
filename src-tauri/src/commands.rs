@@ -735,6 +735,16 @@ pub async fn gui_autostart_enabled(app: tauri::AppHandle) -> Result<bool, String
     app.autolaunch().is_enabled().map_err(|e| e.to_string())
 }
 
+/// Relaunch the app (post-update). Tauri's `downloadAndInstall()` only exits
+/// into the installer on Windows; on Linux the AppImage is replaced in place
+/// and the running process must re-exec itself. `AppHandle::restart()`
+/// resolves the binary via the `APPIMAGE` env, so it re-launches the updated
+/// image rather than the ephemeral /tmp/.mount_* path.
+#[tauri::command]
+pub fn relaunch_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 // ── Deferred first show (cold-launch white-flash fix) ────────────────────────
 //
 // The main window is created hidden (tauri.conf.json `"visible": false`) and
