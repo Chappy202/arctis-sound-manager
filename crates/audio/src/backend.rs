@@ -188,7 +188,23 @@ impl<R: CommandRunner> AudioBackend<R> {
     /// Force a rebuild so a changed `SinkSpec` (e.g. a new playback target) is
     /// actually applied: tear down any existing instance, then create fresh.
     /// This is the enforcement the old per-channel output selector lacked.
+    ///
+    /// Diff-before-recreate: when the rendered conf is byte-identical to what's
+    /// on disk AND the sink is live, the teardown+respawn is skipped — it would
+    /// only cause an audible dropout (e.g. reconcile's set_output re-running the
+    /// same targets on every daemon start/Reload).
     pub fn recreate(&mut self, eq: &EqModel) -> Result<ConfHandle, AudioError> {
+        let conf = render_filter_chain_conf(&self.spec, eq)?;
+        let path = self.conf_path();
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|existing| existing == conf)
+            .unwrap_or(false);
+        if unchanged && self.sink_exists()? {
+            return Ok(ConfHandle {
+                conf_path: path,
+                child: None,
+            });
+        }
         self.remove()?;
         self.create(eq)
     }
@@ -376,6 +392,9 @@ id 58, type PipeWire:Interface:Node/3
 
     #[test]
     fn recreate_tears_down_then_creates_with_new_target() {
+        // Scrub any stale conf from a previous run so the diff-before-recreate
+        // guard cannot skip the scripted teardown.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_eq.arctis_eq.conf"));
         // remove(): sink_exists ls (present) → find_node_id ls → destroy → pkill
         // create(): sink_exists ls (now absent) → spawn_owned pipewire -c
         let runner = MockRunner::new()
@@ -406,6 +425,63 @@ id 58, type PipeWire:Interface:Node/3
             handle.child.is_some(),
             "recreate must surface the new child token"
         );
+    }
+
+    /// Diff-before-recreate: identical on-disk conf + live sink → NO teardown,
+    /// no respawn, no destroy — just the one existence check.
+    #[test]
+    fn recreate_skips_respawn_when_conf_identical_and_sink_live() {
+        let spec = SinkSpec {
+            node_name: "arctis_eq_guard".into(),
+            description: "Guard".into(),
+            channels: crate::config::ChainChannels::Stereo,
+            playback_target: Some("alsa_output.speakers".into()),
+        };
+        let eq = EqModel::default_10band();
+        // Pre-write the EXACT conf the recreate would render.
+        let conf = crate::config::render_filter_chain_conf(&spec, &eq).unwrap();
+        let path = std::env::temp_dir().join("arctis_eq.arctis_eq_guard.conf");
+        std::fs::write(&path, conf).unwrap();
+
+        let ls = "id 57, type PipeWire:Interface:Node/3\n    node.name = \"arctis_eq_guard\"\n";
+        let runner = MockRunner::new().with_output(0, ls, ""); // guard: sink_exists (present)
+        let mut be = AudioBackend::new(runner, spec);
+        let handle = be.recreate(&eq).unwrap();
+
+        assert!(handle.child.is_none(), "no respawn when nothing changed");
+        let calls = &be.runner().calls;
+        assert_eq!(calls.len(), 1, "only the existence check runs");
+        assert!(be.runner().spawned.is_empty(), "no pipewire spawn");
+        assert!(!calls.iter().any(|c| c.get(1).map(|s| s == "destroy").unwrap_or(false)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Diff-before-recreate: a CHANGED conf must still tear down + respawn.
+    #[test]
+    fn recreate_respawns_when_conf_changed() {
+        let spec = SinkSpec {
+            node_name: "arctis_eq_guard2".into(),
+            description: "Guard2".into(),
+            channels: crate::config::ChainChannels::Stereo,
+            playback_target: Some("alsa_output.speakers".into()),
+        };
+        // Stale conf on disk differs from what will be rendered.
+        let path = std::env::temp_dir().join("arctis_eq.arctis_eq_guard2.conf");
+        std::fs::write(&path, "stale contents").unwrap();
+
+        let ls =
+            "id 57, type PipeWire:Interface:Node/3\n    node.name = \"arctis_eq_guard2\"\n";
+        let runner = MockRunner::new()
+            .with_output(0, ls, "") // remove: sink_exists (present)
+            .with_output(0, ls, "") // remove: find_node_id
+            .with_output(0, "", "") // remove: destroy
+            .with_output(0, "", "") // remove: pkill
+            .with_output(0, "id 1\n    node.name = \"x\"\n", ""); // create: sink_exists (absent)
+        let mut be = AudioBackend::new(runner, spec);
+        let handle = be.recreate(&EqModel::default_10band()).unwrap();
+        assert!(handle.child.is_some(), "changed conf must respawn");
+        assert_eq!(be.runner().spawned.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

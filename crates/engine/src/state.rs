@@ -172,6 +172,9 @@ pub struct SurroundSnapshot {
     /// Convolver partition size, if pinned by the profile.
     #[serde(default)]
     pub blocksize: Option<u32>,
+    /// Pinned convolver tailsize (samples), or None (PipeWire default).
+    #[serde(default)]
+    pub tailsize: Option<u32>,
 }
 
 /// Lightweight summary of one EQ preset for the state snapshot.

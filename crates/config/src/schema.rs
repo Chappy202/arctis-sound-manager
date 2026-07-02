@@ -386,6 +386,12 @@ pub struct SurroundConfig {
     /// Convolver partition size (samples). None = PipeWire default.
     #[serde(default)]
     pub blocksize: Option<u32>,
+    /// Convolver tail partition size (samples). Pairs with `blocksize`: a small
+    /// blocksize without a tailsize partitions the WHOLE impulse response at
+    /// that size (the bundled 250 ms IR → ~188 tiny partitions, xrun risk).
+    /// Must be ≥ blocksize when both are set. None = PipeWire default.
+    #[serde(default)]
+    pub tailsize: Option<u32>,
 }
 
 impl Default for SurroundConfig {
@@ -398,6 +404,7 @@ impl Default for SurroundConfig {
             mode: SurroundMode::default(),
             crossfeed: 0,
             blocksize: None,
+            tailsize: None,
         }
     }
 }
@@ -1415,6 +1422,7 @@ description = "Chat"
             mode: SurroundMode::Hrir71,
             crossfeed: 0,
             blocksize: None,
+            tailsize: None,
         };
         let serialized = toml::to_string(&cfg).expect("serialize");
         let deserialized: Config = toml::from_str(&serialized).expect("deserialize");
@@ -1859,6 +1867,7 @@ volume_db = -6.0
             mode: SurroundMode::Hrir71,
             crossfeed: 0,
             blocksize: Some(128),
+            tailsize: Some(4096),
         };
         let toml = toml::to_string(&sc).expect("serialize");
         let back: SurroundConfig = toml::from_str(&toml).expect("deserialize");

@@ -241,6 +241,8 @@ pub enum Request {
     ListFactoryProfiles,
     /// Pin (or clear) the convolver blocksize on the active profile's surround.
     SurroundSetBlocksize { blocksize: Option<u32> },
+    /// Pin (or clear) the convolver tailsize on the active profile's surround.
+    SurroundSetTailsize { tailsize: Option<u32> },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

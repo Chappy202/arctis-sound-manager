@@ -213,6 +213,12 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::SurroundSetTailsize { tailsize } => {
+            match engine.surround_set_tailsize(tailsize) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Request::SetChannelVolume {
             channel,
             volume_pct,

@@ -667,6 +667,7 @@ impl<R: CommandRunner> Engine<R> {
                 negotiated_surround,
                 hrir_missing: surround_hrir_missing,
                 blocksize: sc.blocksize,
+                tailsize: sc.tailsize,
             }
         } else {
             crate::state::SurroundSnapshot::default()
@@ -2791,7 +2792,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize, conv_gain)
+                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize, conv_gain, sc.tailsize)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2801,7 +2802,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize, conv_gain)
+                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize, conv_gain, sc.tailsize)
                 }
                 SurroundMode::StereoBypass => {
                     surround_be.recreate_stereo_bypass(sc.crossfeed, None)
@@ -2985,18 +2986,30 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Validate a convolver partition size: a power of two in 64..=8192.
+    /// `None` (PipeWire default) is always valid. Typed error otherwise (G7).
+    fn validate_convolver_size(
+        name: &str,
+        v: Option<u32>,
+    ) -> Result<(), crate::error::EngineError> {
+        if let Some(n) = v {
+            if !(64..=8192).contains(&n) || !n.is_power_of_two() {
+                return Err(crate::error::EngineError::BadRequest(format!(
+                    "{name} must be a power of two in 64..=8192, got {n} (use None for the PipeWire default)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Pin (or clear) the convolver blocksize. Persists; re-applies when enabled.
+    /// Validates BEFORE persisting (G7): power of two in 64..=8192, and never
+    /// larger than a pinned tailsize.
     pub fn surround_set_blocksize(
         &mut self,
         blocksize: Option<u32>,
     ) -> Result<(), crate::error::EngineError> {
-        // Reject obviously-invalid values BEFORE persisting (G7). A 0 blocksize is
-        // invalid; `None` stays valid (PipeWire default / auto).
-        if blocksize == Some(0) {
-            return Err(crate::error::EngineError::BadRequest(
-                "blocksize must be greater than 0 (use None for the PipeWire default)".into(),
-            ));
-        }
+        Self::validate_convolver_size("blocksize", blocksize)?;
         {
             let name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
@@ -3004,7 +3017,48 @@ impl<R: CommandRunner> Engine<R> {
                     name.clone(),
                 ))
             })?;
+            if let (Some(b), Some(t)) = (blocksize, profile.surround.tailsize) {
+                if b > t {
+                    return Err(crate::error::EngineError::BadRequest(format!(
+                        "blocksize {b} exceeds the pinned tailsize {t}"
+                    )));
+                }
+            }
             profile.surround.blocksize = blocksize;
+        }
+        self.save_config()?;
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        Ok(())
+    }
+
+    /// Pin (or clear) the convolver tailsize. Persists; re-applies when enabled.
+    /// Same validation as blocksize, plus tailsize ≥ blocksize (a tail partition
+    /// smaller than the head partition is invalid). Rationale: a bare small
+    /// blocksize partitions the entire ~250 ms bundled IR at that size — the
+    /// tail should run in larger, cheaper partitions.
+    pub fn surround_set_tailsize(
+        &mut self,
+        tailsize: Option<u32>,
+    ) -> Result<(), crate::error::EngineError> {
+        Self::validate_convolver_size("tailsize", tailsize)?;
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            if let (Some(t), Some(b)) = (tailsize, profile.surround.blocksize) {
+                if t < b {
+                    return Err(crate::error::EngineError::BadRequest(format!(
+                        "tailsize {t} must be ≥ the pinned blocksize {b}"
+                    )));
+                }
+            }
+            profile.surround.tailsize = tailsize;
         }
         self.save_config()?;
         if self.config.active()?.surround.enabled {
@@ -6902,6 +6956,21 @@ mod tests {
         assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
     }
 
+    /// Remove stale on-disk confs from previous tests/runs so the
+    /// diff-before-recreate guards never skip a scripted teardown+respawn.
+    fn scrub_stale_confs() {
+        let t = std::env::temp_dir();
+        for f in [
+            "arctis_arctis_surround.conf",
+            "arctis_eq.Arctis_Game.conf",
+            "arctis_eq.Arctis_Chat.conf",
+            "arctis_eq.Arctis_Media.conf",
+            "arctis_eq.Arctis_Aux.conf",
+        ] {
+            let _ = std::fs::remove_file(t.join(f));
+        }
+    }
+
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
     /// Engine::new seeds "aux" → 4 channels (game/chat/media/aux).
     /// Step6 enabled (apply_surround uses recreate_ex in enabled path):
@@ -6911,6 +6980,7 @@ mod tests {
     ///   2. reroute "game": set_output → ls (source_exists: present) → find_node_id → destroy → pkill + ls (source absent → spawn)
     ///   3. reroute "media": same
     fn queue_reconcile_surround_enabled_absent(runner: MockRunner) -> MockRunner {
+        scrub_stale_confs();
         let ls_channels = ls_all_present();
         let ls_surround_absent = ls_all_absent(); // no surround node
         let mut r = runner;
@@ -7102,6 +7172,7 @@ mod tests {
 
     #[test]
     fn surround_set_hrir_persists_and_emits_event() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_set_hrir_home");
         let tmp_cfg = unique_cfg_tmp("surr_set_hrir_cfg");
@@ -7173,6 +7244,7 @@ mod tests {
 
     #[test]
     fn surround_set_channels_persists_and_emits_event() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("surr_set_ch");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
@@ -7228,6 +7300,7 @@ mod tests {
 
     #[test]
     fn surround_set_blocksize_persists() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("surr_set_bs");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
@@ -7239,6 +7312,68 @@ mod tests {
         assert_eq!(engine.config.active().unwrap().surround.blocksize, Some(128));
         engine.surround_set_blocksize(None).unwrap();
         assert_eq!(engine.config.active().unwrap().surround.blocksize, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_blocksize_rejects_non_power_of_two_and_out_of_range() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_bs_invalid");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        for bad in [100u32, 32, 16384, 65] {
+            let res = engine.surround_set_blocksize(Some(bad));
+            assert!(
+                matches!(res, Err(crate::error::EngineError::BadRequest(_))),
+                "blocksize {bad} must be rejected (power of two in 64..=8192)"
+            );
+        }
+        // Valid values pass (64 and 8192 are the range edges).
+        engine.surround_set_blocksize(Some(64)).unwrap();
+        engine.surround_set_blocksize(Some(8192)).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_tailsize_validates_and_persists() {
+        scrub_stale_confs();
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_ts");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Same shape validation as blocksize.
+        assert!(matches!(
+            engine.surround_set_tailsize(Some(100)),
+            Err(crate::error::EngineError::BadRequest(_))
+        ));
+        // tailsize must be >= a pinned blocksize.
+        engine.surround_set_blocksize(Some(256)).unwrap();
+        assert!(
+            matches!(
+                engine.surround_set_tailsize(Some(128)),
+                Err(crate::error::EngineError::BadRequest(_))
+            ),
+            "tailsize below the pinned blocksize must be rejected"
+        );
+        engine.surround_set_tailsize(Some(4096)).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.tailsize, Some(4096));
+        // And blocksize may not be raised past the pinned tailsize.
+        assert!(matches!(
+            engine.surround_set_blocksize(Some(8192)),
+            Err(crate::error::EngineError::BadRequest(_))
+        ));
+        // Clearing works.
+        engine.surround_set_tailsize(None).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.tailsize, None);
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -7299,6 +7434,7 @@ mod tests {
     /// After apply_surround: media must be restored to its output_device; surround_routed = {"game"}.
     #[test]
     fn apply_surround_restores_removed_channel() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("c1_restore_home");
         let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
@@ -7400,6 +7536,7 @@ mod tests {
     /// (even though output_device = None), surround_routed = {}.
     #[test]
     fn apply_surround_disabled_restores_stale_channel_with_no_output_device() {
+        scrub_stale_confs();
         // Config: surround disabled (default). Game channel has output_device = None.
         let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
 
@@ -7473,6 +7610,7 @@ mod tests {
     /// 2. surround_set_enabled(false) → drains surround_routed + restores channels
     #[test]
     fn surround_set_enabled_disable_restores_all_channels() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_roundtrip_home");
         let tmp_cfg = unique_cfg_tmp("surr_roundtrip_cfg");
@@ -7607,6 +7745,7 @@ mod tests {
     /// → only the sink is recreated (no channel thrash).
     #[test]
     fn surround_set_hrir_enabled_uses_apply_surround_no_channel_thrash() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_hrir_i3_home");
         let tmp_cfg = unique_cfg_tmp("surr_hrir_i3_cfg");
@@ -8709,6 +8848,7 @@ mod tests {
     ///   recreate_ex: remove source_exists (absent, 1 ls) + spawn_conf (no ls) = 1 ls
     ///   set_output game: remove sink_exists (absent) + create sink_exists (absent → spawn) = 2 ls
     fn queue_apply_surround_both_absent(runner: MockRunner) -> MockRunner {
+        scrub_stale_confs();
         let ls_absent = ls_all_absent();
         runner
             .with_output(0, &ls_absent, "") // recreate_ex: remove source_exists (absent)

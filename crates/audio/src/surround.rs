@@ -59,6 +59,12 @@ pub struct SurroundRender<'a> {
     /// common target so switching HRIRs (or A/B-ing vs bypass) compares tone,
     /// not loudness. `None` omits it (unity).
     pub gain: Option<f32>,
+    /// Convolver tail partition size in samples (`tailsize = n`). Pairs with
+    /// `blocksize`: a small blocksize (low latency) with NO tailsize partitions
+    /// the ENTIRE impulse response at that size — for the bundled 250 ms /
+    /// 12000-sample IR that means ~188 tiny partitions and real xrun risk.
+    /// `None` omits it (PipeWire default).
+    pub tailsize: Option<u32>,
 }
 
 // ─── Conf renderer ────────────────────────────────────────────────────────────
@@ -226,8 +232,12 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
             Some(n) => format!("  blocksize = {n}"),
             None => String::new(),
         };
+        let ts = match r.tailsize {
+            Some(n) => format!("  tailsize = {n}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch}{g}{bs} }} }}\n"
+            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch}{g}{bs}{ts} }} }}\n"
         ));
     }
 
@@ -664,6 +674,7 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
         output_eq: None,
         blocksize: None,
         gain: None,
+        tailsize: None,
     })
 }
 
@@ -777,11 +788,31 @@ impl<R: CommandRunner> SurroundBackend<R> {
         self.create(hrir_path)
     }
 
-    /// Teardown then recreate with explicit channel count and optional output EQ.
+    /// Diff-before-recreate: if `conf` is byte-identical to what's already on
+    /// disk AND the node is live, skip the teardown+respawn entirely — a
+    /// respawn is an audible dropout plus a fallback window where streams play
+    /// unconvolved. Otherwise tear down and spawn fresh.
+    fn recreate_conf(&mut self, conf: String) -> Result<ConfHandle, AudioError> {
+        let path = self.conf_path();
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|existing| existing == conf)
+            .unwrap_or(false);
+        if unchanged && self.source_exists()? {
+            return Ok(ConfHandle {
+                conf_path: path,
+                child: None,
+            });
+        }
+        self.remove()?;
+        self.spawn_conf(conf)
+    }
+
+    /// Recreate with explicit channel count and optional output EQ.
     ///
     /// `channels` must be `6` (5.1) or `8` (7.1); see [`render_surround_conf_ex`].
-    /// Use this when switching surround topology at runtime — always tears down the
-    /// existing sink before spawning the new one.
+    /// Renders first and skips the teardown+respawn when nothing changed (see
+    /// [`Self::recreate_conf`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn recreate_ex(
         &mut self,
         hrir_path: &Path,
@@ -789,8 +820,8 @@ impl<R: CommandRunner> SurroundBackend<R> {
         output_eq: Option<&EqModel>,
         blocksize: Option<u32>,
         gain: Option<f32>,
+        tailsize: Option<u32>,
     ) -> Result<ConfHandle, AudioError> {
-        self.remove()?;
         let conf = render_surround_conf_ex(&SurroundRender {
             spec: &self.spec,
             hrir_path,
@@ -798,22 +829,22 @@ impl<R: CommandRunner> SurroundBackend<R> {
             output_eq,
             blocksize,
             gain,
+            tailsize,
         })?;
-        self.spawn_conf(conf)
+        self.recreate_conf(conf)
     }
 
-    /// Teardown then recreate as a stereo-bypass sink (no HRIR convolver).
+    /// Recreate as a stereo-bypass sink (no HRIR convolver).
     ///
     /// `crossfeed` is [0, 100]; see [`render_stereo_bypass_conf`].
-    /// Use this when the source is already stereo and no upmix is wanted.
+    /// Renders first and skips the teardown+respawn when nothing changed.
     pub fn recreate_stereo_bypass(
         &mut self,
         crossfeed: u8,
         output_eq: Option<&EqModel>,
     ) -> Result<ConfHandle, AudioError> {
-        self.remove()?;
         let conf = render_stereo_bypass_conf(&self.spec, crossfeed, output_eq)?;
-        self.spawn_conf(conf)
+        self.recreate_conf(conf)
     }
 
     /// Resolve the filter-chain node id for the capture (sink) node.
@@ -981,6 +1012,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap_err();
         assert!(
@@ -1001,6 +1033,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: Some(&eq),
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap_err();
         assert!(
@@ -1020,6 +1053,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1085,6 +1119,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: Some(128),
             gain: None,
+            tailsize: None,
         })
         .unwrap();
         let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
@@ -1106,6 +1141,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: Some(1.25),
+            tailsize: None,
         })
         .unwrap();
         let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
@@ -1133,6 +1169,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
         assert!(!got.contains("blocksize"), "None must not emit a blocksize key");
@@ -1157,6 +1194,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: Some(&eq),
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1235,6 +1273,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: Some(&eq),
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1320,6 +1359,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1342,6 +1382,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1370,6 +1411,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: Some(&eq),
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1433,6 +1475,7 @@ id 40, type PipeWire:Interface:Node/3
             output_eq: None,
             blocksize: None,
             gain: None,
+            tailsize: None,
         })
         .unwrap();
         assert_eq!(
@@ -1775,6 +1818,8 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test 8ch EQ".into(),
             hw_sink: None,
         };
+        // Scrub any stale conf so the diff-guard cannot skip the scripted spawn.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_8ch_eq.conf"));
         // remove: source_exists → absent (early return, no destroy)
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
@@ -1782,7 +1827,7 @@ id 40, type PipeWire:Interface:Node/3
         let eq = EqModel {
             bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 3.0)],
         };
-        let handle = be.recreate_ex(&hrir, 8, Some(&eq), None, None).unwrap();
+        let handle = be.recreate_ex(&hrir, 8, Some(&eq), None, None, None).unwrap();
 
         // (a) one spawn_owned("pipewire", ["-c", <conf_path>]) recorded
         let spawned = &be.runner().spawned;
@@ -1820,11 +1865,12 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test 6ch".into(),
             hw_sink: None,
         };
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_6ch.conf"));
         // remove: source_exists → absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
         let hrir = PathBuf::from("/test/hrir.wav");
-        let handle = be.recreate_ex(&hrir, 6, None, None, None).unwrap();
+        let handle = be.recreate_ex(&hrir, 6, None, None, None, None).unwrap();
 
         let spawned = &be.runner().spawned;
         assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
@@ -1845,6 +1891,7 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test bypass".into(),
             hw_sink: None,
         };
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_bypass.conf"));
         // remove: source_exists → absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
@@ -1864,5 +1911,88 @@ id 40, type PipeWire:Interface:Node/3
             !conf.contains("convolver"),
             "stereo bypass must not contain any convolver node"
         );
+    }
+
+    /// Diff-before-recreate: identical on-disk conf + live node → NO teardown,
+    /// no respawn (an unnecessary respawn is an audible dropout).
+    #[test]
+    fn recreate_ex_skips_respawn_when_conf_identical_and_node_live() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_guard".into(),
+            description: "Guard".into(),
+            hw_sink: None,
+        };
+        let hrir = PathBuf::from("/test/hrir.wav");
+        // Pre-write the EXACT conf recreate_ex would render.
+        let conf = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &hrir,
+            channels: 8,
+            output_eq: None,
+            blocksize: Some(128),
+            gain: None,
+            tailsize: Some(1024),
+        })
+        .unwrap();
+        let path = std::env::temp_dir().join("arctis_test_surr_guard.conf");
+        std::fs::write(&path, conf).unwrap();
+
+        let ls = "id 81, type PipeWire:Interface:Node/3\n    node.name = \"effect_input.test_surr_guard\"\n";
+        let runner = MockRunner::new().with_output(0, ls, ""); // guard: source_exists (present)
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be
+            .recreate_ex(&hrir, 8, None, Some(128), None, Some(1024))
+            .unwrap();
+
+        assert!(handle.child.is_none(), "no respawn when nothing changed");
+        assert_eq!(be.runner().calls.len(), 1, "only the existence check runs");
+        assert!(be.runner().spawned.is_empty(), "no pipewire spawn");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Diff-before-recreate: a CHANGED conf must tear down + respawn as before.
+    #[test]
+    fn recreate_ex_respawns_when_conf_changed() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_guard2".into(),
+            description: "Guard2".into(),
+            hw_sink: None,
+        };
+        let path = std::env::temp_dir().join("arctis_test_surr_guard2.conf");
+        std::fs::write(&path, "stale contents").unwrap();
+
+        // remove: source_exists → absent (early return) → spawn
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be
+            .recreate_ex(&PathBuf::from("/test/hrir.wav"), 8, None, None, None, None)
+            .unwrap();
+        assert!(handle.child.is_some(), "changed conf must respawn");
+        assert_eq!(be.runner().spawned.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tailsize is emitted on every convolver when set.
+    #[test]
+    fn render_with_tailsize_emits_tailsize_on_every_convolver() {
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: None,
+            blocksize: Some(64),
+            gain: None,
+            tailsize: Some(4096),
+        })
+        .unwrap();
+        let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
+        assert_eq!(conv_lines.len(), 16);
+        for line in &conv_lines {
+            assert!(
+                line.contains("blocksize = 64  tailsize = 4096"),
+                "convolver line missing blocksize/tailsize pair: {line}"
+            );
+        }
     }
 }
