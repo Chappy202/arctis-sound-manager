@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Popover } from "bits-ui";
   import type { ChannelSnapshot, AppStream, OutputDeviceSnapshot } from "../ipc.js";
-  import { setChannelOutput, setChannelVolume, setChannelMute } from "../ipc.js";
+  import { setChannelOutput, setChannelVolume, setChannelVolumeAck, setChannelMute } from "../ipc.js";
   import {
     buildDeviceOptions,
     toSelectOptions,
@@ -99,6 +99,13 @@
   async function handleVolumeCommit(pct: number) {
     const s = await setChannelVolume(channel.id, pct);
     if (s) engineState.set(s);
+  }
+
+  // Intermediate drag ticks (80 ms throttle): ack-only IPC — the daemon
+  // applies the volume but no full EngineState crosses the bridge. The
+  // release commit above still returns state, so convergence happens.
+  function handleVolumeDrag(pct: number) {
+    return setChannelVolumeAck(channel.id, pct);
   }
 
   // -----------------------------------------------------------------------
@@ -233,6 +240,7 @@
       accent={accentFor(channel.id)}
       label="Volume for {channel.id.toUpperCase()}"
       oncommit={handleVolumeCommit}
+      ondrag={handleVolumeDrag}
       onError={onError}
     />
     <LevelMeter

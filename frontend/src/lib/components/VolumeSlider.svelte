@@ -27,6 +27,12 @@
     volume: number;
     /** Called to persist the volume; may return a Promise (rejections go to onError). */
     oncommit: (v: number) => void | Promise<unknown>;
+    /**
+     * Optional lightweight commit for INTERMEDIATE drag ticks (ack-only IPC,
+     * no EngineState echo). The release commit always uses `oncommit` so
+     * state convergence still happens. Omitted → ticks fall back to oncommit.
+     */
+    ondrag?: (v: number) => void | Promise<unknown>;
     /** Called with a user-readable message when oncommit rejects. */
     onError?: (msg: string) => void;
     /** ARIA label for the slider (e.g. "Volume for GAME"). */
@@ -39,6 +45,7 @@
   let {
     volume,
     oncommit,
+    ondrag,
     onError,
     label = "Volume",
     accent,
@@ -60,8 +67,11 @@
   // -----------------------------------------------------------------------
 
   const committer = createVolumeCommitter(VOLUME_COMMIT_INTERVAL_MS, (v) => {
+    // Intermediate ticks fire while dragging → cheap ack path when provided;
+    // the release flush runs after `dragging` clears → full state commit.
+    const fn = dragging && ondrag ? ondrag : oncommit;
     // Route async rejections to onError; never let them throw uncaught.
-    Promise.resolve(oncommit(v)).catch((e) => onError?.(toErrorMsg(e)));
+    Promise.resolve(fn(v)).catch((e) => onError?.(toErrorMsg(e)));
   });
 
   // -----------------------------------------------------------------------
@@ -76,8 +86,10 @@
 
   function handleValueCommit(v: number) {
     value = v;
-    committer.flush();
+    // Clear `dragging` BEFORE flushing so the release commit takes the full
+    // state-returning oncommit path (see the committer callback above).
     dragging = false;
+    committer.flush();
   }
 
   // -----------------------------------------------------------------------

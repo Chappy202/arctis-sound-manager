@@ -1,0 +1,74 @@
+/**
+ * fonts.css — Bundled webfonts (DESIGN.md typography stack).
+ *
+ * The app is offline-first (Tauri): 'Inter', 'Saira Condensed' and
+ * 'JetBrains Mono' are bundled from frontend/public/fonts/ rather than
+ * fetched from a CDN. Latin subsets only, and only the weights the CSS
+ * actually uses (Inter 400/600/700, Saira Condensed 700, JBM 400/500/700).
+ *
+ * font-display: block — a brief invisible-text window beats a flash of the
+ * fallback face on a local (instant) load.
+ *
+ * Sources: Inter (rsms/inter), Saira Condensed (Omnibus-Type/Saira),
+ * JetBrains Mono (JetBrains/JetBrainsMono) — all SIL OFL 1.1, see
+ * LICENSES/fonts/ at the repo root.
+ */
+
+/* ── Inter — UI sans (body, labels, buttons) ── */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url('/fonts/inter-v20-latin-regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 600;
+  font-display: block;
+  src: url('/fonts/inter-v20-latin-600.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url('/fonts/inter-v20-latin-700.woff2') format('woff2');
+}
+
+/* ── Saira Condensed — display headings (uppercase condensed) ── */
+@font-face {
+  font-family: 'Saira Condensed';
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url('/fonts/saira-condensed-v12-latin-700.woff2') format('woff2');
+}
+
+/* ── JetBrains Mono — tabular numeric readouts (dB / Hz / % / battery) ── */
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url('/fonts/jetbrains-mono-v24-latin-regular.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: block;
+  src: url('/fonts/jetbrains-mono-v24-latin-500.woff2') format('woff2');
+}
+
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: block;
+  src: url('/fonts/jetbrains-mono-v24-latin-700.woff2') format('woff2');
+}

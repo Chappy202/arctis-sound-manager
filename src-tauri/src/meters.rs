@@ -19,11 +19,20 @@
 //! * **Mic source** (`arctis_clean_mic`): pw-record targets the source
 //!   directly.
 //!
+//! # Lifecycle
+//!
+//! Capture workers only run while at least one LevelMeter is subscribed: the
+//! emit loop in lib.rs starts the [`MeterTask`] on the 0→1 subscriber edge and
+//! drops it on 1→0 (Drop kills the pw-record children), so a hidden window or
+//! a meterless page costs zero capture processes. See [`lifecycle`].
+//!
 //! # Resilience
 //!
-//! Nodes that do not exist yet → pw-record exits quickly with error → we keep
-//! the level at 0.0 until the next restart attempt (every ~1 s).  Errors
-//! never crash the app; all code is off the audio hot path.
+//! Each node has a supervisor thread that respawns its pw-record child when it
+//! exits (node absent yet, pw-record missing, PipeWire restart). Quick failures
+//! back off exponentially from ~1 s to ~5 s; the level holds at 0.0 while no
+//! child runs (honest: no data = silence). Errors never crash the app; all
+//! code is off the audio hot path.
 //!
 //! # CPU
 //!
@@ -113,6 +122,13 @@ const NODES: &[NodeCfg] = &[
 const RATE: u32 = 48_000;
 /// ~40 ms window for peak computation (samples per channel).
 const WINDOW_SAMPLES: usize = 1_920;
+/// Base delay before respawning an exited pw-record child.
+const RESPAWN_DELAY_MS: u64 = 1_000;
+/// Cap for the respawn backoff when the child keeps failing quickly.
+const RESPAWN_DELAY_MAX_MS: u64 = 5_000;
+/// A capture run shorter than this counts as a failed start (node absent,
+/// pw-record erroring out) and doubles the backoff; longer runs reset it.
+const HEALTHY_RUN_MS: u64 = 2_000;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-testable, no subprocess)
@@ -144,6 +160,40 @@ pub(crate) fn peak_from_s16_bytes(bytes: &[u8]) -> f32 {
     peak as f32 / i16::MAX as f32
 }
 
+/// Next respawn delay: reset to the base after a healthy run, otherwise double
+/// (bounded) so a permanently-absent node doesn't spin a subprocess every second.
+pub(crate) fn next_respawn_delay_ms(prev_ms: u64, ran_healthy: bool) -> u64 {
+    if ran_healthy {
+        RESPAWN_DELAY_MS
+    } else {
+        (prev_ms * 2).min(RESPAWN_DELAY_MAX_MS)
+    }
+}
+
+/// What the emit loop (lib.rs) should do this tick, given the UI subscriber
+/// count and whether capture workers are currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// Subscribers gone, workers running → drop the task (kills pw-record children).
+    Stop,
+    /// No subscribers, nothing running → do nothing.
+    Idle,
+    /// First subscriber arrived → start capture workers.
+    Start,
+    /// Subscribers present, workers running → collect + emit.
+    Run,
+}
+
+/// Map (subscriber count, workers running) → the lifecycle action for this tick.
+pub fn lifecycle(subscribers: usize, running: bool) -> Lifecycle {
+    match (subscribers, running) {
+        (0, true) => Lifecycle::Stop,
+        (0, false) => Lifecycle::Idle,
+        (_, false) => Lifecycle::Start,
+        (_, true) => Lifecycle::Run,
+    }
+}
+
 /// Build the `pw-record` command-line arguments for a given node config.
 ///
 /// Returns `(program, args)` so the caller can pass them to `Command::new`.
@@ -168,8 +218,9 @@ fn pw_record_args(node: &NodeCfg) -> (&'static str, Vec<String>) {
 // ---------------------------------------------------------------------------
 
 /// Reads from a `pw-record` child's stdout, computes peaks over windows, and
-/// sends them on `tx`.  Runs until `stop` is set or the child exits.
-fn capture_loop(mut child: Child, channels: u8, tx: watch::Sender<f32>, stop: Arc<AtomicBool>) {
+/// sends them on `tx`.  Returns when `stop` is set or the child exits (EOF /
+/// read error); the supervisor decides whether to respawn.
+fn capture_loop(mut child: Child, channels: u8, tx: &watch::Sender<f32>, stop: &AtomicBool) {
     let buf_bytes = WINDOW_SAMPLES * channels as usize * 2; // 2 bytes/sample
     let mut buf = vec![0u8; buf_bytes];
     let mut stdout = match child.stdout.take() {
@@ -208,32 +259,57 @@ fn capture_loop(mut child: Child, channels: u8, tx: watch::Sender<f32>, stop: Ar
     let _ = child.wait();
 }
 
-/// Spawn a `pw-record` capture worker for one node.
+/// Supervisor: (re)spawns the pw-record child for one node until `stop` is
+/// set.  When the child exits (node not created yet, pw-record missing,
+/// PipeWire restart) the level is reset to 0.0 and the child is respawned
+/// after a bounded backoff — so meters recover when the daemon/sinks come up
+/// after the GUI, instead of staying dead until relaunch.
+fn supervise_capture(node: NodeCfg, tx: watch::Sender<f32>, stop: Arc<AtomicBool>) {
+    let mut delay_ms = RESPAWN_DELAY_MS;
+    while !stop.load(Ordering::Relaxed) {
+        let started = std::time::Instant::now();
+        let (prog, args) = pw_record_args(&node);
+        let child_result = Command::new(prog)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()) // suppress pw-record status lines
+            .spawn();
+        if let Ok(child) = child_result {
+            capture_loop(child, node.channels, &tx, &stop);
+        }
+        // Spawn failure (pw-record not found) falls through to the same
+        // backoff path — it may appear later (e.g. PATH/env fixed by reinstall).
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = tx.send(0.0); // no child → honest silence
+        let healthy = started.elapsed().as_millis() as u64 >= HEALTHY_RUN_MS;
+        delay_ms = next_respawn_delay_ms(delay_ms, healthy);
+        sleep_unless_stopped(delay_ms, &stop);
+    }
+}
+
+/// Sleep `total_ms` in small slices, returning early once `stop` is set so a
+/// dropped MeterTask never leaves a supervisor respawning a child.
+fn sleep_unless_stopped(total_ms: u64, stop: &AtomicBool) {
+    let mut remaining = total_ms;
+    while remaining > 0 && !stop.load(Ordering::Relaxed) {
+        let step = remaining.min(100);
+        thread::sleep(std::time::Duration::from_millis(step));
+        remaining -= step;
+    }
+}
+
+/// Spawn the supervised capture worker for one node.
 ///
 /// Returns `(rx, stop_flag)`.  Set `stop_flag` to true to request teardown;
-/// the worker thread exits at the next read boundary.
+/// the supervisor exits at the next read/sleep boundary and kills its child.
 fn spawn_capture(node: &NodeCfg) -> (watch::Receiver<f32>, Arc<AtomicBool>) {
     let (tx, rx) = watch::channel(0.0f32);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
-    let channels = node.channels;
-
-    let (prog, args) = pw_record_args(node);
-    let child_result = Command::new(prog)
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null()) // suppress pw-record status lines
-        .spawn();
-
-    match child_result {
-        Ok(child) => {
-            thread::spawn(move || capture_loop(child, channels, tx, stop_clone));
-        }
-        Err(_) => {
-            // pw-record not found or node absent — level stays at 0.0
-        }
-    }
-
+    let node = node.clone();
+    thread::spawn(move || supervise_capture(node, tx, stop_clone));
     (rx, stop)
 }
 
@@ -263,8 +339,8 @@ impl Drop for MeterTask {
         for flag in &self.stop_flags {
             flag.store(true, Ordering::Relaxed);
         }
-        // Worker threads will notice the flag and kill their children on the
-        // next read; we don't block waiting for them.
+        // Supervisor threads notice the flag at the next read/sleep boundary
+        // and kill their children; we don't block waiting for them.
     }
 }
 
@@ -473,5 +549,43 @@ mod tests {
         assert!(!levels_unchanged(&a, &b));
         let c = payload(&[("Arctis_Game", 0.5), ("Arctis_Chat", 0.5)]);
         assert!(!levels_unchanged(&a, &c));
+    }
+
+    // --- lifecycle (subscriber count → task lifecycle) ---
+
+    #[test]
+    fn first_subscriber_starts_workers() {
+        assert_eq!(lifecycle(1, false), Lifecycle::Start);
+        assert_eq!(lifecycle(3, false), Lifecycle::Start);
+    }
+
+    #[test]
+    fn last_unsubscribe_stops_workers() {
+        assert_eq!(lifecycle(0, true), Lifecycle::Stop);
+    }
+
+    #[test]
+    fn steady_states_keep_or_idle() {
+        assert_eq!(lifecycle(0, false), Lifecycle::Idle);
+        assert_eq!(lifecycle(2, true), Lifecycle::Run);
+    }
+
+    // --- next_respawn_delay_ms (bounded backoff) ---
+
+    #[test]
+    fn healthy_run_resets_backoff_to_base() {
+        assert_eq!(next_respawn_delay_ms(RESPAWN_DELAY_MAX_MS, true), RESPAWN_DELAY_MS);
+        assert_eq!(next_respawn_delay_ms(RESPAWN_DELAY_MS, true), RESPAWN_DELAY_MS);
+    }
+
+    #[test]
+    fn quick_failure_doubles_backoff() {
+        assert_eq!(next_respawn_delay_ms(RESPAWN_DELAY_MS, false), RESPAWN_DELAY_MS * 2);
+    }
+
+    #[test]
+    fn backoff_is_capped() {
+        assert_eq!(next_respawn_delay_ms(RESPAWN_DELAY_MAX_MS, false), RESPAWN_DELAY_MAX_MS);
+        assert_eq!(next_respawn_delay_ms(4_000, false), RESPAWN_DELAY_MAX_MS);
     }
 }

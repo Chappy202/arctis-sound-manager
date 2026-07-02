@@ -9,7 +9,7 @@
     freqToX, gainToY, xToFreq, yToGain, logFreqAxis, summedCurveDb, clampBand,
     FREQ_MIN, FREQ_MAX, GAIN_MIN, GAIN_MAX, type Band,
   } from "../eq.js";
-  import { setEqBand } from "../ipc.js";
+  import { setEqBand, setEqBandAck } from "../ipc.js";
   import { beginEditing, endEditing, pulseEditing } from "../stores/eqEditing.js";
 
   interface Props {
@@ -22,9 +22,13 @@
   }
   let { bands, selectedIndex, onBandChange, onSelect, onFlush, channelId = "" }: Props = $props();
 
-  // Internal viewBox coordinate space (CSS scales the SVG to fit).
-  const VW = 1000;
-  const VH = 360;
+  // Internal viewBox coordinate space. The viewBox tracks the rendered size
+  // 1:1 via a ResizeObserver (see $effect below), so axis text and band dots
+  // render undistorted at any aspect ratio — a fixed viewBox with
+  // preserveAspectRatio="none" stretched them at extreme aspect ratios.
+  // Values below are only the pre-observation fallback (design size).
+  let VW = $state(1000);
+  let VH = $state(360);
 
   const BAND_COLORS = [
     "#FF5200", "#0091D1", "#41A930", "#754BD3", "#FFBE00",
@@ -46,9 +50,19 @@
     setEqBand(channelId, index, band.kind, band.freqHz, band.q, band.gainDb)
       .catch((e) => console.warn("[EqGraph] setEqBand failed:", e));
   }
+  // Intermediate drag ticks use the ack-only command: the daemon applies the
+  // band but no EngineState is serialised over the bridge (~20 ticks/s of
+  // pure waste otherwise). The release/commit path keeps using flush() above
+  // so state convergence still happens. Callers that own their IPC (onFlush,
+  // e.g. the mic EQ) receive intermediate ticks through the same prop.
+  function dragFlush(index: number, band: Band) {
+    if (onFlush) { onFlush(index, band); return; }
+    setEqBandAck(channelId, index, band.kind, band.freqHz, band.q, band.gainDb)
+      .catch((e) => console.warn("[EqGraph] setEqBandAck failed:", e));
+  }
   function throttledFlush(index: number) {
     if (throttleTimer !== null) return;
-    throttleTimer = setTimeout(() => { throttleTimer = null; flush(index, bands[index]); }, THROTTLE_MS);
+    throttleTimer = setTimeout(() => { throttleTimer = null; dragFlush(index, bands[index]); }, THROTTLE_MS);
   }
 
   // ── Derived geometry ──────────────────────────────────────────────────────
@@ -69,6 +83,22 @@
 
   function handleX(b: Band) { return freqToX(b.freqHz, VW); }
   function handleY(b: Band) { return gainToY(b.gainDb, VH); }
+
+  // ── ResizeObserver → viewBox tracks the rendered size 1:1 ────────────────
+  let wrapEl: HTMLDivElement | undefined = $state();
+  $effect(() => {
+    if (!wrapEl || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[entries.length - 1]?.contentRect;
+      // Ignore zero sizes (display:none / detached) — keep the last good box.
+      if (r && r.width > 0 && r.height > 0) {
+        VW = Math.round(r.width);
+        VH = Math.round(r.height);
+      }
+    });
+    ro.observe(wrapEl);
+    return () => ro.disconnect();
+  });
 
   // ── Pointer drag (per-handle) ─────────────────────────────────────────────
   let dragIndex = -1;
@@ -164,8 +194,8 @@
   }
 </script>
 
-<div class="eq-graph-wrap">
-  <svg bind:this={svgEl} viewBox="0 0 {VW} {VH}" preserveAspectRatio="none"
+<div class="eq-graph-wrap" bind:this={wrapEl}>
+  <svg bind:this={svgEl} viewBox="0 0 {VW} {VH}"
        class="eq-graph" role="group" aria-label="Parametric EQ frequency response editor">
     <!-- grid -->
     {#each FREQ_LABELS as f}

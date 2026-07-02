@@ -3,6 +3,7 @@
  * Imports tokens.css and applies the dark base, box-sizing reset,
  * focus-visible, and reduced-motion rules.
  */
+@import './fonts.css';
 @import './tokens.css';
 
 /* ============================================================================
@@ -19,7 +20,14 @@
 /* ============================================================================
  * Dark base
  * ============================================================================ */
+:root {
+  /* Dark-only app: keeps native widgets/scrollbars/form controls dark and
+   * stops WebKit from ever painting a light default background. */
+  color-scheme: dark;
+}
+
 html {
+  background: var(--ss-bg-root);
   font-size: 16px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -36,6 +44,24 @@ body {
   min-width: var(--ss-window-min-w);
   min-height: var(--ss-window-min-h);
   overflow-x: hidden;
+  /* Native feel: this is a device console, not a document — chrome text is
+   * not selectable and the cursor stays default. Copyable content opts back
+   * in below (inputs, alerts) or locally (e.g. the version label). */
+  user-select: none;
+  cursor: default;
+}
+
+/* Explicit text opt-ins: editable fields must stay selectable… */
+input,
+textarea,
+[contenteditable]:not([contenteditable="false"]) {
+  user-select: text;
+  cursor: text;
+}
+
+/* …and error/status messages stay copyable for bug reports. */
+[role="alert"] {
+  user-select: text;
 }
 
 /* ============================================================================

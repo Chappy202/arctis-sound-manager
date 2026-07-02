@@ -22,19 +22,48 @@
   // ── Shared module-level subscription ──────────────────────────────────────
   // ONE Tauri `levels` listener for ALL LevelMeter instances; it fans out to
   // each instance's handler. It also drives the Rust subscriber gate: the first
-  // mounted meter calls meter_subscribe, the last to unmount calls
-  // meter_unsubscribe — so when no meter is on screen, Rust emits nothing.
+  // mounted meter subscribes, the last to unmount unsubscribes — and the Rust
+  // side ties the pw-record capture workers to that count, so with no meter on
+  // screen ZERO capture processes run. Hiding to tray counts as "no meter":
+  // visibilitychange releases the Rust subscription while hidden and reclaims
+  // it on show (capture teardown/restart is handled Rust-side).
   type LevelsHandler = (payload: LevelsPayload) => void;
   const handlers = new Set<LevelsHandler>();
   let sharedUnlisten: (() => void) | null = null;
   let refCount = 0;
+  let rustSubscribed = false;
+
+  function subscribeRust() {
+    if (rustSubscribed) return;
+    rustSubscribed = true;
+    void meterSubscribe();
+  }
+
+  function unsubscribeRust() {
+    if (!rustSubscribed) return;
+    rustSubscribed = false;
+    void meterUnsubscribe();
+  }
+
+  function handleVisibilityChange() {
+    if (document.hidden) {
+      unsubscribeRust(); // hidden to tray → stop pw-record capture entirely
+    } else if (refCount > 0) {
+      subscribeRust();
+    }
+  }
 
   async function acquireShared(handler: LevelsHandler) {
     handlers.add(handler);
     refCount += 1;
     if (refCount > 1) return; // listener + Rust subscription already live
     try {
-      void meterSubscribe(); // tell Rust at least one meter is mounted
+      // Tell Rust at least one meter is mounted — unless the window is hidden,
+      // in which case the visibilitychange handler subscribes on show.
+      if (typeof document === "undefined" || !document.hidden) subscribeRust();
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+      }
       const unlisten = await onLevels((payload) => {
         // Pause while the window/tab is hidden — no point smoothing meters
         // nobody can see, and it keeps the event off a backgrounded compositor.
@@ -61,7 +90,10 @@
     if (refCount === 0) {
       sharedUnlisten?.();
       sharedUnlisten = null;
-      void meterUnsubscribe();
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      }
+      unsubscribeRust();
     }
   }
 

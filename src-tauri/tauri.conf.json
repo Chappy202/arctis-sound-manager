@@ -16,6 +16,7 @@
         "label": "main",
         "title": "Arctis Sound Manager",
         "visible": false,
+        "backgroundColor": "#0F0D0E",
         "width": 1100,
         "height": 720,
         "minWidth": 920,
