@@ -74,6 +74,9 @@ pub enum StageName {
     Compressor,
     Gate,
     MicEq,
+    /// Always-on output limiter (hard_limiter_1413, −1 dBFS ceiling). Not a
+    /// user-toggled stage — reported so a missing plugin is still visible.
+    Limiter,
 }
 
 impl From<StageKind> for StageName {

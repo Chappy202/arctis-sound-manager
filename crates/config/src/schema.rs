@@ -44,7 +44,7 @@ fn default_gate_thresh() -> f32 {
     0.003
 }
 fn default_atten_limit() -> f32 {
-    100.0
+    70.0
 }
 fn default_comp_threshold() -> f32 {
     -18.0
@@ -54,6 +54,12 @@ fn default_comp_ratio() -> f32 {
 }
 fn default_comp_makeup() -> f32 {
     4.0
+}
+fn default_comp_attack() -> f32 {
+    10.0
+}
+fn default_comp_release() -> f32 {
+    150.0
 }
 
 /// Gain stage config: amplify/attenuate the raw mic signal.
@@ -108,6 +114,10 @@ pub enum SuppressionBackend {
 }
 
 /// Noise suppression stage — supports DeepFilterNet (default) or RNNoise (fallback).
+///
+/// Latency note: DeepFilterNet processes in 10 ms frames with one frame of
+/// lookahead, adding ~20 ms of algorithmic latency to the mic path — fine for
+/// voice chat, worth knowing when reasoning about round-trip monitoring.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MicSuppressionStage {
     /// Whether the suppression stage is active. Defaults to false.
@@ -116,7 +126,9 @@ pub struct MicSuppressionStage {
     /// Which suppression backend to use.
     #[serde(default)]
     pub backend: SuppressionBackend,
-    /// DeepFilterNet: attenuation limit in dB (0..=100). Default 100.0 = full suppression.
+    /// DeepFilterNet: attenuation limit in dB (0..=100). Default 70.0 — full
+    /// (100 dB) suppression makes residual noise pump audibly; capping the
+    /// attenuation keeps a stable, natural noise floor.
     #[serde(default = "default_atten_limit")]
     pub attenuation_limit_db: f32,
     /// RNNoise: VAD threshold %. Default 40.
@@ -158,6 +170,15 @@ pub struct MicCompressorStage {
     /// Makeup gain in dB. Default 4.0.
     #[serde(default = "default_comp_makeup")]
     pub makeup_db: f32,
+    /// Attack time in ms (sc4m: 1.5..=400). Default 10.0 — fast enough to catch
+    /// plosives without relying on the LADSPA hint default (~101 ms, far too slow
+    /// for speech). Old configs without this field load the default via serde.
+    #[serde(default = "default_comp_attack")]
+    pub attack_ms: f32,
+    /// Release time in ms (sc4m: 2..=800). Default 150.0 (LADSPA hint default is
+    /// ~401 ms, audibly pumpy on speech). Old configs load the default via serde.
+    #[serde(default = "default_comp_release")]
+    pub release_ms: f32,
 }
 
 impl Default for MicCompressorStage {
@@ -167,6 +188,8 @@ impl Default for MicCompressorStage {
             threshold_db: default_comp_threshold(),
             ratio: default_comp_ratio(),
             makeup_db: default_comp_makeup(),
+            attack_ms: default_comp_attack(),
+            release_ms: default_comp_release(),
         }
     }
 }
@@ -1074,6 +1097,8 @@ description = "Chat"
                 threshold_db: -18.0,
                 ratio: 2.0,
                 makeup_db: 4.0,
+                attack_ms: 10.0,
+                release_ms: 150.0,
             },
             gate: MicGateStage {
                 enabled: true,
@@ -1146,6 +1171,42 @@ description = "Chat"
         assert!(!MicChainConfig::passthrough().enabled, "passthrough() must remain disabled");
     }
 
+    /// Old configs with a compressor block but no attack/release fields load the
+    /// serde defaults unchanged (10 ms / 150 ms), never the LADSPA hint defaults.
+    #[test]
+    fn old_compressor_block_without_attack_release_gets_defaults() {
+        let toml_str = r#"
+version = 1
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+
+[[profiles.channels]]
+id = "game"
+node_name = "Arctis_Game"
+description = "Game"
+
+[profiles.mic.compressor]
+enabled = true
+threshold_db = -20.0
+ratio = 3.0
+makeup_db = 5.0
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("old compressor block loads");
+        let comp = &cfg.active().unwrap().mic.compressor;
+        assert_eq!(comp.threshold_db, -20.0);
+        assert_eq!(comp.attack_ms, 10.0, "attack defaults to 10 ms");
+        assert_eq!(comp.release_ms, 150.0, "release defaults to 150 ms");
+    }
+
+    /// DeepFilterNet default attenuation limit is capped at 70 dB (full 100 dB
+    /// suppression pumps audibly).
+    #[test]
+    fn suppression_default_attenuation_limit_is_70() {
+        assert_eq!(MicSuppressionStage::default().attenuation_limit_db, 70.0);
+    }
+
     // ── Compressor validation tests ───────────────────────────────────────────
 
     fn make_enabled_compressor(threshold_db: f32, ratio: f32, makeup_db: f32) -> Config {
@@ -1155,6 +1216,7 @@ description = "Chat"
             threshold_db,
             ratio,
             makeup_db,
+            ..Default::default()
         };
         cfg
     }
@@ -1228,6 +1290,7 @@ description = "Chat"
             threshold_db: 100.0, // out of range
             ratio: 0.0,          // out of range
             makeup_db: 99.0,     // out of range
+            ..Default::default()
         };
         assert!(
             cfg.validate().is_ok(),

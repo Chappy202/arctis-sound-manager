@@ -577,6 +577,7 @@ fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
         StageName::Compressor => "compressor",
         StageName::Gate => "gate",
         StageName::MicEq => "eq",
+        StageName::Limiter => "limiter",
     }
 }
 

@@ -29,7 +29,8 @@ pub use error::AudioError;
 pub use mic::{
     resolve_ladspa, FsPluginProbe, MicBackend, MockPluginProbe, PluginProbe, StageKind,
     DEEPFILTER_LABEL_MONO, DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME,
-    RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME, SC4M_LABEL, SC4M_PLUGIN_BASENAME,
+    LIMITER_LABEL, LIMITER_PLUGIN_BASENAME, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME,
+    SC4M_LABEL, SC4M_PLUGIN_BASENAME,
 };
 pub use props::{
     band_props_json, control_props_json, node_volume_props_json, set_band_props_argv,
