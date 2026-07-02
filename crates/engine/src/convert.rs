@@ -746,7 +746,12 @@ mod tests {
             freqs,
             vec![31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
         );
-        assert!(v.iter().all(|b| b.gain_db == 0.0 && b.q == 1.0));
+        assert!(v.iter().all(|b| b.gain_db == 0.0));
+        // Q derives from the audio default: constant-Q 1.41 peaking mids,
+        // Butterworth 0.707 shelves at the extremes.
+        assert!(v[1..9].iter().all(|b| b.q == arctis_audio::DEFAULT_PEAKING_Q));
+        assert_eq!(v[0].q, arctis_audio::DEFAULT_SHELF_Q);
+        assert_eq!(v[9].q, arctis_audio::DEFAULT_SHELF_Q);
         // Kinds derive from the audio default: shelves at the extremes, peaking middle.
         assert_eq!(v[0].kind, "lowshelf");
         assert_eq!(v[9].kind, "highshelf");

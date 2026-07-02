@@ -22,8 +22,8 @@ pub use config::{
     ChainSpec, FilterNode, NodeType, SinkSpec,
 };
 pub use eq::{
-    BandKind, EqBand, EqModel, FREQ_MAX_HZ, FREQ_MIN_HZ, GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS,
-    Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
+    BandKind, EqBand, EqModel, DEFAULT_PEAKING_Q, DEFAULT_SHELF_Q, FREQ_MAX_HZ, FREQ_MIN_HZ,
+    GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS, Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
 };
 pub use error::AudioError;
 pub use mic::{

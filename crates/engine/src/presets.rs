@@ -11,31 +11,48 @@ fn pkq(freq: f32, q: f32, gain: f32) -> EqBandConfig { EqBandConfig { kind: "pea
 fn ls(gain: f32) -> EqBandConfig { EqBandConfig { kind: "lowshelf".into(), freq_hz: 31.0, q: 0.7, gain_db: gain } }
 fn hs(gain: f32) -> EqBandConfig { EqBandConfig { kind: "highshelf".into(), freq_hz: 16000.0, q: 0.7, gain_db: gain } }
 
-fn eqp(name: &str, hint: &str, bands: Vec<EqBandConfig>) -> EqPreset {
-    EqPreset { name: name.into(), kind_hint: Some(hint.into()), bands }
+/// Format a dB value compactly: whole numbers without the decimal ("-4 dB"),
+/// fractional ones with one decimal ("-4.5 dB").
+fn fmt_db(v: f32) -> String {
+    if (v - v.round()).abs() < 1e-6 { format!("{}", v.round() as i32) } else { format!("{v:.1}") }
+}
+
+/// Build the kind hint FROM the band data (G4): the engine now renders a real
+/// auto-preamp node compensating the largest boost, so the advertised preamp is
+/// derived from the same rule (`−max boost`), never hand-written.
+fn eqp(name: &str, desc: &str, bands: Vec<EqBandConfig>) -> EqPreset {
+    let max_boost = bands.iter().map(|b| b.gain_db).fold(0.0f32, f32::max);
+    let hint = if max_boost > 0.0 {
+        format!("{desc} · preamp {} dB", fmt_db(-max_boost))
+    } else {
+        format!("{desc} · no boost")
+    };
+    EqPreset { name: name.into(), kind_hint: Some(hint), bands }
 }
 
 pub fn factory_eq_presets() -> Vec<EqPreset> {
     vec![
-        eqp("Flat", "Reference · no EQ",
+        eqp("Flat", "Reference",
             vec![ls(0.0), pk(62.0,0.0), pk(125.0,0.0), pk(250.0,0.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,0.0), pk(4000.0,0.0), pk(8000.0,0.0), hs(0.0)]),
-        eqp("Reference (Calibrated)", "Reference · preamp -3.2 dB",
+        eqp("Reference (Calibrated)", "Reference",
             vec![ls(-1.5), pk(62.0,0.3), pkq(125.0,1.41,-9.5), pkq(250.0,1.41,-1.6), pk(500.0,1.0), pk(1000.0,2.2), pk(2000.0,1.6), pk(4000.0,2.8), pk(8000.0,0.2), hs(2.2)]),
-        eqp("Bass Boost", "Music · preamp -4 dB",
+        eqp("Bass Boost", "Music",
             vec![ls(4.0), pk(62.0,2.0), pkq(125.0,1.41,-5.0), pk(250.0,-0.5), pk(500.0,0.5), pk(1000.0,1.5), pk(2000.0,1.0), pk(4000.0,2.5), pk(8000.0,-1.0), hs(1.0)]),
-        eqp("FPS / Footsteps", "Gaming · preamp -5 dB",
+        eqp("FPS / Footsteps", "Gaming",
             vec![ls(-2.0), pk(62.0,-1.5), pkq(125.0,1.41,-7.0), pk(250.0,-2.5), pk(500.0,0.0), pk(1000.0,2.0), pk(2000.0,3.5), pk(4000.0,5.0), pk(8000.0,2.5), hs(1.0)]),
-        eqp("FPS / Footsteps (Competitive)", "Gaming · preamp -3 dB",
+        eqp("FPS / Footsteps (Competitive)", "Gaming",
             vec![ls(0.0), pk(62.0,-3.0), pkq(125.0,1.41,-2.0), pk(250.0,3.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,3.0), pk(4000.0,2.0), pk(8000.0,0.0), hs(0.0)]),
-        eqp("DayZ Spatial", "Gaming · post-HRIR footsteps + air",
+        // Applied PRE-convolution on the game channel sink (factory_profiles.rs);
+        // the old "post-HRIR" wording contradicted the code.
+        eqp("DayZ Spatial", "Gaming · pre-HRIR footsteps + air",
             vec![ls(-1.0), pk(62.0,-3.0), pkq(125.0,1.41,-2.0), pk(250.0,3.0), pk(500.0,0.0), pk(1000.0,0.0), pk(2000.0,3.0), pk(4000.0,2.0), pk(8000.0,1.5), hs(1.5)]),
-        eqp("Immersive", "Movies · preamp -4.5 dB",
+        eqp("Immersive", "Movies",
             vec![ls(4.5), pk(62.0,2.5), pkq(125.0,1.41,-5.5), pk(250.0,-1.0), pk(500.0,0.0), pk(1000.0,0.5), pk(2000.0,1.0), pk(4000.0,2.0), pk(8000.0,-2.0), hs(3.5)]),
-        eqp("Vocal Clarity", "Voice · preamp -4 dB",
+        eqp("Vocal Clarity", "Voice",
             vec![ls(-3.0), pk(62.0,-1.5), pkq(125.0,1.41,-8.5), pk(250.0,0.0), pk(500.0,1.0), pk(1000.0,3.0), pk(2000.0,3.0), pk(4000.0,4.0), pk(8000.0,-1.5), hs(1.5)]),
-        eqp("Warm", "Music · preamp -3 dB",
+        eqp("Warm", "Music",
             vec![ls(2.5), pk(62.0,3.0), pkq(125.0,1.41,-3.5), pk(250.0,1.5), pk(500.0,0.5), pk(1000.0,0.0), pk(2000.0,0.0), pk(4000.0,1.5), pk(8000.0,-3.5), hs(-1.5)]),
-        eqp("Treble Smooth", "Fatigue · preamp -3 dB",
+        eqp("Treble Smooth", "Fatigue",
             vec![ls(-1.0), pk(62.0,0.5), pkq(125.0,1.41,-8.0), pk(250.0,-1.5), pk(500.0,1.0), pk(1000.0,2.0), pk(2000.0,2.0), pk(4000.0,3.0), pkq(8000.0,1.4,-4.0), hs(-2.0)]),
     ]
 }
@@ -117,6 +134,25 @@ mod tests {
         // Names unique within each catalog.
         let mut eqn: Vec<_> = eq.iter().map(|p| &p.name).collect(); eqn.sort(); eqn.dedup();
         assert_eq!(eqn.len(), eq.len());
+    }
+
+    #[test]
+    fn kind_hints_derive_preamp_from_band_data() {
+        let presets = factory_eq_presets();
+        let hint = |name: &str| {
+            presets.iter().find(|p| p.name == name).expect(name).kind_hint.clone().unwrap()
+        };
+        // Preamp text = −(largest boosted band), the same rule the rendered
+        // eq_preamp node uses — never a hand-written number.
+        assert_eq!(hint("Flat"), "Reference · no boost");
+        assert_eq!(hint("Bass Boost"), "Music · preamp -4 dB");
+        assert_eq!(hint("Immersive"), "Movies · preamp -4.5 dB");
+        assert_eq!(hint("Reference (Calibrated)"), "Reference · preamp -2.8 dB");
+        // DayZ Spatial is applied PRE-convolution (factory_profiles.rs seeds the
+        // game CHANNEL sink EQ) — the hint must say so.
+        let dz = hint("DayZ Spatial");
+        assert!(dz.contains("pre-HRIR"), "DayZ hint must match the code (pre-convolution): {dz}");
+        assert!(dz.contains("preamp -3 dB"), "DayZ hint must carry the derived preamp: {dz}");
     }
 
     #[test]

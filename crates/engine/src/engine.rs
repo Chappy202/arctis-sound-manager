@@ -798,8 +798,11 @@ impl<R: CommandRunner> Engine<R> {
                 }
             } else {
                 // Value-only edit (Freq/Q/Gain): keep the low-latency live path.
+                // The auto-preamp is recomputed from the FULL dense model so the
+                // headroom always compensates the largest boost (live, G3).
                 let eq_band = convert::eq_band_from_cfg(&cfg)?;
-                be.apply_band(band, &eq_band)?;
+                let eq_model = convert::eq_model_for(channel)?;
+                be.apply_band_with_preamp(band, &eq_band, &eq_model)?;
             }
             let _ = active_name; // suppress unused warning
         }
@@ -3315,79 +3318,32 @@ mod tests {
         // Queue outputs (interleaved per channel):
         // detect_headset_sink: 2 calls (pw-metadata 0 + pw-dump)
         // Phase 1 (channels up): 4 × 1 ls-Node
-        // Per channel (4 channels): (1 ls + 10 bands) + (1 ls + 1 Props) = 13 × 4 = 52
+        // Per channel (4 channels): (1 ls + 10 bands + 1 preamp) + (1 ls + 1 Props) = 14 × 4 = 56
         // Phase 5: 1 ls (mic disabled)
         // Phase 6: 1 ls (surround disabled)
-        // Total: 2 + 4 + 52 + 1 + 1 = 60
-        let runner = MockRunner::new()
+        // Total: 2 + 4 + 56 + 1 + 1 = 64
+        let mut runner = MockRunner::new()
             // detect_headset_sink: pw-metadata 0 + pw-dump []
-            .with_output(0, "", "")  // [0] detect: pw-metadata 0
-            .with_output(0, "[]", "") // [1] detect: pw-dump []
-            // Phase 1: channel up — game[2], chat[3], media[4], aux[5] (all present)
-            .with_output(0, &ls, "") // [2] game
-            .with_output(0, &ls, "") // [3] chat
-            .with_output(0, &ls, "") // [4] media
-            .with_output(0, &ls, "") // [5] aux
-            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [6] game EQ ls
-            .with_output(0, "", "") // [7]
-            .with_output(0, "", "") // [8]
-            .with_output(0, "", "") // [9]
-            .with_output(0, "", "") // [10]
-            .with_output(0, "", "") // [11]
-            .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14]
-            .with_output(0, "", "") // [15]
-            .with_output(0, "", "") // [16] game 10 band sets
-            .with_output(0, &ls, "") // [17] game vol find_node_id
-            .with_output(0, "", "") // [18] game vol Props set
-            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [19] chat EQ ls
-            .with_output(0, "", "") // [20]
-            .with_output(0, "", "") // [21]
-            .with_output(0, "", "") // [22]
-            .with_output(0, "", "") // [23]
-            .with_output(0, "", "") // [24]
-            .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27]
-            .with_output(0, "", "") // [28]
-            .with_output(0, "", "") // [29] chat 10 band sets
-            .with_output(0, &ls, "") // [30] chat vol find_node_id
-            .with_output(0, "", "") // [31] chat vol Props set
-            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [32] media EQ ls
-            .with_output(0, "", "") // [33]
-            .with_output(0, "", "") // [34]
-            .with_output(0, "", "") // [35]
-            .with_output(0, "", "") // [36]
-            .with_output(0, "", "") // [37]
-            .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40]
-            .with_output(0, "", "") // [41]
-            .with_output(0, "", "") // [42] media 10 band sets
-            .with_output(0, &ls, "") // [43] media vol find_node_id
-            .with_output(0, "", "") // [44] media vol Props set
-            // aux: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [45] aux EQ ls
-            .with_output(0, "", "") // [46]
-            .with_output(0, "", "") // [47]
-            .with_output(0, "", "") // [48]
-            .with_output(0, "", "") // [49]
-            .with_output(0, "", "") // [50]
-            .with_output(0, "", "") // [51]
-            .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53]
-            .with_output(0, "", "") // [54]
-            .with_output(0, "", "") // [55] aux 10 band sets
-            .with_output(0, &ls, "") // [56] aux vol find_node_id
-            .with_output(0, "", "") // [57] aux vol Props set
-            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "") // [58]
-            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls, ""); // [59]
+            .with_output(0, "", "") // [0] detect: pw-metadata 0
+            .with_output(0, "[]", ""); // [1] detect: pw-dump []
+        // Phase 1: channel up — game[2], chat[3], media[4], aux[5] (all present)
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls, "");
+        }
+        // Per channel: Phase 2 (1 ls + 10 band sets + 1 preamp set) then
+        // Phase 2b (1 ls + 1 vol/mute Props set).
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls, ""); // EQ find_node_id
+            for _ in 0..11 {
+                runner = runner.with_output(0, "", ""); // 10 bands + preamp
+            }
+            runner = runner
+                .with_output(0, &ls, "") // vol find_node_id
+                .with_output(0, "", ""); // vol Props set
+        }
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        let runner = runner.with_output(0, &ls, "").with_output(0, &ls, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -3413,57 +3369,65 @@ mod tests {
         assert_eq!(calls[7][1], "s");
         assert_eq!(calls[7][3], "Props");
 
-        // Phase 2b: apply_volume_mute game — index 17
+        // Preamp set closes each channel's apply_all — index 17 for game.
+        assert_eq!(calls[17][0], "pw-cli", "game preamp set");
+        assert!(
+            calls[17][4].contains("eq_preamp:Mult"),
+            "call 17 must be the game auto-preamp set: {:?}",
+            calls[17]
+        );
+
+        // Phase 2b: apply_volume_mute game — index 18
         assert_eq!(
-            calls[17],
+            calls[18],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat: EQ starts at index 19
+        // Phase 2 chat: EQ starts at index 20
         assert_eq!(
-            calls[19],
+            calls[20],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat: volume starts at index 30
+        // Phase 2b chat: volume starts at index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media: EQ starts at index 32
+        // Phase 2 media: EQ starts at index 34
         assert_eq!(
-            calls[32],
+            calls[34],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media: volume starts at index 43
+        // Phase 2b media: volume starts at index 46
         assert_eq!(
-            calls[43],
+            calls[46],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux: EQ starts at index 45
+        // Phase 2 aux: EQ starts at index 48
         assert_eq!(
-            calls[45],
+            calls[48],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux: volume starts at index 56
+        // Phase 2b aux: volume starts at index 60
         assert_eq!(
-            calls[56],
+            calls[60],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 2 (detect) + 4 (up) + 4*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 60
-        assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
+        // Total: 2 (detect) + 4 (up) + 4*(1+10+1+1+1) (apply_all+preamp+vol/mute) + 1 (mic step5) + 1 (surround step6) = 64
+        assert_eq!(calls.len(), 64, "expected 64 total pw-cli calls");
 
         // No spawned processes (sinks already present, including aux)
         assert!(
@@ -3482,75 +3446,30 @@ mod tests {
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
-        let runner = MockRunner::new()
+        let mut runner = MockRunner::new()
             // detect_headset_sink: pw-metadata 0 + pw-dump []
-            .with_output(0, "", "")  // [0] detect: pw-metadata 0
-            .with_output(0, "[]", "") // [1] detect: pw-dump []
-            // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
-            .with_output(0, &ls_absent, "") // [2] game ls (absent)
-            .with_output(0, &ls_absent, "") // [3] chat ls (absent)
-            .with_output(0, &ls_absent, "") // [4] media ls (absent)
-            .with_output(0, &ls_absent, "") // [5] aux ls (absent, seeded by Engine::new)
-            // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [6] game EQ find_node_id
-            .with_output(0, "", "") // [7]
-            .with_output(0, "", "") // [8]
-            .with_output(0, "", "") // [9]
-            .with_output(0, "", "") // [10]
-            .with_output(0, "", "") // [11]
-            .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14]
-            .with_output(0, "", "") // [15]
-            .with_output(0, "", "") // [16] game 10 band sets
-            .with_output(0, &ls_present, "") // [17] game vol find_node_id
-            .with_output(0, "", "") // [18] game vol Props set
-            // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [19] chat EQ find_node_id
-            .with_output(0, "", "") // [20]
-            .with_output(0, "", "") // [21]
-            .with_output(0, "", "") // [22]
-            .with_output(0, "", "") // [23]
-            .with_output(0, "", "") // [24]
-            .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27]
-            .with_output(0, "", "") // [28]
-            .with_output(0, "", "") // [29] chat 10 band sets
-            .with_output(0, &ls_present, "") // [30] chat vol find_node_id
-            .with_output(0, "", "") // [31] chat vol Props set
-            // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [32] media EQ find_node_id
-            .with_output(0, "", "") // [33]
-            .with_output(0, "", "") // [34]
-            .with_output(0, "", "") // [35]
-            .with_output(0, "", "") // [36]
-            .with_output(0, "", "") // [37]
-            .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40]
-            .with_output(0, "", "") // [41]
-            .with_output(0, "", "") // [42] media 10 band sets
-            .with_output(0, &ls_present, "") // [43] media vol find_node_id
-            .with_output(0, "", "") // [44] media vol Props set
-            // aux: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [45] aux EQ find_node_id
-            .with_output(0, "", "") // [46]
-            .with_output(0, "", "") // [47]
-            .with_output(0, "", "") // [48]
-            .with_output(0, "", "") // [49]
-            .with_output(0, "", "") // [50]
-            .with_output(0, "", "") // [51]
-            .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53]
-            .with_output(0, "", "") // [54]
-            .with_output(0, "", "") // [55] aux 10 band sets
-            .with_output(0, &ls_present, "") // [56] aux vol find_node_id
-            .with_output(0, "", "") // [57] aux vol Props set
-            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "") // [58]
-            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls_absent, ""); // [59]
+            .with_output(0, "", "") // [0] detect: pw-metadata 0
+            .with_output(0, "[]", ""); // [1] detect: pw-dump []
+        // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls_absent, "");
+        }
+        // Per channel: Phase 2 (1 ls + 10 band sets + 1 preamp set) then
+        // Phase 2b (1 ls + 1 vol/mute Props set).
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls_present, ""); // EQ find_node_id
+            for _ in 0..11 {
+                runner = runner.with_output(0, "", ""); // 10 bands + preamp
+            }
+            runner = runner
+                .with_output(0, &ls_present, "") // vol find_node_id
+                .with_output(0, "", ""); // vol Props set
+        }
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        let runner = runner
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -3576,60 +3495,60 @@ mod tests {
         assert_eq!(calls[7][1], "s", "game band 0 sub-cmd");
         assert_eq!(calls[7][3], "Props", "game band 0 Props");
 
-        // Phase 2b: apply game vol at index 17
+        // Phase 2b: apply game vol at index 18 (after 10 bands + preamp)
         assert_eq!(
-            calls[17],
+            calls[18],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat EQ: index 19
+        // Phase 2 chat EQ: index 20
         assert_eq!(
-            calls[19],
+            calls[20],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat vol: index 30
+        // Phase 2b chat vol: index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media EQ: index 32
+        // Phase 2 media EQ: index 34
         assert_eq!(
-            calls[32],
+            calls[34],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media vol: index 43
+        // Phase 2b media vol: index 46
         assert_eq!(
-            calls[43],
+            calls[46],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux EQ: index 45
+        // Phase 2 aux EQ: index 48
         assert_eq!(
-            calls[45],
+            calls[48],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux vol: index 56
+        // Phase 2b aux vol: index 60
         assert_eq!(
-            calls[56],
+            calls[60],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 2 (detect) + 4 (phase1 ls) + 4*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 60
+        // Total: 2 (detect) + 4 (phase1 ls) + 4*(1+10+1+1+1) (EQ+preamp+vol) + 1 (mic step5) + 1 (surround step6) = 64
         assert_eq!(
             calls.len(),
-            60,
-            "expected 60 total run calls (no spawns in calls)"
+            64,
+            "expected 64 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 4 pipewire -c invocations (channels only)

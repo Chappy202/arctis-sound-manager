@@ -105,6 +105,8 @@ impl<R: CommandRunner> AudioBackend<R> {
     }
 
     /// Apply every band live (used by future re-apply-on-startup; here for E2E).
+    /// Also pushes the recomputed auto-preamp so the headroom always tracks the
+    /// full band set (G3: live, no restart).
     pub fn apply_all(&mut self, eq: &EqModel) -> Result<(), AudioError> {
         eq.validate()?;
         let id = self.find_node_id()?;
@@ -114,6 +116,36 @@ impl<R: CommandRunner> AudioBackend<R> {
             let out = self.runner.run("pw-cli", &args)?;
             Self::check(out, "pw-cli")?;
         }
+        self.apply_preamp_with_id(&id, eq)
+    }
+
+    /// Apply one band + the recomputed auto-preamp with a single node-id
+    /// resolve. `eq` is the FULL band model (the preamp must compensate the
+    /// largest boost across ALL bands, not just the edited one).
+    pub fn apply_band_with_preamp(
+        &mut self,
+        band_index: usize,
+        band: &EqBand,
+        eq: &EqModel,
+    ) -> Result<(), AudioError> {
+        let id = self.find_node_id()?;
+        let argv = set_band_props_argv(&id, band_index, band)?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-cli", &args)?;
+        Self::check(out, "pw-cli")?;
+        self.apply_preamp_with_id(&id, eq)
+    }
+
+    fn apply_preamp_with_id(&mut self, id: &str, eq: &EqModel) -> Result<(), AudioError> {
+        let argv = crate::props::set_control_props_argv(
+            id,
+            crate::config::PREAMP_NODE_NAME,
+            crate::config::PREAMP_CONTROL,
+            eq.preamp_mult(),
+        )?;
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.runner.run("pw-cli", &args)?;
+        Self::check(out, "pw-cli")?;
         Ok(())
     }
 
@@ -497,14 +529,15 @@ id 58, type PipeWire:Interface:Node/3
             .with_output(0, LS_WITH_SINK, "") // find_node_id
             .with_output(0, "", "") // band 0 set
             .with_output(0, "", "") // band 1 set
-            .with_output(0, "", ""); // band 2 set
+            .with_output(0, "", "") // band 2 set
+            .with_output(0, "", ""); // preamp set
         let mut be = AudioBackend::new(runner, spec());
         be.apply_all(&model).unwrap();
         let calls = &be.runner().calls;
         // First call: find_node_id ls Node
         assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
-        // Exactly 3 band set calls follow (one per band)
-        assert_eq!(calls.len(), 4);
+        // 3 band set calls follow (one per band), then the auto-preamp set.
+        assert_eq!(calls.len(), 5);
         // First band argv: ["pw-cli", "s", "57", "Props", "<payload>"]
         let expected_band0_payload =
             "{ params = [ \"eq_band_0:Freq\" 100.0 \"eq_band_0:Q\" 1.0 \"eq_band_0:Gain\" 2.0 ] }";
@@ -519,5 +552,45 @@ id 58, type PipeWire:Interface:Node/3
             calls[3],
             vec!["pw-cli", "s", "57", "Props", expected_band2_payload,]
         );
+        // Auto-preamp: largest boost = +2 dB → Mult = 10^(-2/20) ≈ 0.7943282.
+        let expected_preamp_payload = format!(
+            "{{ params = [ \"eq_preamp:Mult\" {} ] }}",
+            10f32.powf(-2.0 / 20.0)
+        );
+        assert_eq!(
+            calls[4],
+            vec!["pw-cli", "s", "57", "Props", &expected_preamp_payload]
+        );
+    }
+
+    #[test]
+    fn apply_band_with_preamp_sets_band_then_preamp_with_one_node_resolve() {
+        let band = EqBand::new(BandKind::Peaking, 1000.0, 1.0, -3.0);
+        // Full model: another band carries the largest boost (+6 dB) — the
+        // preamp must track THAT, not the edited band.
+        let model = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 100.0, 1.0, 6.0), band],
+        };
+        let runner = MockRunner::new()
+            .with_output(0, LS_WITH_SINK, "") // find_node_id (once)
+            .with_output(0, "", "") // band set
+            .with_output(0, "", ""); // preamp set
+        let mut be = AudioBackend::new(runner, spec());
+        be.apply_band_with_preamp(1, &band, &model).unwrap();
+        let calls = &be.runner().calls;
+        assert_eq!(calls.len(), 3, "exactly one ls + band set + preamp set");
+        assert_eq!(calls[0], vec!["pw-cli", "ls", "Node"]);
+        assert_eq!(
+            calls[1],
+            vec![
+                "pw-cli", "s", "57", "Props",
+                "{ params = [ \"eq_band_1:Freq\" 1000.0 \"eq_band_1:Q\" 1.0 \"eq_band_1:Gain\" -3.0 ] }"
+            ]
+        );
+        let expected_preamp = format!(
+            "{{ params = [ \"eq_preamp:Mult\" {} ] }}",
+            10f32.powf(-6.0 / 20.0)
+        );
+        assert_eq!(calls[2], vec!["pw-cli", "s", "57", "Props", &expected_preamp]);
     }
 }

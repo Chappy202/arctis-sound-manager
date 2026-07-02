@@ -23,6 +23,10 @@ impl BandKind {
 /// Engine-wide audio constants (ARCHITECTURE G3 / spec §3).
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const MAX_BANDS: usize = 10;
+/// Default Q for peaking bands: constant-Q for the one-octave band spacing.
+pub const DEFAULT_PEAKING_Q: f32 = 1.41;
+/// Default Q for the low/high shelves: Butterworth (no overshoot).
+pub const DEFAULT_SHELF_Q: f32 = 0.707;
 // EQ bounds are derived from the domain's single source of truth so that the
 // audio layer and the config layer always agree on valid ranges.
 pub const GAIN_MIN_DB: f32 = arctis_domain::eq_bounds::EQ_GAIN_MIN_DB;
@@ -83,12 +87,16 @@ pub struct EqModel {
 }
 
 impl EqModel {
-    /// 10 flat bands at standard ISO-ish centers; gain 0 dB, Q 1.0.
+    /// 10 flat bands at standard ISO-ish centers; gain 0 dB.
     ///
     /// The lowest band is a **low-shelf** and the highest a **high-shelf** so
     /// bass/treble adjustments move real energy at the frequency extremes — a
     /// peaking filter at 31 Hz / 16 kHz has half its skirt off the edge of
     /// hearing and barely shifts level. The eight middle bands stay peaking.
+    ///
+    /// Q defaults: peaking bands use [`DEFAULT_PEAKING_Q`] (1.41 ≈ constant-Q for
+    /// one-octave spacing so adjacent bands hand over without a big overlap hump);
+    /// shelves use [`DEFAULT_SHELF_Q`] (0.707 Butterworth, no shelf overshoot).
     pub fn default_10band() -> Self {
         const CENTERS: [f32; MAX_BANDS] = [
             31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
@@ -98,15 +106,24 @@ impl EqModel {
             .iter()
             .enumerate()
             .map(|(i, &f)| {
-                let kind = match i {
-                    0 => BandKind::LowShelf,
-                    i if i == last => BandKind::HighShelf,
-                    _ => BandKind::Peaking,
+                let (kind, q) = match i {
+                    0 => (BandKind::LowShelf, DEFAULT_SHELF_Q),
+                    i if i == last => (BandKind::HighShelf, DEFAULT_SHELF_Q),
+                    _ => (BandKind::Peaking, DEFAULT_PEAKING_Q),
                 };
-                EqBand::new(kind, f, 1.0, 0.0)
+                EqBand::new(kind, f, q, 0.0)
             })
             .collect();
         Self { bands }
+    }
+
+    /// AutoEq-convention auto-preamp: the linear multiplier that compensates the
+    /// largest boosted band so a boosted curve cannot clip at the float→S16
+    /// device boundary. `10^(−max(0, max_band_gain_db)/20)`; 1.0 when no band
+    /// boosts (flat or cut-only curves stay at unity).
+    pub fn preamp_mult(&self) -> f32 {
+        let max_boost = self.bands.iter().map(|b| b.gain_db).fold(0.0f32, f32::max);
+        10f32.powf(-max_boost / 20.0)
     }
 
     pub fn validate(&self) -> Result<(), AudioError> {
@@ -143,8 +160,40 @@ mod tests {
     fn default_is_ten_flat_bands_and_validates() {
         let m = EqModel::default_10band();
         assert_eq!(m.bands.len(), 10);
-        assert!(m.bands.iter().all(|b| b.gain_db == 0.0 && b.q == 1.0));
+        assert!(m.bands.iter().all(|b| b.gain_db == 0.0));
+        // Peaking bands: constant-Q 1.41 for octave spacing; shelves: 0.707.
+        assert!(m.bands[1..9].iter().all(|b| b.q == DEFAULT_PEAKING_Q));
+        assert_eq!(m.bands[0].q, DEFAULT_SHELF_Q);
+        assert_eq!(m.bands[9].q, DEFAULT_SHELF_Q);
         assert!(m.validate().is_ok());
+    }
+
+    // --- preamp_mult (AutoEq convention) ---
+
+    #[test]
+    fn preamp_mult_flat_is_unity() {
+        assert!((EqModel::default_10band().preamp_mult() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preamp_mult_cut_only_is_unity() {
+        let m = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, -6.0)],
+        };
+        assert!((m.preamp_mult() - 1.0).abs() < 1e-6, "cuts never raise the preamp");
+    }
+
+    #[test]
+    fn preamp_mult_compensates_largest_boost() {
+        let m = EqModel {
+            bands: vec![
+                EqBand::new(BandKind::LowShelf, 100.0, 0.7, 3.0),
+                EqBand::new(BandKind::Peaking, 1000.0, 1.0, 6.0),
+                EqBand::new(BandKind::HighShelf, 8000.0, 0.7, -2.0),
+            ],
+        };
+        // Largest boost = +6 dB → mult = 10^(-6/20) ≈ 0.5012.
+        assert!((m.preamp_mult() - 10f32.powf(-6.0 / 20.0)).abs() < 1e-6);
     }
 
     #[test]
