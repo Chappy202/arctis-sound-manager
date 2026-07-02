@@ -8,7 +8,7 @@ use crate::{
     },
 };
 
-use arctis_domain::db_to_volume_pct;
+use arctis_domain::db_to_volume_pct_cubic;
 
 // ── v0 schema helpers (private) ───────────────────────────────────────────────
 
@@ -108,12 +108,16 @@ fn migrate_v1(raw: &str) -> Result<Config, ConfigError> {
 /// Backfill `volume_pct` / `master_volume_pct` from the legacy dB fields for every profile.
 ///
 /// Called by both v0 and v1 migration paths so the logic lives in one place.
+/// Uses the CUBIC conversion (pct = 100·10^(dB/60)): `volume_pct` is consumed by
+/// the perceptual (cubic) write path (`apply_volume_mute_pct` / wpctl), so the
+/// cubic percent is what reproduces the old linear-dB loudness. The linear
+/// `db_to_volume_pct` would land the migrated volume at 3× the intended dB.
 fn backfill_volume_pct(cfg: &mut Config) {
     for profile in &mut cfg.profiles {
         for channel in &mut profile.channels {
-            channel.volume_pct = db_to_volume_pct(channel.volume_db);
+            channel.volume_pct = db_to_volume_pct_cubic(channel.volume_db);
         }
-        profile.master_volume_pct = db_to_volume_pct(profile.master_volume_db);
+        profile.master_volume_pct = db_to_volume_pct_cubic(profile.master_volume_db);
         // mic.volume_pct: no old dB field exists; serde default (100) is already in place.
     }
 }
@@ -124,7 +128,9 @@ fn backfill_volume_pct(cfg: &mut Config) {
 mod tests {
     use super::*;
 
-    /// An old v1 config with volume_db = −6.0 on a channel must migrate to volume_pct ≈ 50.
+    /// An old v1 config with volume_db = −6.0 on a channel must migrate to volume_pct ≈ 79:
+    /// the stored percent is applied CUBICALLY ((pct/100)^3), so 79 % ≈ −6 dB. (The old
+    /// linear conversion produced 50, which the cubic path plays back at ≈ −18 dB.)
     #[test]
     fn migrate_v1_fills_volume_pct_from_volume_db() {
         let toml_str = r#"
@@ -153,8 +159,8 @@ description = "Chat"
         );
         let profile = cfg.active().expect("active profile");
         assert_eq!(
-            profile.channels[0].volume_pct, 50,
-            "channel volume_pct must be ~50 for volume_db = -6.0 dB"
+            profile.channels[0].volume_pct, 79,
+            "channel volume_pct must be ~79 (cubic) for volume_db = -6.0 dB"
         );
         // chat channel has no volume_db (defaults to 0.0) → should map to 100
         assert_eq!(
@@ -162,8 +168,8 @@ description = "Chat"
             "channel with default volume_db (0.0) must map to volume_pct = 100"
         );
         assert_eq!(
-            profile.master_volume_pct, 50,
-            "master_volume_pct must be ~50 for master_volume_db = -6.0 dB"
+            profile.master_volume_pct, 79,
+            "master_volume_pct must be ~79 (cubic) for master_volume_db = -6.0 dB"
         );
     }
 

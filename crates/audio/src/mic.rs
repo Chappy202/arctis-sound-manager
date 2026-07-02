@@ -26,6 +26,16 @@ pub const GATE_PLUGIN_BASENAME: &str = "gate_1410";
 /// swh gate label.
 pub const GATE_LABEL: &str = "gate";
 
+/// Hard Limiter (Marcus Andersson, LADSPA 1413) basename — the always-on mic
+/// output ceiling. Chosen over swh fast_lookahead_limiter_1913: the lookahead
+/// limiter is stereo-only (Input 1/2, Output 1/2) and the mic filter-chain
+/// renderer wires strictly linear mono links, so pairing one mono line into
+/// both inputs is not cleanly expressible; hard_limiter is genuinely mono
+/// ("Input"/"Output") and transparent below its ceiling.
+pub const LIMITER_PLUGIN_BASENAME: &str = "hard_limiter_1413";
+/// Hard Limiter label (verified with analyseplugin).
+pub const LIMITER_LABEL: &str = "hardLimiter";
+
 // ─── LADSPA multi-distro resolver ────────────────────────────────────────────
 
 /// Search the standard LADSPA plugin directories for `<basename>.so` and return

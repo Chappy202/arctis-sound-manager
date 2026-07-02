@@ -23,11 +23,14 @@ pub struct SurroundSpec {
 }
 
 impl SurroundSpec {
-    fn capture_node_name(&self) -> String {
+    /// The capture (sink) node name apps/channels route INTO. Public so the
+    /// engine derives the surround route target from the spec (G4 — single
+    /// source of truth, no duplicated string literals).
+    pub fn capture_node_name(&self) -> String {
         format!("effect_input.{}", self.node_name_base)
     }
 
-    fn playback_node_name(&self) -> String {
+    pub fn playback_node_name(&self) -> String {
         format!("effect_output.{}", self.node_name_base)
     }
 }
@@ -51,6 +54,17 @@ pub struct SurroundRender<'a> {
     /// Convolver partition size in samples. `Some(n)` emits `blocksize = n` into
     /// every convolver node's config; `None` omits it (PipeWire default).
     pub blocksize: Option<u32>,
+    /// Per-convolver linear gain (`gain = g` config option, supported by the
+    /// PipeWire convolver). Used to normalize each HRIR's insertion gain to a
+    /// common target so switching HRIRs (or A/B-ing vs bypass) compares tone,
+    /// not loudness. `None` omits it (unity).
+    pub gain: Option<f32>,
+    /// Convolver tail partition size in samples (`tailsize = n`). Pairs with
+    /// `blocksize`: a small blocksize (low latency) with NO tailsize partitions
+    /// the ENTIRE impulse response at that size — for the bundled 250 ms /
+    /// 12000-sample IR that means ~188 tiny partitions and real xrun risk.
+    /// `None` omits it (PipeWire default).
+    pub tailsize: Option<u32>,
 }
 
 // ─── Conf renderer ────────────────────────────────────────────────────────────
@@ -210,12 +224,20 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
     ];
     let convs: &[(&str, u32)] = if is_51 { convs_51 } else { convs_71 };
     for (name, ch) in convs {
+        let g = match r.gain {
+            Some(g) => format!("  gain = {}", fmt_num(g)),
+            None => String::new(),
+        };
         let bs = match r.blocksize {
             Some(n) => format!("  blocksize = {n}"),
             None => String::new(),
         };
+        let ts = match r.tailsize {
+            Some(n) => format!("  tailsize = {n}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch}{bs} }} }}\n"
+            "                    {{ type = builtin  label = convolver  name = {name}  config = {{ filename = \"{hrir_str}\"  channel = {ch}{g}{bs}{ts} }} }}\n"
         ));
     }
 
@@ -408,14 +430,23 @@ pub fn render_surround_conf_ex(r: &SurroundRender<'_>) -> Result<String, AudioEr
 /// the HRIR convolver). The graph passes stereo L/R through, optionally applies
 /// crossfeed, and optionally applies a per-ear output EQ.
 ///
+/// # Level matching (−6 dB pad)
+///
+/// The HRIR graph bakes `SURROUND_MIX_HEADROOM_GAIN` (−6 dB) into every mixer
+/// input; without the same pad here, toggling HRIR ↔ bypass/crossfeed shifted
+/// loudness by ~6 dB and biased every A/B comparison toward the louder path.
+/// The bypass and crossfeed graphs therefore route through `mixer` nodes with
+/// the SAME −6 dB per-input gain, so all three surround graphs meet at one
+/// level. Surround-OFF (no filter-chain at all) remains unity — that residual
+/// difference is acceptable and intentional: OFF means "untouched".
+///
 /// # Crossfeed
 ///
-/// `crossfeed` is a percentage [0, 100]. When 0, the path is pure passthrough
-/// (two `copy` nodes). When > 0, two `mixer` nodes blend a fraction of the
-/// opposite channel into each ear, with gain `cf = (crossfeed as f32 / 100.0) * 0.5`.
-///
-/// Maximum crossfeed (100) gives `cf = 0.5`, which avoids clipping while still
-/// providing significant blending.
+/// `crossfeed` is a percentage [0, 100]. When > 0, the mixers blend a fraction
+/// of the opposite channel into each ear with gain
+/// `cf = (crossfeed / 100) * 0.5 * SURROUND_MIX_HEADROOM_GAIN`, keeping the
+/// direct:cross ratio of the pre-pad design (max crossfeed = half the direct
+/// level).
 ///
 /// The PipeWire builtin `mixer` supports per-input gain controls `"Gain 1"` …
 /// `"Gain 8"` (verified: <https://docs.pipewire.org/page_module_filter_chain.html>).
@@ -445,6 +476,10 @@ pub fn render_stereo_bypass_conf(
     let capture_node = spec.capture_node_name();
     let playback_node = spec.playback_node_name();
     let has_crossfeed = crossfeed > 0;
+    // −6 dB pad on the direct path (matches the HRIR graph's per-mixer-input
+    // headroom gain); crossfeed keeps the same ratio relative to direct.
+    let direct = SURROUND_MIX_HEADROOM_GAIN;
+    let cf = (crossfeed as f32 / 100.0) * 0.5 * direct;
 
     let target_line = match &spec.hw_sink {
         Some(sink) => format!("                target.object = \"{sink}\"\n"),
@@ -482,20 +517,23 @@ pub fn render_stereo_bypass_conf(
     out.push_str("                    { type = builtin  label = copy  name = copyL }\n");
     out.push_str("                    { type = builtin  label = copy  name = copyR }\n");
 
-    // Optional crossfeed mixer nodes.
+    // Mixer nodes (ALWAYS present): carry the −6 dB level-matching pad on the
+    // direct input, plus the crossfeed blend on In 2 when requested.
     // PipeWire mixer builtin: "Gain 1".."Gain 8" set per-input gain.
-    // copyL→mixL In 1 (gain 1.0), copyR→mixL In 2 (gain cf)
-    // copyR→mixR In 1 (gain 1.0), copyL→mixR In 2 (gain cf)
-    if has_crossfeed {
-        let cf = (crossfeed as f32 / 100.0) * 0.5;
-        let cf_str = fmt_num(cf);
-        out.push_str(&format!(
-            "                    {{ type = builtin  label = mixer  name = mixL  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
-        ));
-        out.push_str(&format!(
-            "                    {{ type = builtin  label = mixer  name = mixR  control = {{ \"Gain 1\" = 1.0  \"Gain 2\" = {cf_str} }} }}\n"
-        ));
-    }
+    // copyL→mixL In 1 (gain 0.5), copyR→mixL In 2 (gain cf)
+    // copyR→mixR In 1 (gain 0.5), copyL→mixR In 2 (gain cf)
+    let direct_str = fmt_num(direct);
+    let mix_ctl = if has_crossfeed {
+        format!("\"Gain 1\" = {direct_str}  \"Gain 2\" = {}", fmt_num(cf))
+    } else {
+        format!("\"Gain 1\" = {direct_str}")
+    };
+    out.push_str(&format!(
+        "                    {{ type = builtin  label = mixer  name = mixL  control = {{ {mix_ctl} }} }}\n"
+    ));
+    out.push_str(&format!(
+        "                    {{ type = builtin  label = mixer  name = mixR  control = {{ {mix_ctl} }} }}\n"
+    ));
 
     // Optional output EQ tail: per-ear bq chains (L first, then R).
     // Identical pattern to render_surround_conf_ex.
@@ -525,17 +563,18 @@ pub fn render_stereo_bypass_conf(
     // ── links ─────────────────────────────────────────────────────────────────
     out.push_str("                links = [\n");
 
+    // Direct routing through the padded mixers (always); cross links only
+    // when crossfeed is requested.
+    out.push_str("                    { output = \"copyL:Out\"  input = \"mixL:In 1\" }\n");
+    out.push_str("                    { output = \"copyR:Out\"  input = \"mixR:In 1\" }\n");
     if has_crossfeed {
-        // Crossfeed routing: each mixer receives its own channel + opposite channel
-        out.push_str("                    { output = \"copyL:Out\"  input = \"mixL:In 1\" }\n");
         out.push_str("                    { output = \"copyR:Out\"  input = \"mixL:In 2\" }\n");
-        out.push_str("                    { output = \"copyR:Out\"  input = \"mixR:In 1\" }\n");
         out.push_str("                    { output = \"copyL:Out\"  input = \"mixR:In 2\" }\n");
     }
 
-    // EQ tail links: source (copy or mixer) → eq chain per ear
-    let left_src = if has_crossfeed { "mixL" } else { "copyL" };
-    let right_src = if has_crossfeed { "mixR" } else { "copyR" };
+    // EQ tail links: mixer → eq chain per ear
+    let left_src = "mixL";
+    let right_src = "mixR";
 
     if let Some(eq) = output_eq {
         let n = eq.bands.len();
@@ -573,11 +612,7 @@ pub fn render_stereo_bypass_conf(
             ));
         }
         None => {
-            if has_crossfeed {
-                out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
-            } else {
-                out.push_str("                outputs = [ \"copyL:Out\" \"copyR:Out\" ]\n");
-            }
+            out.push_str("                outputs = [ \"mixL:Out\" \"mixR:Out\" ]\n");
         }
     }
 
@@ -638,6 +673,8 @@ pub fn render_surround_conf(spec: &SurroundSpec, hrir_path: &Path) -> Result<Str
         channels: 8,
         output_eq: None,
         blocksize: None,
+        gain: None,
+        tailsize: None,
     })
 }
 
@@ -754,41 +791,63 @@ impl<R: CommandRunner> SurroundBackend<R> {
         self.create(hrir_path)
     }
 
-    /// Teardown then recreate with explicit channel count and optional output EQ.
+    /// Diff-before-recreate: if `conf` is byte-identical to what's already on
+    /// disk AND the node is live, skip the teardown+respawn entirely — a
+    /// respawn is an audible dropout plus a fallback window where streams play
+    /// unconvolved. Otherwise tear down and spawn fresh.
+    fn recreate_conf(&mut self, conf: String) -> Result<ConfHandle, AudioError> {
+        let path = self.conf_path();
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|existing| existing == conf)
+            .unwrap_or(false);
+        if unchanged && self.source_exists()? {
+            return Ok(ConfHandle {
+                conf_path: path,
+                child: None,
+            });
+        }
+        self.remove()?;
+        self.spawn_conf(conf)
+    }
+
+    /// Recreate with explicit channel count and optional output EQ.
     ///
     /// `channels` must be `6` (5.1) or `8` (7.1); see [`render_surround_conf_ex`].
-    /// Use this when switching surround topology at runtime — always tears down the
-    /// existing sink before spawning the new one.
+    /// Renders first and skips the teardown+respawn when nothing changed (see
+    /// [`Self::recreate_conf`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn recreate_ex(
         &mut self,
         hrir_path: &Path,
         channels: u8,
         output_eq: Option<&EqModel>,
         blocksize: Option<u32>,
+        gain: Option<f32>,
+        tailsize: Option<u32>,
     ) -> Result<ConfHandle, AudioError> {
-        self.remove()?;
         let conf = render_surround_conf_ex(&SurroundRender {
             spec: &self.spec,
             hrir_path,
             channels,
             output_eq,
             blocksize,
+            gain,
+            tailsize,
         })?;
-        self.spawn_conf(conf)
+        self.recreate_conf(conf)
     }
 
-    /// Teardown then recreate as a stereo-bypass sink (no HRIR convolver).
+    /// Recreate as a stereo-bypass sink (no HRIR convolver).
     ///
     /// `crossfeed` is [0, 100]; see [`render_stereo_bypass_conf`].
-    /// Use this when the source is already stereo and no upmix is wanted.
+    /// Renders first and skips the teardown+respawn when nothing changed.
     pub fn recreate_stereo_bypass(
         &mut self,
         crossfeed: u8,
         output_eq: Option<&EqModel>,
     ) -> Result<ConfHandle, AudioError> {
-        self.remove()?;
         let conf = render_stereo_bypass_conf(&self.spec, crossfeed, output_eq)?;
-        self.spawn_conf(conf)
+        self.recreate_conf(conf)
     }
 
     /// Resolve the filter-chain node id for the capture (sink) node.
@@ -955,6 +1014,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 7,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap_err();
         assert!(
@@ -974,6 +1035,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: Some(&eq),
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap_err();
         assert!(
@@ -992,6 +1055,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 6,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1056,6 +1121,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: None,
             blocksize: Some(128),
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
         let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
@@ -1063,6 +1130,36 @@ id 40, type PipeWire:Interface:Node/3
         for line in &conv_lines {
             assert!(line.contains("blocksize = 128"), "convolver line missing blocksize: {line}");
         }
+    }
+
+    #[test]
+    fn render_with_gain_emits_gain_on_every_convolver() {
+        // HRIR insertion-gain normalization: `gain = g` on every convolver so
+        // every HRIR meets the same target level (locks the rendered value).
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: None,
+            blocksize: None,
+            gain: Some(1.25),
+            tailsize: None,
+        })
+        .unwrap();
+        let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
+        assert_eq!(conv_lines.len(), 16);
+        for line in &conv_lines {
+            assert!(line.contains("gain = 1.25"), "convolver line missing gain: {line}");
+        }
+    }
+
+    #[test]
+    fn render_without_gain_omits_gain_key() {
+        let spec = test_spec();
+        let got = render_surround_conf(&test_spec(), &PathBuf::from("/test/hrir.wav")).unwrap();
+        assert!(!got.contains("gain ="), "None must not emit a gain key");
+        let _ = spec;
     }
 
     #[test]
@@ -1074,6 +1171,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
         assert!(!got.contains("blocksize"), "None must not emit a blocksize key");
@@ -1097,6 +1196,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: Some(&eq),
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1174,6 +1275,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 6,
             output_eq: Some(&eq),
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1258,6 +1361,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1279,6 +1384,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 6,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1306,6 +1413,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: Some(&eq),
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
 
@@ -1368,6 +1477,8 @@ id 40, type PipeWire:Interface:Node/3
             channels: 8,
             output_eq: None,
             blocksize: None,
+            gain: None,
+            tailsize: None,
         })
         .unwrap();
         assert_eq!(
@@ -1418,10 +1529,24 @@ id 40, type PipeWire:Interface:Node/3
         assert!(pb.contains("audio.position = [ FL FR ]"), "playback must be FL FR");
         assert!(pb.contains("target.object = \"hwsink\""), "target must be set");
 
-        // Passthrough outputs come directly from copy nodes
+        // Passthrough now routes through the level-matching mixers: −6 dB pad
+        // (SURROUND_MIX_HEADROOM_GAIN) matches the HRIR graph so mode switches
+        // compare tone, not loudness.
         assert!(
-            got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
-            "passthrough outputs must come from copy nodes"
+            got.contains("name = mixL  control = { \"Gain 1\" = 0.5 }"),
+            "bypass mixL must carry the −6 dB pad, got:\n{got}"
+        );
+        assert!(
+            got.contains("name = mixR  control = { \"Gain 1\" = 0.5 }"),
+            "bypass mixR must carry the −6 dB pad"
+        );
+        assert!(
+            got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "passthrough outputs must come from the padded mixers"
+        );
+        assert!(
+            got.contains("output = \"copyL:Out\"  input = \"mixL:In 1\""),
+            "copyL must feed mixL In 1"
         );
     }
 
@@ -1449,32 +1574,37 @@ id 40, type PipeWire:Interface:Node/3
             "single-band chain must not have eq_r_1"
         );
 
-        // copyL/R link directly into the EQ tail (no mixer in the path)
+        // The padded mixers link into the EQ tail (level-matching pad always
+        // in the path).
         assert!(
-            got.contains("output = \"copyL:Out\"  input = \"eq_l_0:In\""),
-            "copyL must link to eq_l_0"
+            got.contains("output = \"mixL:Out\"  input = \"eq_l_0:In\""),
+            "mixL must link to eq_l_0"
         );
         assert!(
-            got.contains("output = \"copyR:Out\"  input = \"eq_r_0:In\""),
-            "copyR must link to eq_r_0"
+            got.contains("output = \"mixR:Out\"  input = \"eq_r_0:In\""),
+            "mixR must link to eq_r_0"
+        );
+        assert!(
+            got.contains("\"Gain 1\" = 0.5"),
+            "−6 dB pad must be present with EQ too"
         );
 
-        // Outputs come from the EQ nodes, not directly from copy
+        // Outputs come from the EQ nodes, not the mixers
         assert!(
             got.contains("outputs = [ \"eq_l_0:Out\" \"eq_r_0:Out\" ]"),
             "outputs must reference eq_l_0/eq_r_0"
         );
         assert!(
-            !got.contains("outputs = [ \"copyL:Out\" \"copyR:Out\" ]"),
-            "copy outputs must not appear when EQ is present"
+            !got.contains("outputs = [ \"mixL:Out\" \"mixR:Out\" ]"),
+            "mixer outputs must not appear when EQ is present"
         );
     }
 
-    /// crossfeed=50 → cf=0.25: mixer nodes with correct gains, cross-links correct.
+    /// crossfeed=50 → direct 0.5 (−6 dB pad), cross = (50/100)·0.5·0.5 = 0.125:
+    /// same direct:cross ratio as before the pad, one level with the HRIR graph.
     #[test]
     fn stereo_bypass_crossfeed_blends_opposite_channel() {
         let spec = test_spec();
-        // cf = (50 / 100) * 0.5 = 0.25
         let got = render_stereo_bypass_conf(&spec, 50, None).unwrap();
 
         // No convolver nodes
@@ -1484,10 +1614,11 @@ id 40, type PipeWire:Interface:Node/3
         assert!(got.contains("name = mixL"), "must have mixL node");
         assert!(got.contains("name = mixR"), "must have mixR node");
 
-        // Per-input gain controls: Gain 1 = 1.0 (direct), Gain 2 = 0.25 (cross)
+        // Per-input gain controls: Gain 1 = 0.5 (direct, −6 dB pad),
+        // Gain 2 = 0.125 (cross, same ratio to direct as before the pad)
         assert!(
-            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
-            "mixer must have Gain 1=1.0 and Gain 2=0.25 for crossfeed=50"
+            got.contains("\"Gain 1\" = 0.5  \"Gain 2\" = 0.125"),
+            "mixer must have Gain 1=0.5 and Gain 2=0.125 for crossfeed=50, got:\n{got}"
         );
 
         // Direct links: each channel's own copy to its mixer's In 1
@@ -1538,10 +1669,10 @@ id 40, type PipeWire:Interface:Node/3
         assert!(got.contains("\"eq_l_0\""), "must have eq_l_0 node");
         assert!(got.contains("\"eq_r_0\""), "must have eq_r_0 node");
 
-        // Mixer gains set for cf=0.25 (crossfeed=50)
+        // Mixer gains set for crossfeed=50 with the −6 dB pad
         assert!(
-            got.contains("\"Gain 1\" = 1.0  \"Gain 2\" = 0.25"),
-            "mixer must have correct crossfeed gains"
+            got.contains("\"Gain 1\" = 0.5  \"Gain 2\" = 0.125"),
+            "mixer must have correct padded crossfeed gains"
         );
 
         // CRITICAL: mixL and mixR link to eq_l_0 and eq_r_0 (NOT copyL/copyR)
@@ -1690,6 +1821,8 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test 8ch EQ".into(),
             hw_sink: None,
         };
+        // Scrub any stale conf so the diff-guard cannot skip the scripted spawn.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_8ch_eq.conf"));
         // remove: source_exists → absent (early return, no destroy)
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
@@ -1697,7 +1830,7 @@ id 40, type PipeWire:Interface:Node/3
         let eq = EqModel {
             bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 3.0)],
         };
-        let handle = be.recreate_ex(&hrir, 8, Some(&eq), None).unwrap();
+        let handle = be.recreate_ex(&hrir, 8, Some(&eq), None, None, None).unwrap();
 
         // (a) one spawn_owned("pipewire", ["-c", <conf_path>]) recorded
         let spawned = &be.runner().spawned;
@@ -1735,11 +1868,12 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test 6ch".into(),
             hw_sink: None,
         };
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_6ch.conf"));
         // remove: source_exists → absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
         let hrir = PathBuf::from("/test/hrir.wav");
-        let handle = be.recreate_ex(&hrir, 6, None, None).unwrap();
+        let handle = be.recreate_ex(&hrir, 6, None, None, None, None).unwrap();
 
         let spawned = &be.runner().spawned;
         assert_eq!(spawned.len(), 1, "exactly one spawn_owned call");
@@ -1760,6 +1894,7 @@ id 40, type PipeWire:Interface:Node/3
             description: "Test bypass".into(),
             hw_sink: None,
         };
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_test_surr_bypass.conf"));
         // remove: source_exists → absent
         let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
         let mut be = SurroundBackend::new(runner, spec);
@@ -1779,5 +1914,88 @@ id 40, type PipeWire:Interface:Node/3
             !conf.contains("convolver"),
             "stereo bypass must not contain any convolver node"
         );
+    }
+
+    /// Diff-before-recreate: identical on-disk conf + live node → NO teardown,
+    /// no respawn (an unnecessary respawn is an audible dropout).
+    #[test]
+    fn recreate_ex_skips_respawn_when_conf_identical_and_node_live() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_guard".into(),
+            description: "Guard".into(),
+            hw_sink: None,
+        };
+        let hrir = PathBuf::from("/test/hrir.wav");
+        // Pre-write the EXACT conf recreate_ex would render.
+        let conf = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &hrir,
+            channels: 8,
+            output_eq: None,
+            blocksize: Some(128),
+            gain: None,
+            tailsize: Some(1024),
+        })
+        .unwrap();
+        let path = std::env::temp_dir().join("arctis_test_surr_guard.conf");
+        std::fs::write(&path, conf).unwrap();
+
+        let ls = "id 81, type PipeWire:Interface:Node/3\n    node.name = \"effect_input.test_surr_guard\"\n";
+        let runner = MockRunner::new().with_output(0, ls, ""); // guard: source_exists (present)
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be
+            .recreate_ex(&hrir, 8, None, Some(128), None, Some(1024))
+            .unwrap();
+
+        assert!(handle.child.is_none(), "no respawn when nothing changed");
+        assert_eq!(be.runner().calls.len(), 1, "only the existence check runs");
+        assert!(be.runner().spawned.is_empty(), "no pipewire spawn");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Diff-before-recreate: a CHANGED conf must tear down + respawn as before.
+    #[test]
+    fn recreate_ex_respawns_when_conf_changed() {
+        let spec = SurroundSpec {
+            node_name_base: "test_surr_guard2".into(),
+            description: "Guard2".into(),
+            hw_sink: None,
+        };
+        let path = std::env::temp_dir().join("arctis_test_surr_guard2.conf");
+        std::fs::write(&path, "stale contents").unwrap();
+
+        // remove: source_exists → absent (early return) → spawn
+        let runner = MockRunner::new().with_output(0, LS_WITHOUT_SURROUND, "");
+        let mut be = SurroundBackend::new(runner, spec);
+        let handle = be
+            .recreate_ex(&PathBuf::from("/test/hrir.wav"), 8, None, None, None, None)
+            .unwrap();
+        assert!(handle.child.is_some(), "changed conf must respawn");
+        assert_eq!(be.runner().spawned.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Tailsize is emitted on every convolver when set.
+    #[test]
+    fn render_with_tailsize_emits_tailsize_on_every_convolver() {
+        let spec = test_spec();
+        let got = render_surround_conf_ex(&SurroundRender {
+            spec: &spec,
+            hrir_path: &PathBuf::from("/test/hrir.wav"),
+            channels: 8,
+            output_eq: None,
+            blocksize: Some(64),
+            gain: None,
+            tailsize: Some(4096),
+        })
+        .unwrap();
+        let conv_lines: Vec<&str> = got.lines().filter(|l| l.contains("label = convolver")).collect();
+        assert_eq!(conv_lines.len(), 16);
+        for line in &conv_lines {
+            assert!(
+                line.contains("blocksize = 64  tailsize = 4096"),
+                "convolver line missing blocksize/tailsize pair: {line}"
+            );
+        }
     }
 }

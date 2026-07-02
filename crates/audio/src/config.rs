@@ -123,6 +123,14 @@ pub fn band_node_name(index: usize) -> String {
     format!("eq_band_{index}")
 }
 
+/// Stable node name of the always-present auto-preamp `linear` node that heads
+/// every channel-EQ filter-chain. Always rendered (Mult = 1.0 when no band
+/// boosts) so the chain topology stays fixed and the preamp is live-updatable
+/// via the existing `<node>:<control>` Props path (G3).
+pub const PREAMP_NODE_NAME: &str = "eq_preamp";
+/// The `linear` builtin control the preamp drives.
+pub const PREAMP_CONTROL: &str = "Mult";
+
 /// Format a value the way the conf expects: always emit a decimal point for
 /// whole numbers so PipeWire parses them as floats.
 fn fmt_num(v: f32) -> String {
@@ -294,25 +302,35 @@ pub fn render_chain_conf(spec: &ChainSpec, nodes: &[FilterNode]) -> Result<Strin
 pub fn render_filter_chain_conf(spec: &SinkSpec, eq: &EqModel) -> Result<String, AudioError> {
     eq.validate()?;
 
-    // Build FilterNode list from EQ bands.
-    let nodes: Vec<FilterNode> = eq
-        .bands
-        .iter()
-        .enumerate()
-        .map(|(i, b)| FilterNode {
-            name: band_node_name(i),
-            node_type: NodeType::Builtin,
-            label: b.kind.label().to_string(),
-            plugin: None,
-            port_in: "In".to_string(),
-            port_out: "Out".to_string(),
-            controls: vec![
-                ("Freq".to_string(), b.freq_hz),
-                ("Q".to_string(), b.q),
-                ("Gain".to_string(), b.gain_db),
-            ],
-        })
-        .collect();
+    // Auto-preamp head node (always present so the topology never changes):
+    // compensates the largest boosted band (AutoEq convention) so boosted
+    // curves cannot clip at the float→S16 device boundary.
+    let mut nodes: Vec<FilterNode> = vec![FilterNode {
+        name: PREAMP_NODE_NAME.to_string(),
+        node_type: NodeType::Builtin,
+        label: "linear".to_string(),
+        plugin: None,
+        port_in: "In".to_string(),
+        port_out: "Out".to_string(),
+        controls: vec![
+            (PREAMP_CONTROL.to_string(), eq.preamp_mult()),
+            ("Add".to_string(), 0.0),
+        ],
+    }];
+    // Then one biquad per EQ band.
+    nodes.extend(eq.bands.iter().enumerate().map(|(i, b)| FilterNode {
+        name: band_node_name(i),
+        node_type: NodeType::Builtin,
+        label: b.kind.label().to_string(),
+        plugin: None,
+        port_in: "In".to_string(),
+        port_out: "Out".to_string(),
+        controls: vec![
+            ("Freq".to_string(), b.freq_hz),
+            ("Q".to_string(), b.q),
+            ("Gain".to_string(), b.gain_db),
+        ],
+    }));
 
     let chain_spec = ChainSpec {
         node_name: spec.node_name.clone(),
@@ -399,6 +417,39 @@ mod tests {
     fn band_node_names_are_stable() {
         assert_eq!(band_node_name(0), "eq_band_0");
         assert_eq!(band_node_name(7), "eq_band_7");
+    }
+
+    /// The auto-preamp node is ALWAYS rendered — Mult 1.0 for flat/cut-only
+    /// curves — so the chain topology never changes and the preamp stays
+    /// live-updatable through the Props path (G3).
+    #[test]
+    fn preamp_node_always_present_unity_when_no_boost() {
+        let spec = SinkSpec {
+            node_name: "arctis_eq".into(),
+            description: "Arctis EQ Sink".into(),
+            channels: ChainChannels::Stereo,
+            playback_target: None,
+        };
+        let flat = EqModel {
+            bands: vec![EqBand::new(BandKind::Peaking, 1000.0, 1.0, 0.0)],
+        };
+        let got = render_filter_chain_conf(&spec, &flat).unwrap();
+        assert!(
+            got.contains("name = \"eq_preamp\"  label = linear"),
+            "preamp node must be present even for a flat curve:\n{got}"
+        );
+        assert!(
+            got.contains("control = { \"Mult\" = 1.0  \"Add\" = 0.0 }"),
+            "flat curve → unity preamp:\n{got}"
+        );
+        assert!(
+            got.contains("inputs  = [ \"eq_preamp:In\" ]"),
+            "chain input must be the preamp node:\n{got}"
+        );
+        assert!(
+            got.contains("{ output = \"eq_preamp:Out\"  input = \"eq_band_0:In\" }"),
+            "preamp must link into band 0:\n{got}"
+        );
     }
 
     // ── Mic source fixture tests ──────────────────────────────────────────────

@@ -2,12 +2,12 @@ use crate::{children::ChildOwner, convert, error::EngineError, state::Event};
 use arctis_audio::{
     move_stream_argv, parse_app_streams, parse_node_volume, query_pw_version,
     richest_surround_input, supports_builtin_noisegate, AppMatch, AudioBackend, ChannelManager,
-    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, RouteRule, Router, StageKind,
+    CommandRunner, EqModel, FsPluginProbe, MicBackend, PluginProbe, Router, StageKind,
     SurroundBackend, DEEPFILTER_PLUGIN_BASENAME, RNNOISE_PLUGIN_BASENAME,
 };
 use arctis_config::{Config, EqBandConfig, SurroundMode};
 use arctis_domain::{
-    db_to_volume_pct, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
+    db_to_volume_pct_cubic, MIC_ATTEN_LIMIT_MAX_DB, MIC_ATTEN_LIMIT_MIN_DB,
     MIC_COMP_MAKEUP_MAX_DB, MIC_COMP_MAKEUP_MIN_DB, MIC_COMP_RATIO_MAX, MIC_COMP_RATIO_MIN,
     MIC_COMP_THRESHOLD_MAX_DB, MIC_COMP_THRESHOLD_MIN_DB, MIC_GAIN_MAX_DB, MIC_GAIN_MIN_DB,
     MIC_GATE_THRESHOLD_MAX, MIC_GATE_THRESHOLD_MIN, MIC_HIGHPASS_MAX_HZ, MIC_HIGHPASS_MIN_HZ,
@@ -122,12 +122,20 @@ pub fn mix_to_chatmix_position(media_mix: u8, chat_mix: u8) -> i64 {
 }
 
 /// Map a ChatMix position 0..=9 to (game_db, chat_db) attenuations.
-/// center = 4.5 is the true midpoint of the 0..=9 range and matches the hardware
-/// Nova Pro dial mapping in `crates/cli/src/dial.rs`, so the GUI ChatMix slider and
-/// the physical dial behave identically. Because the center is 4.5, no integer
-/// position is exactly neutral: position 4 leans slightly toward chat (game ~-4.4 dB)
-/// and position 5 slightly toward game; true balance sits between 4 and 5.
+/// center = 4.5 is the true midpoint of the 0..=9 range and matches the position
+/// readback mapping in `mix_to_chatmix_position` (used by the hardware dial path in
+/// `crates/cli/src/dial.rs`). Because the center is 4.5, no integer position is
+/// exactly neutral: position 4 leans slightly toward chat (game ~-4.4 dB) and
+/// position 5 slightly toward game; true balance sits between 4 and 5.
 /// Endpoints: 9 => full game (chat fully attenuated), 0 => full chat (game attenuated).
+///
+/// GUI-slider vs hardware-dial guarantee: both write through the SAME perceptual
+/// (cubic) channelVolumes path, and both derive the reported position via
+/// `mix_to_chatmix_position`. The curves differ on the losing side, though: the
+/// slider realises an exact dB ramp (0 → CHATMIX_FULL_ATTEN_DB, converted for the
+/// cubic path by `db_to_volume_pct_cubic`), while `apply_dial_mix` applies the
+/// firmware-reported mix percentages verbatim (the dial's taper is owned by the
+/// headset firmware and may reach 0 % = silence at full tilt).
 fn chatmix_to_volumes(position: i64) -> (f32, f32) {
     let p = position.clamp(0, 9) as f32;
     let center = 4.5_f32;
@@ -142,6 +150,20 @@ fn chatmix_to_volumes(position: i64) -> (f32, f32) {
         let t = (center - p) / center; // 0..1
         (CHATMIX_FULL_ATTEN_DB * t, 0.0)
     }
+}
+
+/// Map a ChatMix position to the (game_pct, chat_pct) pair to write through the
+/// perceptual (cubic) volume path. The dB targets from `chatmix_to_volumes` MUST
+/// be converted with `db_to_volume_pct_cubic` (pct = 100·10^(dB/60)): the write
+/// path cubes pct/100, so the linear `db_to_volume_pct` (pct = 100·10^(dB/20))
+/// would triple the intended attenuation (position 5 ≈ −13.3 dB instead of −4.4;
+/// "full" would be −120 dB instead of −40).
+pub(crate) fn chatmix_to_volume_pcts(position: i64) -> (u8, u8) {
+    let (game_db, chat_db) = chatmix_to_volumes(position);
+    (
+        db_to_volume_pct_cubic(game_db),
+        db_to_volume_pct_cubic(chat_db),
+    )
 }
 
 /// Map a configured surround mode + negotiated channel count to the effective render mode.
@@ -681,11 +703,19 @@ impl<R: CommandRunner> Engine<R> {
                 channels: sc.channels.clone(),
                 hw_sink: sc.hw_sink.clone(),
                 mode: surround_mode_str(sc.mode).to_string(),
-                effective_mode: surround_mode_str(resolve_effective_mode(sc.mode, None)).to_string(),
+                // Feed the PROBED negotiated channel count so Auto reports what the
+                // DSP actually does (bypass for stereo input, HRIR for surround) —
+                // hardcoding None made Auto always claim HRIR 7.1.
+                effective_mode: surround_mode_str(resolve_effective_mode(
+                    sc.mode,
+                    negotiated_channels,
+                ))
+                .to_string(),
                 negotiated_channels,
                 negotiated_surround,
                 hrir_missing: surround_hrir_missing,
                 blocksize: sc.blocksize,
+                tailsize: sc.tailsize,
             }
         } else {
             crate::state::SurroundSnapshot::default()
@@ -825,8 +855,11 @@ impl<R: CommandRunner> Engine<R> {
                 }
             } else {
                 // Value-only edit (Freq/Q/Gain): keep the low-latency live path.
+                // The auto-preamp is recomputed from the FULL dense model so the
+                // headroom always compensates the largest boost (live, G3).
                 let eq_band = convert::eq_band_from_cfg(&cfg)?;
-                be.apply_band(band, &eq_band)?;
+                let eq_model = convert::eq_model_for(channel)?;
+                be.apply_band_with_preamp(band, &eq_band, &eq_model)?;
             }
             let _ = active_name; // suppress unused warning
         }
@@ -838,11 +871,23 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Project the active profile's routes — the single source of truth (G4) —
+    /// into `routes.json` + the persistent conf fragments via Router. Building
+    /// the Router from the FULL route set is what keeps sibling rules intact:
+    /// constructing it empty and applying one rule used to clobber every other
+    /// persisted route on each GUI route change.
+    fn project_routes(&mut self) -> Result<(), EngineError> {
+        let rules = convert::route_rules_from_profile(self.config.active()?);
+        let router = Router::with_rules(&mut self.runner, rules);
+        router.save_persistent()?;
+        Ok(())
+    }
+
     /// Persist a route rule without doing a live move.
     ///
     /// Upserts the route in the active profile's in-memory config, writes the unified
-    /// config to disk, and updates the WirePlumber persistent fragment via Router.
-    /// Emits `RouteSet`. Does NOT call `apply_live`.
+    /// config to disk, and re-projects ALL profile routes into the persistent
+    /// fragments via Router. Emits `RouteSet`. Does NOT call `apply_live`.
     fn persist_route(&mut self, app_binary: &str, target_sink: &str) -> Result<(), EngineError> {
         // Update in-memory config
         {
@@ -867,12 +912,8 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Persist unified config
         self.save_config()?;
-        // Write persistent WirePlumber fragment via Router (no live move)
-        {
-            let mut router = Router::new(&mut self.runner);
-            router.set_rule(RouteRule::new(app_binary, target_sink));
-            router.save_persistent()?;
-        }
+        // Re-project the FULL route set (no live move)
+        self.project_routes()?;
         // Emit event
         self.emit(Event::RouteSet {
             app_binary: app_binary.to_string(),
@@ -894,9 +935,17 @@ impl<R: CommandRunner> Engine<R> {
 
     /// Remove the routing rule for `app_binary`.
     ///
-    /// Drops the rule from in-memory config + persists, removes the WirePlumber
-    /// fragment entry, and attempts a best-effort live clear (moves the stream back
-    /// to the default sink by deleting its `target.object` metadata key).
+    /// Drops the rule from in-memory config + persists, re-projects the remaining
+    /// routes into the persistent fragments (siblings survive), and attempts a
+    /// best-effort live clear (moves the stream back to the default sink by
+    /// deleting its `target.object` metadata key).
+    ///
+    /// KNOWN LIMITATION: WirePlumber's restore-stream module
+    /// (`node.stream.restore-target`, default true) remembers the app's last
+    /// manual target in `~/.local/state/wireplumber/restore-stream`; there is no
+    /// supported way to clear a single app's entry without restarting
+    /// WirePlumber, so the app's NEXT stream may reappear on the old sink until
+    /// the user moves it once. See KNOWN_ISSUES.md (KI-6).
     pub fn clear_route(&mut self, app_binary: &str) -> Result<(), EngineError> {
         // Update in-memory config
         {
@@ -910,12 +959,12 @@ impl<R: CommandRunner> Engine<R> {
         }
         // Persist unified config
         self.save_config()?;
-        // Update Router (remove from persistent fragment)
+        // Re-project the REMAINING routes (clear_route used to write an empty
+        // rule set here, wiping every other persisted route).
+        self.project_routes()?;
+        // Best-effort live clear (ignore error if app not running)
         {
             let mut router = Router::new(&mut self.runner);
-            router.remove_rule(app_binary);
-            router.save_persistent()?;
-            // Best-effort live clear (ignore error if app not running)
             let _ = router.clear_live(&AppMatch::Binary(app_binary.to_string()));
         }
         // Emit event
@@ -1006,11 +1055,12 @@ impl<R: CommandRunner> Engine<R> {
         Ok(deduped)
     }
 
-    /// Discover real output devices (physical sinks) via `pw-metadata 0` + `pw-dump`.
+    /// Discover real output sinks (physical devices) via `pw-metadata 0` + `pw-dump`.
     ///
-    /// Returns a best-effort `Vec` for the UI output selector: on any subprocess
-    /// failure an empty `Vec` is returned.  Never panics; never returns `Err`.
-    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+    /// Best-effort: on any subprocess failure an empty `Vec` is returned.
+    /// Never panics; never returns `Err`. Shared by the UI output selector and
+    /// the headset-sink detection helpers below (G1).
+    fn list_output_sinks(&mut self) -> Vec<arctis_audio::OutputSink> {
         // Step 1: get default sink name from pw-metadata 0.
         let default_sink = match self.runner.run("pw-metadata", &["0"]) {
             Ok(out) if out.status == 0 => arctis_audio::parse_default_sink_name(&out.stdout),
@@ -1026,32 +1076,49 @@ impl<R: CommandRunner> Engine<R> {
             return Vec::new();
         }
 
-        // Step 3: parse and map OutputSink → OutputDeviceSnapshot.
-        match arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref()) {
-            Ok(sinks) => sinks
-                .into_iter()
-                .map(|s| crate::state::OutputDeviceSnapshot {
-                    node_name: s.node_name,
-                    description: s.description,
-                    is_default: s.is_default,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        // Step 3: parse.
+        arctis_audio::parse_output_sinks(&out.stdout, default_sink.as_deref())
+            .unwrap_or_default()
     }
 
-    /// Detect the headset hardware sink by scanning `list_output_devices()` for a
+    /// Discover real output devices (physical sinks) for the UI output selector.
+    pub fn list_output_devices(&mut self) -> Vec<crate::state::OutputDeviceSnapshot> {
+        self.list_output_sinks()
+            .into_iter()
+            .map(|s| crate::state::OutputDeviceSnapshot {
+                node_name: s.node_name,
+                description: s.description,
+                is_default: s.is_default,
+            })
+            .collect()
+    }
+
+    /// True when the sink looks like the headset hardware sink.
+    fn is_headset_sink(node_name: &str) -> bool {
+        let lower = node_name.to_lowercase();
+        // Virtual channel sinks are "Arctis_<Channel>" — parse_output_sinks
+        // already excludes them, so a plain "arctis" match is safe here.
+        lower.contains("steelseries") || lower.contains("arctis")
+    }
+
+    /// Detect the headset hardware sink by scanning the real output sinks for a
     /// node_name that contains "steelseries" or "arctis" (case-insensitive).
     /// Returns `None` if no hardware headset sink is found or on any subprocess
     /// failure. Never panics.
     pub fn detect_headset_sink(&mut self) -> Option<String> {
-        self.list_output_devices()
+        self.list_output_sinks()
             .into_iter()
-            .find(|d| {
-                let lower = d.node_name.to_lowercase();
-                lower.contains("steelseries") || lower.contains("arctis")
-            })
+            .find(|d| Self::is_headset_sink(&d.node_name))
             .map(|d| d.node_name)
+    }
+
+    /// Detect the headset hardware sink's PipeWire object id (for `wpctl <id>`,
+    /// which does not accept node names). Same discovery as `detect_headset_sink`.
+    fn detect_headset_sink_id(&mut self) -> Option<u32> {
+        self.list_output_sinks()
+            .into_iter()
+            .find(|d| Self::is_headset_sink(&d.node_name))
+            .map(|d| d.id)
     }
 
     /// Route a running stream to a channel: resolve channel id → sink node.name,
@@ -1723,8 +1790,23 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Set the master output gain (dB) on the headset output via wpctl, persist,
-    /// and emit MasterVolumeSet.
+    /// Resolve the wpctl target for master volume/mute: the REAL hardware
+    /// headset sink by object id when present, else `@DEFAULT_AUDIO_SINK@`.
+    ///
+    /// Master must always control the hardware tail: `set_default_sink_channel`
+    /// lets the user point the system default at one of OUR virtual sinks
+    /// (e.g. Arctis_Game), and targeting @DEFAULT_AUDIO_SINK@ there would stack
+    /// master gain multiplicatively on that channel's own volume (double
+    /// attenuation) while leaving the hardware sink uncontrolled.
+    fn master_wpctl_target(&mut self) -> String {
+        match self.detect_headset_sink_id() {
+            Some(id) => id.to_string(),
+            None => "@DEFAULT_AUDIO_SINK@".to_string(),
+        }
+    }
+
+    /// Set the master output gain on the headset hardware sink via wpctl,
+    /// persist, and emit MasterVolumeSet.
     pub fn set_master_volume(&mut self, pct: u8) -> Result<(), EngineError> {
         {
             let name = self.config.active_profile.clone();
@@ -1734,12 +1816,12 @@ impl<R: CommandRunner> Engine<R> {
             p.master_volume_pct = pct;
         }
         self.save_config()?;
-        // wpctl set-volume on @DEFAULT_AUDIO_SINK@ using a linear factor.
-        let linear = pct as f32 / 100.0;
-        let factor = format!("{linear:.4}");
-        let out = self
-            .runner
-            .run("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &factor])?;
+        let target = self.master_wpctl_target();
+        // wpctl interprets the 0..1 factor on the CUBIC user scale (WirePlumber
+        // module-mixer-api) — the same perceptual scale as our channel sliders,
+        // which is exactly what a master volume slider should feel like.
+        let factor = format!("{:.4}", pct as f32 / 100.0);
+        let out = self.runner.run("wpctl", &["set-volume", &target, &factor])?;
         if out.status != 0 {
             return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
                 program: "wpctl".into(),
@@ -1752,7 +1834,9 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
-    /// Mute/unmute the master output via wpctl, persist, emit MasterMuteSet.
+    /// Mute/unmute the master output (headset hardware sink, with the same
+    /// @DEFAULT_AUDIO_SINK@ fallback as volume) via wpctl, persist, emit
+    /// MasterMuteSet.
     pub fn set_master_mute(&mut self, muted: bool) -> Result<(), EngineError> {
         {
             let name = self.config.active_profile.clone();
@@ -1762,10 +1846,9 @@ impl<R: CommandRunner> Engine<R> {
             p.master_mute = muted;
         }
         self.save_config()?;
+        let target = self.master_wpctl_target();
         let arg = if muted { "1" } else { "0" };
-        let out = self
-            .runner
-            .run("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", arg])?;
+        let out = self.runner.run("wpctl", &["set-mute", &target, arg])?;
         if out.status != 0 {
             return Err(EngineError::Audio(arctis_audio::AudioError::NonZeroExit {
                 program: "wpctl".into(),
@@ -1824,11 +1907,11 @@ impl<R: CommandRunner> Engine<R> {
             })?;
             p.chatmix_position = pos;
         }
-        let (game_db, chat_db) = chatmix_to_volumes(pos);
+        let (game_pct, chat_pct) = chatmix_to_volume_pcts(pos);
         // Reuse set_channel_volume (live + persist) for each side; ignore "channel
         // not found" so profiles lacking game/chat don't hard-fail.
-        let _ = self.set_channel_volume("game", db_to_volume_pct(game_db));
-        let _ = self.set_channel_volume("chat", db_to_volume_pct(chat_db));
+        let _ = self.set_channel_volume("game", game_pct);
+        let _ = self.set_channel_volume("chat", chat_pct);
         self.save_config()?;
         self.emit(Event::ChatmixSet { position: pos });
         Ok(())
@@ -2085,13 +2168,13 @@ impl<R: CommandRunner> Engine<R> {
             }
         }
 
-        // Step 4: routing rules — persistent only (apply_live is best-effort and needs live streams)
-        if !route_rules.is_empty() {
-            let mut router = Router::new(&mut self.runner);
-            for rule in route_rules {
-                router.set_rule(rule);
-            }
-            // save_persistent writes WirePlumber fragment to disk (no runner calls needed)
+        // Step 4: routing rules — persistent projection only (apply_live is
+        // best-effort and needs live streams). Always save, even when empty:
+        // routes.json and the conf fragments are pure projections of
+        // profile.routes (G4), so an empty profile must clear them rather than
+        // leave stale rules behind. save_persistent is disk-only (no runner calls).
+        {
+            let router = Router::with_rules(&mut self.runner, route_rules);
             router.save_persistent()?;
         }
 
@@ -2674,9 +2757,35 @@ impl<R: CommandRunner> Engine<R> {
         // Each surround-routed channel keeps its own EQ on its channel sink, applied
         // BEFORE convolution. There is no config-driven post-convolution tail EQ.
         //
+        // Auto adapts to what the feeding app actually negotiated: probe the richest
+        // input among streams on the surround-routed channel sinks (read-only, reuses
+        // the TTL-cached pw-dump). Stereo-only input → StereoBypass; true surround →
+        // HRIR. Explicit modes skip the probe entirely. Probe failure → None →
+        // optimistic HRIR 7.1, the pre-probe behaviour.
+        //
+        // TODO(pw-watcher): the layout is only re-probed when apply_surround runs
+        // (reconcile / surround setters). A live re-apply when the richest negotiated
+        // layout CHANGES would need an engine hook from a stream watcher;
+        // crates/cli/src/route_watcher.rs only rewrites route metadata and has no
+        // engine handle, so wiring that is not contained — documented follow-up.
+        let negotiated: Option<u8> = if sc.mode == SurroundMode::Auto {
+            let surround_sinks: Vec<String> = profile
+                .channels
+                .iter()
+                .filter(|c| sc.channels.iter().any(|id| id == &c.id))
+                .map(|c| c.node_name.clone())
+                .collect();
+            let dump = self.volume_dump();
+            parse_app_streams(&dump)
+                .ok()
+                .and_then(|streams| richest_surround_input(&streams, &surround_sinks))
+                .map(|si| si.channels)
+        } else {
+            None
+        };
         // Enabled path: resolve HRIR first (only needed for HRIR modes).
         // StereoBypass does not use an HRIR file — resolve only when needed.
-        let effective = resolve_effective_mode(sc.mode, None);
+        let effective = resolve_effective_mode(sc.mode, negotiated);
         let hrir_path_opt: Option<std::path::PathBuf> = match effective {
             SurroundMode::StereoBypass => {
                 self.surround_hrir_missing = None;
@@ -2708,6 +2817,16 @@ impl<R: CommandRunner> Engine<R> {
             spec.hw_sink = self.detect_headset_sink();
         }
 
+        // Insertion-gain normalization: measure the HRIR's direct-path peak and
+        // emit the convolver `gain` option so every HRIR meets the same target
+        // level (unmeasurable file → None → unity, the old behaviour).
+        let conv_gain = hrir_path_opt
+            .as_deref()
+            .and_then(crate::hrir_import::normalization_gain);
+
+        // The surround route target derives from the spec (G4), not a literal.
+        let surround_target = spec.capture_node_name();
+
         // Recreate surround sink — pick the variant that matches the effective mode.
         {
             let mut surround_be = SurroundBackend::new(&mut self.runner, spec);
@@ -2722,7 +2841,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 8, None, sc.blocksize, conv_gain, sc.tailsize)
                 }
                 SurroundMode::Hrir51 => {
                     let hrir_path = match hrir_path_opt.as_deref() {
@@ -2732,7 +2851,7 @@ impl<R: CommandRunner> Engine<R> {
                             return Ok(());
                         }
                     };
-                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize)
+                    surround_be.recreate_ex(hrir_path, 6, None, sc.blocksize, conv_gain, sc.tailsize)
                 }
                 SurroundMode::StereoBypass => {
                     surround_be.recreate_stereo_bypass(sc.crossfeed, None)
@@ -2769,7 +2888,6 @@ impl<R: CommandRunner> Engine<R> {
             .collect();
 
         let channel_set = convert::channel_set_from_profile(profile);
-        let surround_target = "effect_input.arctis_surround".to_string();
 
         // Restore removed channels to their configured output_device.
         for ch_id in &to_restore {
@@ -2917,18 +3035,30 @@ impl<R: CommandRunner> Engine<R> {
         Ok(())
     }
 
+    /// Validate a convolver partition size: a power of two in 64..=8192.
+    /// `None` (PipeWire default) is always valid. Typed error otherwise (G7).
+    fn validate_convolver_size(
+        name: &str,
+        v: Option<u32>,
+    ) -> Result<(), crate::error::EngineError> {
+        if let Some(n) = v {
+            if !(64..=8192).contains(&n) || !n.is_power_of_two() {
+                return Err(crate::error::EngineError::BadRequest(format!(
+                    "{name} must be a power of two in 64..=8192, got {n} (use None for the PipeWire default)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Pin (or clear) the convolver blocksize. Persists; re-applies when enabled.
+    /// Validates BEFORE persisting (G7): power of two in 64..=8192, and never
+    /// larger than a pinned tailsize.
     pub fn surround_set_blocksize(
         &mut self,
         blocksize: Option<u32>,
     ) -> Result<(), crate::error::EngineError> {
-        // Reject obviously-invalid values BEFORE persisting (G7). A 0 blocksize is
-        // invalid; `None` stays valid (PipeWire default / auto).
-        if blocksize == Some(0) {
-            return Err(crate::error::EngineError::BadRequest(
-                "blocksize must be greater than 0 (use None for the PipeWire default)".into(),
-            ));
-        }
+        Self::validate_convolver_size("blocksize", blocksize)?;
         {
             let name = self.config.active_profile.clone();
             let profile = self.config.profile_mut(&name).ok_or_else(|| {
@@ -2936,7 +3066,48 @@ impl<R: CommandRunner> Engine<R> {
                     name.clone(),
                 ))
             })?;
+            if let (Some(b), Some(t)) = (blocksize, profile.surround.tailsize) {
+                if b > t {
+                    return Err(crate::error::EngineError::BadRequest(format!(
+                        "blocksize {b} exceeds the pinned tailsize {t}"
+                    )));
+                }
+            }
             profile.surround.blocksize = blocksize;
+        }
+        self.save_config()?;
+        if self.config.active()?.surround.enabled {
+            let profile = self.config.active()?.clone();
+            self.apply_surround(&profile)?;
+        }
+        Ok(())
+    }
+
+    /// Pin (or clear) the convolver tailsize. Persists; re-applies when enabled.
+    /// Same validation as blocksize, plus tailsize ≥ blocksize (a tail partition
+    /// smaller than the head partition is invalid). Rationale: a bare small
+    /// blocksize partitions the entire ~250 ms bundled IR at that size — the
+    /// tail should run in larger, cheaper partitions.
+    pub fn surround_set_tailsize(
+        &mut self,
+        tailsize: Option<u32>,
+    ) -> Result<(), crate::error::EngineError> {
+        Self::validate_convolver_size("tailsize", tailsize)?;
+        {
+            let name = self.config.active_profile.clone();
+            let profile = self.config.profile_mut(&name).ok_or_else(|| {
+                crate::error::EngineError::Config(arctis_config::ConfigError::ProfileNotFound(
+                    name.clone(),
+                ))
+            })?;
+            if let (Some(t), Some(b)) = (tailsize, profile.surround.blocksize) {
+                if t < b {
+                    return Err(crate::error::EngineError::BadRequest(format!(
+                        "tailsize {t} must be ≥ the pinned blocksize {b}"
+                    )));
+                }
+            }
+            profile.surround.tailsize = tailsize;
         }
         self.save_config()?;
         if self.config.active()?.surround.enabled {
@@ -3292,79 +3463,32 @@ mod tests {
         // Queue outputs (interleaved per channel):
         // detect_headset_sink: 2 calls (pw-metadata 0 + pw-dump)
         // Phase 1 (channels up): 4 × 1 ls-Node
-        // Per channel (4 channels): (1 ls + 10 bands) + (1 ls + 1 Props) = 13 × 4 = 52
+        // Per channel (4 channels): (1 ls + 10 bands + 1 preamp) + (1 ls + 1 Props) = 14 × 4 = 56
         // Phase 5: 1 ls (mic disabled)
         // Phase 6: 1 ls (surround disabled)
-        // Total: 2 + 4 + 52 + 1 + 1 = 60
-        let runner = MockRunner::new()
+        // Total: 2 + 4 + 56 + 1 + 1 = 64
+        let mut runner = MockRunner::new()
             // detect_headset_sink: pw-metadata 0 + pw-dump []
-            .with_output(0, "", "")  // [0] detect: pw-metadata 0
-            .with_output(0, "[]", "") // [1] detect: pw-dump []
-            // Phase 1: channel up — game[2], chat[3], media[4], aux[5] (all present)
-            .with_output(0, &ls, "") // [2] game
-            .with_output(0, &ls, "") // [3] chat
-            .with_output(0, &ls, "") // [4] media
-            .with_output(0, &ls, "") // [5] aux
-            // game: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [6] game EQ ls
-            .with_output(0, "", "") // [7]
-            .with_output(0, "", "") // [8]
-            .with_output(0, "", "") // [9]
-            .with_output(0, "", "") // [10]
-            .with_output(0, "", "") // [11]
-            .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14]
-            .with_output(0, "", "") // [15]
-            .with_output(0, "", "") // [16] game 10 band sets
-            .with_output(0, &ls, "") // [17] game vol find_node_id
-            .with_output(0, "", "") // [18] game vol Props set
-            // chat: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [19] chat EQ ls
-            .with_output(0, "", "") // [20]
-            .with_output(0, "", "") // [21]
-            .with_output(0, "", "") // [22]
-            .with_output(0, "", "") // [23]
-            .with_output(0, "", "") // [24]
-            .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27]
-            .with_output(0, "", "") // [28]
-            .with_output(0, "", "") // [29] chat 10 band sets
-            .with_output(0, &ls, "") // [30] chat vol find_node_id
-            .with_output(0, "", "") // [31] chat vol Props set
-            // media: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [32] media EQ ls
-            .with_output(0, "", "") // [33]
-            .with_output(0, "", "") // [34]
-            .with_output(0, "", "") // [35]
-            .with_output(0, "", "") // [36]
-            .with_output(0, "", "") // [37]
-            .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40]
-            .with_output(0, "", "") // [41]
-            .with_output(0, "", "") // [42] media 10 band sets
-            .with_output(0, &ls, "") // [43] media vol find_node_id
-            .with_output(0, "", "") // [44] media vol Props set
-            // aux: Phase 2 (EQ) + Phase 2b (vol/mute)
-            .with_output(0, &ls, "") // [45] aux EQ ls
-            .with_output(0, "", "") // [46]
-            .with_output(0, "", "") // [47]
-            .with_output(0, "", "") // [48]
-            .with_output(0, "", "") // [49]
-            .with_output(0, "", "") // [50]
-            .with_output(0, "", "") // [51]
-            .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53]
-            .with_output(0, "", "") // [54]
-            .with_output(0, "", "") // [55] aux 10 band sets
-            .with_output(0, &ls, "") // [56] aux vol find_node_id
-            .with_output(0, "", "") // [57] aux vol Props set
-            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls, "") // [58]
-            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls, ""); // [59]
+            .with_output(0, "", "") // [0] detect: pw-metadata 0
+            .with_output(0, "[]", ""); // [1] detect: pw-dump []
+        // Phase 1: channel up — game[2], chat[3], media[4], aux[5] (all present)
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls, "");
+        }
+        // Per channel: Phase 2 (1 ls + 10 band sets + 1 preamp set) then
+        // Phase 2b (1 ls + 1 vol/mute Props set).
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls, ""); // EQ find_node_id
+            for _ in 0..11 {
+                runner = runner.with_output(0, "", ""); // 10 bands + preamp
+            }
+            runner = runner
+                .with_output(0, &ls, "") // vol find_node_id
+                .with_output(0, "", ""); // vol Props set
+        }
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        let runner = runner.with_output(0, &ls, "").with_output(0, &ls, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -3390,57 +3514,65 @@ mod tests {
         assert_eq!(calls[7][1], "s");
         assert_eq!(calls[7][3], "Props");
 
-        // Phase 2b: apply_volume_mute game — index 17
+        // Preamp set closes each channel's apply_all — index 17 for game.
+        assert_eq!(calls[17][0], "pw-cli", "game preamp set");
+        assert!(
+            calls[17][4].contains("eq_preamp:Mult"),
+            "call 17 must be the game auto-preamp set: {:?}",
+            calls[17]
+        );
+
+        // Phase 2b: apply_volume_mute game — index 18
         assert_eq!(
-            calls[17],
+            calls[18],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat: EQ starts at index 19
+        // Phase 2 chat: EQ starts at index 20
         assert_eq!(
-            calls[19],
+            calls[20],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat: volume starts at index 30
+        // Phase 2b chat: volume starts at index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media: EQ starts at index 32
+        // Phase 2 media: EQ starts at index 34
         assert_eq!(
-            calls[32],
+            calls[34],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media: volume starts at index 43
+        // Phase 2b media: volume starts at index 46
         assert_eq!(
-            calls[43],
+            calls[46],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux: EQ starts at index 45
+        // Phase 2 aux: EQ starts at index 48
         assert_eq!(
-            calls[45],
+            calls[48],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux: volume starts at index 56
+        // Phase 2b aux: volume starts at index 60
         assert_eq!(
-            calls[56],
+            calls[60],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 2 (detect) + 4 (up) + 4*(1+10+1+1) (apply_all+vol/mute) + 1 (mic step5) + 1 (surround step6) = 60
-        assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
+        // Total: 2 (detect) + 4 (up) + 4*(1+10+1+1+1) (apply_all+preamp+vol/mute) + 1 (mic step5) + 1 (surround step6) = 64
+        assert_eq!(calls.len(), 64, "expected 64 total pw-cli calls");
 
         // No spawned processes (sinks already present, including aux)
         assert!(
@@ -3459,75 +3591,30 @@ mod tests {
         let ls_absent = ls_all_absent();
         let ls_present = ls_all_present();
 
-        let runner = MockRunner::new()
+        let mut runner = MockRunner::new()
             // detect_headset_sink: pw-metadata 0 + pw-dump []
-            .with_output(0, "", "")  // [0] detect: pw-metadata 0
-            .with_output(0, "[]", "") // [1] detect: pw-dump []
-            // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
-            .with_output(0, &ls_absent, "") // [2] game ls (absent)
-            .with_output(0, &ls_absent, "") // [3] chat ls (absent)
-            .with_output(0, &ls_absent, "") // [4] media ls (absent)
-            .with_output(0, &ls_absent, "") // [5] aux ls (absent, seeded by Engine::new)
-            // game: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [6] game EQ find_node_id
-            .with_output(0, "", "") // [7]
-            .with_output(0, "", "") // [8]
-            .with_output(0, "", "") // [9]
-            .with_output(0, "", "") // [10]
-            .with_output(0, "", "") // [11]
-            .with_output(0, "", "") // [12]
-            .with_output(0, "", "") // [13]
-            .with_output(0, "", "") // [14]
-            .with_output(0, "", "") // [15]
-            .with_output(0, "", "") // [16] game 10 band sets
-            .with_output(0, &ls_present, "") // [17] game vol find_node_id
-            .with_output(0, "", "") // [18] game vol Props set
-            // chat: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [19] chat EQ find_node_id
-            .with_output(0, "", "") // [20]
-            .with_output(0, "", "") // [21]
-            .with_output(0, "", "") // [22]
-            .with_output(0, "", "") // [23]
-            .with_output(0, "", "") // [24]
-            .with_output(0, "", "") // [25]
-            .with_output(0, "", "") // [26]
-            .with_output(0, "", "") // [27]
-            .with_output(0, "", "") // [28]
-            .with_output(0, "", "") // [29] chat 10 band sets
-            .with_output(0, &ls_present, "") // [30] chat vol find_node_id
-            .with_output(0, "", "") // [31] chat vol Props set
-            // media: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [32] media EQ find_node_id
-            .with_output(0, "", "") // [33]
-            .with_output(0, "", "") // [34]
-            .with_output(0, "", "") // [35]
-            .with_output(0, "", "") // [36]
-            .with_output(0, "", "") // [37]
-            .with_output(0, "", "") // [38]
-            .with_output(0, "", "") // [39]
-            .with_output(0, "", "") // [40]
-            .with_output(0, "", "") // [41]
-            .with_output(0, "", "") // [42] media 10 band sets
-            .with_output(0, &ls_present, "") // [43] media vol find_node_id
-            .with_output(0, "", "") // [44] media vol Props set
-            // aux: Phase 2 (EQ apply) + Phase 2b (vol/mute apply)
-            .with_output(0, &ls_present, "") // [45] aux EQ find_node_id
-            .with_output(0, "", "") // [46]
-            .with_output(0, "", "") // [47]
-            .with_output(0, "", "") // [48]
-            .with_output(0, "", "") // [49]
-            .with_output(0, "", "") // [50]
-            .with_output(0, "", "") // [51]
-            .with_output(0, "", "") // [52]
-            .with_output(0, "", "") // [53]
-            .with_output(0, "", "") // [54]
-            .with_output(0, "", "") // [55] aux 10 band sets
-            .with_output(0, &ls_present, "") // [56] aux vol find_node_id
-            .with_output(0, "", "") // [57] aux vol Props set
-            // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
-            .with_output(0, &ls_absent, "") // [58]
-            // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
-            .with_output(0, &ls_absent, ""); // [59]
+            .with_output(0, "", "") // [0] detect: pw-metadata 0
+            .with_output(0, "[]", ""); // [1] detect: pw-dump []
+        // Phase 1: 4 ls calls only (spawn_owned does not consume queued outputs)
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls_absent, "");
+        }
+        // Per channel: Phase 2 (1 ls + 10 band sets + 1 preamp set) then
+        // Phase 2b (1 ls + 1 vol/mute Props set).
+        for _ in 0..4 {
+            runner = runner.with_output(0, &ls_present, ""); // EQ find_node_id
+            for _ in 0..11 {
+                runner = runner.with_output(0, "", ""); // 10 bands + preamp
+            }
+            runner = runner
+                .with_output(0, &ls_present, "") // vol find_node_id
+                .with_output(0, "", ""); // vol Props set
+        }
+        // Phase 5: mic disabled → remove() → source_exists() → 1 ls (no mic node)
+        // Phase 6: surround disabled → remove() → source_exists() → 1 ls (surround absent)
+        let runner = runner
+            .with_output(0, &ls_absent, "")
+            .with_output(0, &ls_absent, "");
 
         let cfg = make_config_no_eq_no_routes();
         let mut engine = Engine::new(runner, cfg);
@@ -3553,60 +3640,60 @@ mod tests {
         assert_eq!(calls[7][1], "s", "game band 0 sub-cmd");
         assert_eq!(calls[7][3], "Props", "game band 0 Props");
 
-        // Phase 2b: apply game vol at index 17
+        // Phase 2b: apply game vol at index 18 (after 10 bands + preamp)
         assert_eq!(
-            calls[17],
+            calls[18],
             vec!["pw-cli", "ls", "Node"],
             "game vol find_node_id"
         );
 
-        // Phase 2 chat EQ: index 19
+        // Phase 2 chat EQ: index 20
         assert_eq!(
-            calls[19],
+            calls[20],
             vec!["pw-cli", "ls", "Node"],
             "chat eq find_node_id"
         );
 
-        // Phase 2b chat vol: index 30
+        // Phase 2b chat vol: index 32
         assert_eq!(
-            calls[30],
+            calls[32],
             vec!["pw-cli", "ls", "Node"],
             "chat vol find_node_id"
         );
 
-        // Phase 2 media EQ: index 32
+        // Phase 2 media EQ: index 34
         assert_eq!(
-            calls[32],
+            calls[34],
             vec!["pw-cli", "ls", "Node"],
             "media eq find_node_id"
         );
 
-        // Phase 2b media vol: index 43
+        // Phase 2b media vol: index 46
         assert_eq!(
-            calls[43],
+            calls[46],
             vec!["pw-cli", "ls", "Node"],
             "media vol find_node_id"
         );
 
-        // Phase 2 aux EQ: index 45
+        // Phase 2 aux EQ: index 48
         assert_eq!(
-            calls[45],
+            calls[48],
             vec!["pw-cli", "ls", "Node"],
             "aux eq find_node_id"
         );
 
-        // Phase 2b aux vol: index 56
+        // Phase 2b aux vol: index 60
         assert_eq!(
-            calls[56],
+            calls[60],
             vec!["pw-cli", "ls", "Node"],
             "aux vol find_node_id"
         );
 
-        // Total: 2 (detect) + 4 (phase1 ls) + 4*(1+10+1+1) (EQ+vol) + 1 (mic step5) + 1 (surround step6) = 60
+        // Total: 2 (detect) + 4 (phase1 ls) + 4*(1+10+1+1+1) (EQ+preamp+vol) + 1 (mic step5) + 1 (surround step6) = 64
         assert_eq!(
             calls.len(),
-            60,
-            "expected 60 total run calls (no spawns in calls)"
+            64,
+            "expected 64 total run calls (no spawns in calls)"
         );
 
         // spawn_owned goes into `spawned` — 4 pipewire -c invocations (channels only)
@@ -3760,18 +3847,22 @@ mod tests {
         let mut engine = Engine::new(runner, simple_cfg);
         engine.reconcile().expect("reconcile should succeed");
 
-        // The WirePlumber fragment should exist.
-        let frag_path = tmp_home.join(".config/wireplumber/wireplumber.conf.d/90-asm-routing.conf");
-        assert!(frag_path.exists(), "WirePlumber fragment should be written");
-        let content = std::fs::read_to_string(&frag_path).unwrap();
-        assert!(
-            content.contains("firefox"),
-            "fragment should contain firefox rule"
-        );
-        assert!(
-            content.contains("Arctis_Media"),
-            "fragment should contain Arctis_Media"
-        );
+        // Both persistent routing fragments should exist (client + pulse).
+        for frag_path in [
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+            tmp_home.join(".config/pipewire/pipewire-pulse.conf.d/90-asm-routing.conf"),
+        ] {
+            assert!(frag_path.exists(), "fragment should be written: {frag_path:?}");
+            let content = std::fs::read_to_string(&frag_path).unwrap();
+            assert!(
+                content.contains("firefox"),
+                "fragment should contain firefox rule"
+            );
+            assert!(
+                content.contains("Arctis_Media"),
+                "fragment should contain Arctis_Media"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_home);
         std::env::remove_var("HOME");
@@ -5572,6 +5663,93 @@ mod tests {
         std::env::remove_var("HOME");
     }
 
+    /// Regression (route-clobber): persist_route used to build an EMPTY Router,
+    /// apply one set_rule and save — wiping every sibling rule from routes.json
+    /// and the persistent fragments on each route change. The projection must
+    /// carry ALL of profile.routes (G4: profile is the single source of truth).
+    #[test]
+    fn set_route_preserves_sibling_persisted_rules() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("route_sib");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("route_sib_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].routes.push(arctis_config::RouteConfig {
+            app_binary: "discord".into(),
+            target_sink: "Arctis_Chat".into(),
+        });
+        // apply_live best-effort: pw-dump returns empty array → live move skipped.
+        let runner = MockRunner::new().with_output(0, "[]", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_route("firefox", "Arctis_Media").unwrap();
+
+        let routes_json = std::fs::read_to_string(
+            tmp_home.join(".config/arctis-sound-manager/routes.json"),
+        )
+        .expect("routes.json written");
+        assert!(routes_json.contains("firefox"), "new rule present: {routes_json}");
+        assert!(routes_json.contains("discord"), "sibling rule survives: {routes_json}");
+
+        let frag = std::fs::read_to_string(
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+        )
+        .expect("client fragment written");
+        assert!(frag.contains("firefox") && frag.contains("discord"), "fragment: {frag}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    /// Regression (route-clobber): clear_route used to save an EMPTY rule set
+    /// even when other routes existed. Clearing one app must re-project the
+    /// remaining profile routes.
+    #[test]
+    fn clear_route_preserves_sibling_persisted_rules() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("route_clear_sib");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        let tmp_home = unique_cfg_tmp("route_clear_sib_home");
+        std::env::set_var("HOME", &tmp_home);
+
+        let mut cfg = make_config_no_eq_no_routes();
+        cfg.profiles[0].routes = vec![
+            arctis_config::RouteConfig {
+                app_binary: "discord".into(),
+                target_sink: "Arctis_Chat".into(),
+            },
+            arctis_config::RouteConfig {
+                app_binary: "firefox".into(),
+                target_sink: "Arctis_Media".into(),
+            },
+        ];
+        // clear_live best-effort: pw-dump returns empty array → skipped.
+        let runner = MockRunner::new().with_output(0, "[]", "");
+        let mut engine = Engine::new(runner, cfg);
+        engine.clear_route("firefox").unwrap();
+
+        let routes_json = std::fs::read_to_string(
+            tmp_home.join(".config/arctis-sound-manager/routes.json"),
+        )
+        .expect("routes.json written");
+        assert!(!routes_json.contains("firefox"), "cleared rule gone: {routes_json}");
+        assert!(routes_json.contains("discord"), "sibling rule survives: {routes_json}");
+
+        let frag = std::fs::read_to_string(
+            tmp_home.join(".config/pipewire/client.conf.d/90-asm-routing.conf"),
+        )
+        .expect("client fragment written");
+        assert!(!frag.contains("firefox") && frag.contains("discord"), "fragment: {frag}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
+        std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
+    }
+
     // ─────────────────────────────────────────────
     // Task 4 TDD: mic source reconcile + engine methods
     // ─────────────────────────────────────────────
@@ -6855,6 +7033,21 @@ mod tests {
         assert_eq!(calls.len(), 60, "expected 60 total pw-cli calls");
     }
 
+    /// Remove stale on-disk confs from previous tests/runs so the
+    /// diff-before-recreate guards never skip a scripted teardown+respawn.
+    fn scrub_stale_confs() {
+        let t = std::env::temp_dir();
+        for f in [
+            "arctis_arctis_surround.conf",
+            "arctis_eq.Arctis_Game.conf",
+            "arctis_eq.Arctis_Chat.conf",
+            "arctis_eq.Arctis_Media.conf",
+            "arctis_eq.Arctis_Aux.conf",
+        ] {
+            let _ = std::fs::remove_file(t.join(f));
+        }
+    }
+
     /// Queue outputs for reconcile with surround ENABLED and surround node absent.
     /// Engine::new seeds "aux" → 4 channels (game/chat/media/aux).
     /// Step6 enabled (apply_surround uses recreate_ex in enabled path):
@@ -6864,6 +7057,7 @@ mod tests {
     ///   2. reroute "game": set_output → ls (source_exists: present) → find_node_id → destroy → pkill + ls (source absent → spawn)
     ///   3. reroute "media": same
     fn queue_reconcile_surround_enabled_absent(runner: MockRunner) -> MockRunner {
+        scrub_stale_confs();
         let ls_channels = ls_all_present();
         let ls_surround_absent = ls_all_absent(); // no surround node
         let mut r = runner;
@@ -6876,9 +7070,9 @@ mod tests {
         }
         // Phase 2 + 2b interleaved: per channel (4), EQ apply then volume/mute apply
         for _ in 0..4 {
-            // Phase 2: EQ apply (1 ls + 10 band sets)
+            // Phase 2: EQ apply (1 ls + 10 band sets + 1 preamp set)
             r = r.with_output(0, &ls_channels, "");
-            for _ in 0..10 {
+            for _ in 0..11 {
                 r = r.with_output(0, "", "");
             }
             // Phase 2b: volume/mute apply (1 ls + 1 Props set)
@@ -6887,8 +7081,11 @@ mod tests {
         }
         // Phase 5 (mic disabled): source_exists → 1 ls (no mic)
         r = r.with_output(0, &ls_surround_absent, "");
-        // Phase 6 start: apply_surround re-detects the headset to default the convolver
-        // output sink (hw_sink unset) → pw-metadata 0 + pw-dump (no SteelSeries → None,
+        // Phase 6 start: apply_surround (mode = Auto) probes the negotiated input
+        // layout first → 1 pw-dump (no streams → None → HRIR 7.1).
+        r = r.with_output(0, "[]", ""); // apply_surround Auto probe: pw-dump
+        // Then it re-detects the headset to default the convolver output sink
+        // (hw_sink unset) → pw-metadata 0 + pw-dump (no SteelSeries → None,
         // so the convolver output is left untargeted in this fixture).
         r = r.with_output(0, "", ""); // apply_surround detect: pw-metadata 0
         r = r.with_output(0, "[]", ""); // apply_surround detect: pw-dump []
@@ -6959,6 +7156,68 @@ mod tests {
         std::env::remove_var("HOME");
     }
 
+    /// pw-dump fixture: a STEREO stream linked to Arctis_Game (the surround sink).
+    const STEREO_STREAM_DUMP: &str = r#"[
+      { "id": 50, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Audio/Sink", "node.name": "Arctis_Game" } } },
+      { "id": 51, "type": "PipeWire:Interface:Node",
+        "info": { "props": { "media.class": "Stream/Output/Audio",
+            "application.name": "Spotify", "application.process.binary": "spotify" },
+          "params": { "Format": [ { "channels": 2, "position": ["FL","FR"] } ] } } },
+      { "id": 99, "type": "PipeWire:Interface:Link",
+        "info": { "output-node-id": 51, "input-node-id": 50 } }
+    ]"#;
+
+    /// Auto + a stereo-only feeding stream → state() must report the REAL
+    /// effective mode (stereo_bypass), not the old hardcoded hrir71.
+    #[test]
+    fn state_effective_mode_auto_reports_bypass_for_stereo_input() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let runner = MockRunner::new().with_output(0, STEREO_STREAM_DUMP, ""); // state(): pw-dump
+        let cfg = make_config_surround_single_game_no_eq("test-hrir"); // mode = Auto
+        let mut engine = Engine::new(runner, cfg);
+        let st = engine.state();
+        assert_eq!(st.surround.mode, "auto");
+        assert_eq!(st.surround.negotiated_channels, Some(2));
+        assert_eq!(
+            st.surround.effective_mode, "stereo_bypass",
+            "Auto with a stereo input must report stereo_bypass"
+        );
+    }
+
+    /// Auto + a stereo-only feeding stream → apply_surround must build the
+    /// stereo-bypass graph (2-ch, no convolver), not the 7.1 HRIR graph.
+    #[test]
+    fn apply_surround_auto_with_stereo_input_builds_bypass() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let runner = queue_apply_surround_both_absent(
+            MockRunner::new()
+                .with_output(0, STEREO_STREAM_DUMP, "") // Auto probe: pw-dump (stereo stream)
+                .with_output(0, "", "") // detect: pw-metadata 0
+                .with_output(0, "[]", ""), // detect: pw-dump []
+        );
+        let cfg = make_config_surround_single_game_no_eq("test-hrir"); // mode = Auto
+        let mut engine = Engine::new(runner, cfg);
+        let profile = engine.config.active().unwrap().clone();
+        engine.apply_surround(&profile).expect("apply_surround must succeed");
+
+        let surround_argv = engine
+            .runner
+            .spawned
+            .iter()
+            .find(|argv| argv.get(2).map(|s| s.contains("arctis_surround")).unwrap_or(false))
+            .expect("surround conf must have been spawned");
+        let conf = std::fs::read_to_string(&surround_argv[2]).expect("conf exists");
+        assert!(
+            conf.contains("audio.channels = 2"),
+            "Auto+stereo must spawn the 2-ch bypass graph, got:\n{conf}"
+        );
+        assert!(
+            !conf.contains("convolver"),
+            "Auto+stereo must NOT build the HRIR convolver graph"
+        );
+    }
+
     // ─────────────────────────────────────────────
     // F1.3 TDD: surround_set_* methods
     // ─────────────────────────────────────────────
@@ -6990,6 +7249,7 @@ mod tests {
 
     #[test]
     fn surround_set_hrir_persists_and_emits_event() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_set_hrir_home");
         let tmp_cfg = unique_cfg_tmp("surr_set_hrir_cfg");
@@ -7061,6 +7321,7 @@ mod tests {
 
     #[test]
     fn surround_set_channels_persists_and_emits_event() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("surr_set_ch");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
@@ -7116,6 +7377,7 @@ mod tests {
 
     #[test]
     fn surround_set_blocksize_persists() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = unique_cfg_tmp("surr_set_bs");
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
@@ -7127,6 +7389,68 @@ mod tests {
         assert_eq!(engine.config.active().unwrap().surround.blocksize, Some(128));
         engine.surround_set_blocksize(None).unwrap();
         assert_eq!(engine.config.active().unwrap().surround.blocksize, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_blocksize_rejects_non_power_of_two_and_out_of_range() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_bs_invalid");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        for bad in [100u32, 32, 16384, 65] {
+            let res = engine.surround_set_blocksize(Some(bad));
+            assert!(
+                matches!(res, Err(crate::error::EngineError::BadRequest(_))),
+                "blocksize {bad} must be rejected (power of two in 64..=8192)"
+            );
+        }
+        // Valid values pass (64 and 8192 are the range edges).
+        engine.surround_set_blocksize(Some(64)).unwrap();
+        engine.surround_set_blocksize(Some(8192)).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    #[test]
+    fn surround_set_tailsize_validates_and_persists() {
+        scrub_stale_confs();
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("surr_set_ts");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+
+        // Same shape validation as blocksize.
+        assert!(matches!(
+            engine.surround_set_tailsize(Some(100)),
+            Err(crate::error::EngineError::BadRequest(_))
+        ));
+        // tailsize must be >= a pinned blocksize.
+        engine.surround_set_blocksize(Some(256)).unwrap();
+        assert!(
+            matches!(
+                engine.surround_set_tailsize(Some(128)),
+                Err(crate::error::EngineError::BadRequest(_))
+            ),
+            "tailsize below the pinned blocksize must be rejected"
+        );
+        engine.surround_set_tailsize(Some(4096)).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.tailsize, Some(4096));
+        // And blocksize may not be raised past the pinned tailsize.
+        assert!(matches!(
+            engine.surround_set_blocksize(Some(8192)),
+            Err(crate::error::EngineError::BadRequest(_))
+        ));
+        // Clearing works.
+        engine.surround_set_tailsize(None).unwrap();
+        assert_eq!(engine.config.active().unwrap().surround.tailsize, None);
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -7187,6 +7511,7 @@ mod tests {
     /// After apply_surround: media must be restored to its output_device; surround_routed = {"game"}.
     #[test]
     fn apply_surround_restores_removed_channel() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("c1_restore_home");
         let profiles_dir = tmp_home.join(".local/share/pipewire/hrir_hesuvi/profiles");
@@ -7288,6 +7613,7 @@ mod tests {
     /// (even though output_device = None), surround_routed = {}.
     #[test]
     fn apply_surround_disabled_restores_stale_channel_with_no_output_device() {
+        scrub_stale_confs();
         // Config: surround disabled (default). Game channel has output_device = None.
         let cfg = make_config_no_eq_no_routes(); // surround.enabled = false
 
@@ -7361,6 +7687,7 @@ mod tests {
     /// 2. surround_set_enabled(false) → drains surround_routed + restores channels
     #[test]
     fn surround_set_enabled_disable_restores_all_channels() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_roundtrip_home");
         let tmp_cfg = unique_cfg_tmp("surr_roundtrip_cfg");
@@ -7495,6 +7822,7 @@ mod tests {
     /// → only the sink is recreated (no channel thrash).
     #[test]
     fn surround_set_hrir_enabled_uses_apply_surround_no_channel_thrash() {
+        scrub_stale_confs();
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp_home = unique_cfg_tmp("surr_hrir_i3_home");
         let tmp_cfg = unique_cfg_tmp("surr_hrir_i3_cfg");
@@ -7920,11 +8248,100 @@ mod tests {
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
 
         let cfg = make_config_no_eq_no_routes();
-        // wpctl call for the gain (status 0).
-        let runner = arctis_audio::MockRunner::new().with_output(0, "", "");
+        // headset detect: pw-metadata 0 + pw-dump (empty → fallback), then wpctl.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, "[]", "")
+            .with_output(0, "", "");
         let mut engine = Engine::new(runner, cfg);
         engine.set_master_volume(50).unwrap();
         assert_eq!(engine.state().master_volume_pct, 50);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Master volume must target the REAL hardware headset sink (by object id):
+    /// @DEFAULT_AUDIO_SINK@ is wrong once set_default_sink_channel points the
+    /// system default at one of our virtual sinks — master would then stack on
+    /// the channel volume (double attenuation) and stop controlling the
+    /// hardware tail.
+    #[test]
+    fn set_master_volume_targets_headset_sink_id_when_present() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_vol_hw");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "") // pw-metadata 0 (no default key)
+            .with_output(0, dump, "") // pw-dump (headset sink id 10)
+            .with_output(0, "", ""); // wpctl set-volume
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_volume(50).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-volume", "10", "0.5000"],
+            "must target the headset sink id, not @DEFAULT_AUDIO_SINK@"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Without a detectable headset sink, master volume falls back to
+    /// @DEFAULT_AUDIO_SINK@ (better than doing nothing).
+    #[test]
+    fn set_master_volume_falls_back_to_default_sink_when_no_headset() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_vol_fb");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "") // pw-metadata 0
+            .with_output(0, "[]", "") // pw-dump: no sinks at all
+            .with_output(0, "", ""); // wpctl set-volume
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_volume(75).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "0.7500"]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Master mute has the same targeting rule as master volume.
+    #[test]
+    fn set_master_mute_targets_headset_sink_id_with_default_fallback() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("master_mute_hw");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, dump, "")
+            .with_output(0, "", ""); // wpctl set-mute
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_mute(true).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-mute", "10", "1"]
+        );
+
+        // Fallback path.
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, "", "")
+            .with_output(0, "[]", "")
+            .with_output(0, "", "");
+        let mut engine = Engine::new(runner, make_config_no_eq_no_routes());
+        engine.set_master_mute(false).unwrap();
+        assert_eq!(
+            engine.runner.last_call().unwrap(),
+            &vec!["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"]
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -7947,6 +8364,103 @@ mod tests {
         let mut engine = Engine::new(runner, cfg);
         engine.set_chatmix(9).unwrap(); // full game
         assert_eq!(engine.state().chatmix_position, 9);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// The dB targets from chatmix_to_volumes must reach the cubic write path as
+    /// pct = 100·10^(dB/60). The old linear conversion (100·10^(dB/20)) tripled
+    /// the attenuation: position 5 played at ≈ −13.3 dB instead of −4.4, and
+    /// "full" (position 9/0) at −120 dB (pct 1) instead of −40 dB (pct 22).
+    #[test]
+    fn chatmix_to_volume_pcts_uses_cubic_conversion() {
+        // (game_pct, chat_pct) per position; winner side is always 0 dB = 100 %.
+        assert_eq!(chatmix_to_volume_pcts(9), (100, 22)); // chat at −40 dB
+        assert_eq!(chatmix_to_volume_pcts(7), (100, 43)); // chat at −22.2 dB
+        assert_eq!(chatmix_to_volume_pcts(5), (100, 84)); // chat at −4.44 dB
+        assert_eq!(chatmix_to_volume_pcts(4), (84, 100)); // game at −4.44 dB
+        assert_eq!(chatmix_to_volume_pcts(0), (22, 100)); // game at −40 dB
+    }
+
+    /// End-to-end argv check: set_chatmix(9) must write pct 100 (game) and pct 22
+    /// (chat) through the cubic Props path — i.e. chat channelVolumes = 0.22^3,
+    /// NOT the old linear pct 1 (channelVolumes = 0.01^3 ≈ −120 dB).
+    #[test]
+    fn set_chatmix_applies_cubic_pcts_via_props_argv() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("chatmix_cubic");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg = make_config_no_eq_no_routes();
+        let ls = ls_all_present();
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "") // game: find_node_id
+            .with_output(0, "", "") // game: pw-cli s Props
+            .with_output(0, &ls, "") // chat: find_node_id
+            .with_output(0, "", ""); // chat: pw-cli s Props
+        let mut engine = Engine::new(runner, cfg);
+        engine.set_chatmix(9).unwrap(); // full game
+
+        let game_vol = 1.0f32; // pct 100
+        let chat_frac = 22.0f32 / 100.0;
+        let chat_vol = chat_frac * chat_frac * chat_frac; // cubic write
+        let want_game =
+            arctis_audio::set_node_volume_props_argv("10", &[game_vol, game_vol], false).unwrap();
+        let want_chat =
+            arctis_audio::set_node_volume_props_argv("11", &[chat_vol, chat_vol], false).unwrap();
+        let calls = &engine.runner.calls;
+        let props_calls: Vec<&Vec<String>> =
+            calls.iter().filter(|c| c.get(1).map(String::as_str) == Some("s")).collect();
+        assert_eq!(props_calls.len(), 2, "one Props set per side: {calls:?}");
+        assert_eq!(props_calls[0][1..], want_game[..], "game side argv");
+        assert_eq!(props_calls[1][1..], want_chat[..], "chat side argv");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// Slider/dial parity: the GUI slider (set_chatmix) and the hardware dial
+    /// (apply_dial_mix) share the SAME cubic write path — equal percent in,
+    /// byte-identical Props argv out. (The losing-side CURVES differ by design:
+    /// the slider ramps 0→−40 dB; the dial applies firmware percentages verbatim.)
+    #[test]
+    fn slider_and_dial_share_cubic_write_path() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = unique_cfg_tmp("chatmix_parity");
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let ls = ls_all_present();
+        // Slider at position 9 → (game 100 %, chat 22 %).
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let mut slider = Engine::new(runner, make_config_no_eq_no_routes());
+        slider.set_chatmix(9).unwrap();
+
+        // Dial reporting the same percentages (game 100 %, chat 22 %).
+        let runner = arctis_audio::MockRunner::new()
+            .with_output(0, &ls, "")
+            .with_output(0, "", "")
+            .with_output(0, &ls, "")
+            .with_output(0, "", "");
+        let mut dial = Engine::new(runner, make_config_no_eq_no_routes());
+        dial.apply_dial_mix(100, 22).unwrap();
+
+        let props_of = |calls: &[Vec<String>]| -> Vec<Vec<String>> {
+            calls
+                .iter()
+                .filter(|c| c.get(1).map(String::as_str) == Some("s"))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            props_of(&slider.runner.calls),
+            props_of(&dial.runner.calls),
+            "equal pct through slider and dial must produce identical Props argv"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("ASM_CONFIG_HOME");
@@ -8411,6 +8925,7 @@ mod tests {
     ///   recreate_ex: remove source_exists (absent, 1 ls) + spawn_conf (no ls) = 1 ls
     ///   set_output game: remove sink_exists (absent) + create sink_exists (absent → spawn) = 2 ls
     fn queue_apply_surround_both_absent(runner: MockRunner) -> MockRunner {
+        scrub_stale_confs();
         let ls_absent = ls_all_absent();
         runner
             .with_output(0, &ls_absent, "") // recreate_ex: remove source_exists (absent)
@@ -8488,6 +9003,7 @@ mod tests {
         let sinks_dump = include_str!("../../audio/tests/fixtures/pw_dump_sinks.json");
         let runner = queue_apply_surround_both_absent(
             MockRunner::new()
+                .with_output(0, "[]", "") // Auto probe: pw-dump (no streams)
                 .with_output(0, PW_METADATA_SINK, "") // detect: pw-metadata 0 (default sink)
                 .with_output(0, sinks_dump, ""), // detect: pw-dump (real sinks)
         );

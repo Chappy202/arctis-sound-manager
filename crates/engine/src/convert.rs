@@ -3,8 +3,9 @@ use crate::state::StageAvailability;
 use arctis_audio::{
     BandKind, ChainChannels, ChainKind, ChainSpec, ChannelDef, ChannelSetConfig, EqBand, EqModel,
     FilterNode, NodeType, PluginProbe, RouteRule, DEEPFILTER_LABEL_MONO,
-    DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME, RNNOISE_LABEL_MONO,
-    RNNOISE_PLUGIN_BASENAME, SC4M_LABEL, SC4M_PLUGIN_BASENAME,
+    DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME, LIMITER_LABEL,
+    LIMITER_PLUGIN_BASENAME, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME, SC4M_LABEL,
+    SC4M_PLUGIN_BASENAME,
 };
 use arctis_config::{ChannelConfig, EqBandConfig, MicChainConfig, RouteConfig, SuppressionBackend};
 
@@ -168,14 +169,21 @@ pub fn mic_chain_spec(cfg: &MicChainConfig) -> ChainSpec {
 
 /// Build the `FilterNode` list for the mic chain plus stage availability info.
 ///
-/// Walks the fixed stage order: gain → highpass → suppression → compressor → gate → mic-EQ.
-/// LADSPA stages (suppression, compressor) are only included if `probe.ladspa_available(path)`;
-/// otherwise they are skipped and recorded as unavailable.
+/// Walks the fixed stage order: gain → highpass → suppression → gate → compressor →
+/// mic-EQ → limiter. The gate sits BEFORE the compressor so it keys on the true
+/// noise floor — after the compressor it would key on the makeup-gain-raised floor
+/// and never fully close. LADSPA stages (suppression, compressor, limiter) are only
+/// included if `probe.ladspa_available(path)`; otherwise they are skipped and
+/// recorded as unavailable.
 /// Gate uses the builtin noisegate when `builtin_noisegate = true` (PW ≥ 1.6),
 /// otherwise falls back to LADSPA gate_1410.
+/// The limiter is an always-on −1 dBFS output ceiling (hard_limiter_1413), not a
+/// user-toggled stage; it degrades gracefully when the plugin is missing.
 ///
 /// If no enabled+available node results, emits a single passthrough `linear` node so
 /// `render_chain_conf` never sees an empty node list.
+// 0.7071 is the deliberate Butterworth Q literal (matches presets.rs style).
+#[allow(clippy::approx_constant)]
 pub fn mic_chain_nodes(
     cfg: &MicChainConfig,
     probe: &dyn PluginProbe,
@@ -214,7 +222,7 @@ pub fn mic_chain_nodes(
             port_out: "Out".to_string(),
             controls: vec![
                 ("Freq".to_string(), cfg.highpass.freq_hz),
-                ("Q".to_string(), 0.7),
+                ("Q".to_string(), 0.7071),
                 ("Gain".to_string(), 0.0),
             ],
         });
@@ -239,10 +247,16 @@ pub fn mic_chain_nodes(
                 DEEPFILTER_LABEL_MONO,
                 "Audio In",
                 "Audio Out",
-                vec![(
-                    "Attenuation Limit (dB)".to_string(),
-                    cfg.suppression.attenuation_limit_db,
-                )],
+                vec![
+                    (
+                        "Attenuation Limit (dB)".to_string(),
+                        cfg.suppression.attenuation_limit_db,
+                    ),
+                    // Slight spectral post-filter for extra suppression on
+                    // stationary noise (port verified with analyseplugin;
+                    // range 0..=0.05, plugin default 0).
+                    ("Post Filter Beta".to_string(), 0.02),
+                ],
             ),
             SuppressionBackend::Rnnoise => (
                 RNNOISE_PLUGIN_BASENAME,
@@ -290,40 +304,9 @@ pub fn mic_chain_nodes(
         }
     }
 
-    // ── Compressor stage (LADSPA sc4m) ───────────────────────────────────────
-    if cfg.compressor.enabled {
-        if probe.ladspa_available(SC4M_PLUGIN_BASENAME) {
-            nodes.push(FilterNode {
-                name: "mic_compressor".to_string(),
-                node_type: NodeType::Ladspa,
-                label: SC4M_LABEL.to_string(),
-                plugin: Some(SC4M_PLUGIN_BASENAME.to_string()),
-                port_in: "Input".to_string(),
-                port_out: "Output".to_string(),
-                controls: vec![
-                    (
-                        "Threshold level (dB)".to_string(),
-                        cfg.compressor.threshold_db,
-                    ),
-                    ("Ratio (1:n)".to_string(), cfg.compressor.ratio),
-                    ("Makeup gain (dB)".to_string(), cfg.compressor.makeup_db),
-                ],
-            });
-            availability.push(StageAvailability {
-                stage: crate::state::StageName::Compressor,
-                available: true,
-                requested: true,
-            });
-        } else {
-            availability.push(StageAvailability {
-                stage: crate::state::StageName::Compressor,
-                available: false,
-                requested: true,
-            });
-        }
-    }
-
     // ── Gate stage (builtin noisegate ≥1.6 or LADSPA gate_1410 fallback) ─────
+    // BEFORE the compressor so the gate keys on the true noise floor, not the
+    // makeup-gain-raised one.
     if cfg.gate.enabled {
         if builtin_noisegate {
             nodes.push(FilterNode {
@@ -335,7 +318,9 @@ pub fn mic_chain_nodes(
                 port_out: "Out".to_string(),
                 controls: vec![
                     ("Open Threshold".to_string(), cfg.gate.threshold),
-                    ("Close Threshold".to_string(), cfg.gate.threshold * 0.9),
+                    // −6 dB hysteresis (0.5×): 0.9× left only ~1 dB between open
+                    // and close, so the gate chattered around the threshold.
+                    ("Close Threshold".to_string(), cfg.gate.threshold * 0.5),
                     ("Attack (s)".to_string(), 0.005),
                     ("Hold (s)".to_string(), 0.050),
                     ("Release (s)".to_string(), 0.100),
@@ -362,7 +347,9 @@ pub fn mic_chain_nodes(
                     ("Attack (ms)".to_string(), 10.0),
                     ("Hold (ms)".to_string(), 100.0),
                     ("Decay (ms)".to_string(), 200.0),
-                    ("Range (dB)".to_string(), -90.0),
+                    // Duck by 30 dB instead of hard-muting (−90 dB): a closed
+                    // gate that goes fully silent sounds like a dropped call.
+                    ("Range (dB)".to_string(), -30.0),
                     (
                         "Output select (-1 = key listen, 0 = gate, 1 = bypass)".to_string(),
                         0.0,
@@ -377,6 +364,46 @@ pub fn mic_chain_nodes(
         } else {
             availability.push(StageAvailability {
                 stage: crate::state::StageName::Gate,
+                available: false,
+                requested: true,
+            });
+        }
+    }
+
+    // ── Compressor stage (LADSPA sc4m), after the gate ───────────────────────
+    if cfg.compressor.enabled {
+        if probe.ladspa_available(SC4M_PLUGIN_BASENAME) {
+            nodes.push(FilterNode {
+                name: "mic_compressor".to_string(),
+                node_type: NodeType::Ladspa,
+                label: SC4M_LABEL.to_string(),
+                plugin: Some(SC4M_PLUGIN_BASENAME.to_string()),
+                port_in: "Input".to_string(),
+                port_out: "Output".to_string(),
+                // Every voicing-relevant port is emitted explicitly — the LADSPA
+                // hint defaults (attack ~101 ms, release ~401 ms) are far too slow
+                // for speech and must never be relied on.
+                controls: vec![
+                    ("RMS/peak".to_string(), 0.0),
+                    ("Attack time (ms)".to_string(), cfg.compressor.attack_ms),
+                    ("Release time (ms)".to_string(), cfg.compressor.release_ms),
+                    (
+                        "Threshold level (dB)".to_string(),
+                        cfg.compressor.threshold_db,
+                    ),
+                    ("Ratio (1:n)".to_string(), cfg.compressor.ratio),
+                    ("Knee radius (dB)".to_string(), 3.0),
+                    ("Makeup gain (dB)".to_string(), cfg.compressor.makeup_db),
+                ],
+            });
+            availability.push(StageAvailability {
+                stage: crate::state::StageName::Compressor,
+                available: true,
+                requested: true,
+            });
+        } else {
+            availability.push(StageAvailability {
+                stage: crate::state::StageName::Compressor,
                 available: false,
                 requested: true,
             });
@@ -408,6 +435,37 @@ pub fn mic_chain_nodes(
         availability.push(StageAvailability {
             stage: crate::state::StageName::MicEq,
             available: true,
+            requested: true,
+        });
+    }
+
+    // ── Output limiter (always on): −1 dBFS ceiling as the FINAL stage ───────
+    // Protects downstream (Discord/OBS/encoders) from clipping regardless of
+    // gain/makeup settings. Not user-toggled; degrades gracefully when the
+    // plugin is missing (chain builds without it, reported unavailable).
+    if probe.ladspa_available(LIMITER_PLUGIN_BASENAME) {
+        nodes.push(FilterNode {
+            name: "mic_limiter".to_string(),
+            node_type: NodeType::Ladspa,
+            label: LIMITER_LABEL.to_string(),
+            plugin: Some(LIMITER_PLUGIN_BASENAME.to_string()),
+            port_in: "Input".to_string(),
+            port_out: "Output".to_string(),
+            controls: vec![
+                ("dB limit".to_string(), -1.0),
+                ("Wet level".to_string(), 1.0),
+                ("Residue level".to_string(), 0.0),
+            ],
+        });
+        availability.push(StageAvailability {
+            stage: crate::state::StageName::Limiter,
+            available: true,
+            requested: true,
+        });
+    } else {
+        availability.push(StageAvailability {
+            stage: crate::state::StageName::Limiter,
+            available: false,
             requested: true,
         });
     }
@@ -746,7 +804,12 @@ mod tests {
             freqs,
             vec![31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
         );
-        assert!(v.iter().all(|b| b.gain_db == 0.0 && b.q == 1.0));
+        assert!(v.iter().all(|b| b.gain_db == 0.0));
+        // Q derives from the audio default: constant-Q 1.41 peaking mids,
+        // Butterworth 0.707 shelves at the extremes.
+        assert!(v[1..9].iter().all(|b| b.q == arctis_audio::DEFAULT_PEAKING_Q));
+        assert_eq!(v[0].q, arctis_audio::DEFAULT_SHELF_Q);
+        assert_eq!(v[9].q, arctis_audio::DEFAULT_SHELF_Q);
         // Kinds derive from the audio default: shelves at the extremes, peaking middle.
         assert_eq!(v[0].kind, "lowshelf");
         assert_eq!(v[9].kind, "highshelf");
@@ -1005,10 +1068,10 @@ mod tests {
             nodes[0].controls,
             vec![("Mult".to_string(), 1.0), ("Add".to_string(), 0.0)]
         );
-        assert!(
-            availability.is_empty(),
-            "passthrough has no stage availability entries"
-        );
+        // The always-on limiter is still reported (unavailable here: no plugin).
+        assert_eq!(availability.len(), 1, "only the limiter entry is reported");
+        assert_eq!(availability[0].stage, crate::state::StageName::Limiter);
+        assert!(!availability[0].available, "no plugin in MockPluginProbe::none()");
     }
 
     #[test]
@@ -1026,9 +1089,11 @@ mod tests {
             (mult - db_to_linear(6.0)).abs() < 1e-6,
             "Mult must be db_to_linear(6.0)"
         );
-        assert_eq!(availability.len(), 1);
+        // gain + the always-on limiter entry (unavailable with an empty probe).
+        assert_eq!(availability.len(), 2);
         assert!(availability[0].available);
         assert!(availability[0].requested);
+        assert_eq!(availability[1].stage, crate::state::StageName::Limiter);
     }
 
     #[test]
@@ -1089,9 +1154,12 @@ mod tests {
         assert_eq!(n.label, "deep_filter_mono");
         assert_eq!(n.port_in, "Audio In");
         assert_eq!(n.port_out, "Audio Out");
-        assert_eq!(n.controls.len(), 1);
+        assert_eq!(n.controls.len(), 2);
         assert_eq!(n.controls[0].0, "Attenuation Limit (dB)");
         assert!((n.controls[0].1 - 80.0).abs() < 1e-6);
+        // Spectral post-filter, port verified with analyseplugin (0..=0.05).
+        assert_eq!(n.controls[1].0, "Post Filter Beta");
+        assert!((n.controls[1].1 - 0.02).abs() < 1e-6);
         let s = avail
             .iter()
             .find(|a| a.stage == crate::state::StageName::Suppression)
@@ -1217,6 +1285,127 @@ mod tests {
         assert_eq!(spec.capture_node_name, "arctis_clean_mic.capture");
         assert_eq!(spec.capture_target, Some("alsa_input.hw_mic".to_string()));
         assert_eq!(spec.playback_node_name, "arctis_clean_mic");
+    }
+
+    // ── Batch C mic-chain voicing tests ───────────────────────────────────────
+
+    /// The gate must sit BEFORE the compressor (keying on the true noise floor)
+    /// and the always-on limiter must close the chain.
+    #[test]
+    fn mic_chain_order_is_gate_compressor_eq_limiter() {
+        use arctis_audio::{GATE_PLUGIN_BASENAME, LIMITER_PLUGIN_BASENAME, SC4M_PLUGIN_BASENAME};
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.gain.enabled = true;
+        cfg.highpass.enabled = true;
+        cfg.gate.enabled = true;
+        cfg.compressor.enabled = true;
+        cfg.eq_enabled = true;
+        cfg.eq = vec![EqBandConfig { kind: "peaking".into(), freq_hz: 1000.0, q: 1.0, gain_db: 2.0 }];
+        let probe = MockPluginProbe::with([
+            GATE_PLUGIN_BASENAME,
+            SC4M_PLUGIN_BASENAME,
+            LIMITER_PLUGIN_BASENAME,
+        ]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["mic_gain", "mic_highpass", "mic_gate", "mic_compressor", "mic_eq_band_0", "mic_limiter"],
+            "chain order must be gain → highpass → GATE → COMPRESSOR → EQ → LIMITER"
+        );
+    }
+
+    /// sc4m: attack/release/knee/RMS are emitted explicitly — never left to the
+    /// LADSPA hint defaults (~101/401 ms, far too slow for speech).
+    #[test]
+    fn mic_compressor_emits_explicit_attack_release_knee_rms() {
+        use arctis_audio::SC4M_PLUGIN_BASENAME;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.compressor.enabled = true;
+        let probe = MockPluginProbe::with([SC4M_PLUGIN_BASENAME]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        let comp = nodes.iter().find(|n| n.name == "mic_compressor").expect("compressor present");
+        let ctl = |name: &str| {
+            comp.controls.iter().find(|(k, _)| k == name).unwrap_or_else(|| panic!("{name} emitted")).1
+        };
+        assert!((ctl("RMS/peak") - 0.0).abs() < 1e-6);
+        assert!((ctl("Attack time (ms)") - 10.0).abs() < 1e-6, "config default 10 ms");
+        assert!((ctl("Release time (ms)") - 150.0).abs() < 1e-6, "config default 150 ms");
+        assert!((ctl("Knee radius (dB)") - 3.0).abs() < 1e-6);
+    }
+
+    /// Configured attack/release flow through to the sc4m controls.
+    #[test]
+    fn mic_compressor_attack_release_come_from_config() {
+        use arctis_audio::SC4M_PLUGIN_BASENAME;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.compressor.enabled = true;
+        cfg.compressor.attack_ms = 25.0;
+        cfg.compressor.release_ms = 300.0;
+        let probe = MockPluginProbe::with([SC4M_PLUGIN_BASENAME]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        let comp = nodes.iter().find(|n| n.name == "mic_compressor").unwrap();
+        assert!(comp.controls.iter().any(|(k, v)| k == "Attack time (ms)" && (*v - 25.0).abs() < 1e-6));
+        assert!(comp.controls.iter().any(|(k, v)| k == "Release time (ms)" && (*v - 300.0).abs() < 1e-6));
+    }
+
+    /// Builtin gate: −6 dB hysteresis (close = 0.5 × open, not 0.9 ×).
+    #[test]
+    fn mic_builtin_gate_close_threshold_is_half_open() {
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.gate.enabled = true;
+        cfg.gate.threshold = 0.004;
+        let probe = MockPluginProbe::none();
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        let gate = nodes.iter().find(|n| n.name == "mic_gate").expect("gate present");
+        let close = gate.controls.iter().find(|(k, _)| k == "Close Threshold").unwrap().1;
+        assert!((close - 0.002).abs() < 1e-7, "close must be 0.5 × open, got {close}");
+    }
+
+    /// LADSPA gate: Range −30 dB (duck, don't hard-mute at −90 dB).
+    #[test]
+    fn mic_ladspa_gate_range_is_minus_30() {
+        use arctis_audio::GATE_PLUGIN_BASENAME;
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.gate.enabled = true;
+        let probe = MockPluginProbe::with([GATE_PLUGIN_BASENAME]);
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, false);
+        let gate = nodes.iter().find(|n| n.name == "mic_gate").unwrap();
+        let range = gate.controls.iter().find(|(k, _)| k == "Range (dB)").unwrap().1;
+        assert!((range - (-30.0)).abs() < 1e-6, "Range must be -30 dB, got {range}");
+    }
+
+    /// Limiter: −1 dBFS ceiling, fully wet, appended even for a passthrough chain.
+    #[test]
+    fn mic_limiter_appended_when_available_with_minus_1_ceiling() {
+        use arctis_audio::{LIMITER_LABEL, LIMITER_PLUGIN_BASENAME};
+        let cfg = MicChainConfig::passthrough();
+        let probe = MockPluginProbe::with([LIMITER_PLUGIN_BASENAME]);
+        let (nodes, avail) = mic_chain_nodes(&cfg, &probe, true);
+        let lim = nodes.last().expect("chain not empty");
+        assert_eq!(lim.name, "mic_limiter", "limiter must be the FINAL node");
+        assert_eq!(lim.label, LIMITER_LABEL);
+        assert_eq!(lim.plugin.as_deref(), Some(LIMITER_PLUGIN_BASENAME));
+        assert_eq!(lim.port_in, "Input");
+        assert_eq!(lim.port_out, "Output");
+        assert!(lim.controls.iter().any(|(k, v)| k == "dB limit" && (*v - (-1.0)).abs() < 1e-6));
+        assert!(lim.controls.iter().any(|(k, v)| k == "Wet level" && (*v - 1.0).abs() < 1e-6));
+        assert!(lim.controls.iter().any(|(k, v)| k == "Residue level" && v.abs() < 1e-6));
+        let l = avail.iter().find(|a| a.stage == crate::state::StageName::Limiter).unwrap();
+        assert!(l.available && l.requested);
+    }
+
+    /// Highpass emits Q = 0.7071 (Butterworth).
+    #[test]
+    #[allow(clippy::approx_constant)]
+    fn mic_highpass_q_is_butterworth() {
+        let mut cfg = MicChainConfig::passthrough();
+        cfg.highpass.enabled = true;
+        let probe = MockPluginProbe::none();
+        let (nodes, _) = mic_chain_nodes(&cfg, &probe, true);
+        let hp = nodes.iter().find(|n| n.name == "mic_highpass").unwrap();
+        let q = hp.controls.iter().find(|(k, _)| k == "Q").unwrap().1;
+        assert!((q - 0.7071).abs() < 1e-6, "highpass Q must be 0.7071, got {q}");
     }
 
     // ── resolve_hrir_path 48 kHz preference tests ─────────────────────────────

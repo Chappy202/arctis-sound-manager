@@ -22,14 +22,15 @@ pub use config::{
     ChainSpec, FilterNode, NodeType, SinkSpec,
 };
 pub use eq::{
-    BandKind, EqBand, EqModel, FREQ_MAX_HZ, FREQ_MIN_HZ, GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS,
-    Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
+    BandKind, EqBand, EqModel, DEFAULT_PEAKING_Q, DEFAULT_SHELF_Q, FREQ_MAX_HZ, FREQ_MIN_HZ,
+    GAIN_MAX_DB, GAIN_MIN_DB, MAX_BANDS, Q_MAX, Q_MIN, SAMPLE_RATE_HZ,
 };
 pub use error::AudioError;
 pub use mic::{
     resolve_ladspa, FsPluginProbe, MicBackend, MockPluginProbe, PluginProbe, StageKind,
     DEEPFILTER_LABEL_MONO, DEEPFILTER_PLUGIN_BASENAME, GATE_LABEL, GATE_PLUGIN_BASENAME,
-    RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME, SC4M_LABEL, SC4M_PLUGIN_BASENAME,
+    LIMITER_LABEL, LIMITER_PLUGIN_BASENAME, RNNOISE_LABEL_MONO, RNNOISE_PLUGIN_BASENAME,
+    SC4M_LABEL, SC4M_PLUGIN_BASENAME,
 };
 pub use props::{
     band_props_json, control_props_json, node_volume_props_json, set_band_props_argv,
@@ -37,8 +38,9 @@ pub use props::{
 };
 pub use pw_version::{parse_pw_version, query_pw_version, supports_builtin_noisegate};
 pub use routing::{
-    clear_stream_target_argv, move_stream_argv, node_rules_fragment, parse_stream_id,
-    wireplumber_fragment_path, AppMatch, RouteRule, Router,
+    clear_stream_target_argv, client_fragment_path, move_stream_argv, parse_stream_id,
+    parse_stream_ids, pulse_fragment_path, pulse_rules_fragment, stream_rules_fragment, AppMatch,
+    RouteRule, Router,
 };
 pub use runner::{ChildToken, CmdOutput, CommandRunner, MockRunner, RealRunner};
 pub use sinks::{parse_default_sink_name, parse_node_volume, parse_output_sinks, OutputSink};

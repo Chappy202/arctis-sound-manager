@@ -76,3 +76,18 @@ The codebase uses a deliberately dense/compact style. `cargo fmt --check` would 
 (191 hunks at minimum), and no stable `rustfmt.toml` preserves the style (every config tested increased
 churn). The CI `cargo fmt --all -- --check` step is therefore `continue-on-error: true` — it still runs
 for visibility but does not gate merges. Run `cargo fmt` deliberately if/when adopting rustfmt wholesale.
+
+## KI-6 — WirePlumber restore-stream can undo a cleared route on the app's next launch (OPEN, upstream limitation)
+
+WirePlumber's restore-stream module (setting `node.stream.restore-target`, default **true**) remembers
+every manual `target.object` move in `~/.local/state/wireplumber/restore-stream`, keyed per app. When a
+route is cleared, ASM removes its own persisted rule everywhere (profile, `routes.json`, conf
+fragments) and deletes the live metadata key — but WirePlumber's stored state survives, so the app's
+NEXT stream can be placed straight back on the old Arctis sink. There is **no supported way to clear a
+single app's stored target at runtime**: the state file is only read at WirePlumber startup and is
+rewritten by the running daemon, so editing it requires stopping WirePlumber (a service restart ASM
+refuses to do — G3). The GUI/CLI clear-route responses therefore carry a note: move the app once to the
+desired sink to re-teach the stored target. To disable the behaviour globally (all apps, at your own
+preference): `wpctl settings node.stream.restore-target false` (runtime), or persist
+`wireplumber.settings = { node.stream.restore-target = false }` in
+`~/.config/wireplumber/wireplumber.conf.d/`.

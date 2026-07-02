@@ -10,6 +10,8 @@ use crate::error::AudioError;
 /// Excludes virtual sinks (e.g., `Arctis_Game`) and filter-chain infrastructure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputSink {
+    /// PipeWire object id (ephemeral, but valid for immediate `wpctl <id>` use).
+    pub id: u32,
     pub node_name: String,
     pub description: String,
     pub is_default: bool,
@@ -21,6 +23,11 @@ pub struct OutputSink {
 /// `update: id:0 key:'default.audio.sink' value:'{"name":"..."}' type:...`
 /// and returns the inner `name` string.  Returns `None` if the key is absent,
 /// the line is malformed, or the embedded JSON cannot be parsed.
+///
+/// NOTE: the default sink is also present in `pw-dump` JSON (Metadata object),
+/// but the engine's discovery seam is a two-step `pw-metadata 0` + `pw-dump`
+/// sequence that many exact-argv tests and the volume-read TTL cache assume;
+/// folding this into the pw-dump parse is deliberately deferred.
 pub fn parse_default_sink_name(pw_metadata_stdout: &str) -> Option<String> {
     for line in pw_metadata_stdout.lines() {
         if !line.contains("key:'default.audio.sink'") {
@@ -69,6 +76,13 @@ pub fn parse_output_sinks(
             continue;
         }
 
+        // Object id — needed for `wpctl set-volume/set-mute <id>` (wpctl does
+        // not accept node names). Nodes without an id are unusable; skip them.
+        let id = match obj.get("id").and_then(|v| v.as_u64()) {
+            Some(i) => i as u32,
+            None => continue,
+        };
+
         let props = match obj.get("info").and_then(|i| i.get("props")) {
             Some(p) => p,
             None => continue,
@@ -110,6 +124,7 @@ pub fn parse_output_sinks(
         let is_default = default_sink_name.map(|d| d == node_name).unwrap_or(false);
 
         sinks.push(OutputSink {
+            id,
             node_name: node_name.to_string(),
             description,
             is_default,
@@ -211,6 +226,15 @@ mod tests {
                 .unwrap()
                 .is_default,
             "onboard analog-stereo should be marked default"
+        );
+        // Object ids are surfaced (needed for wpctl targeting).
+        assert_eq!(
+            s.iter()
+                .find(|x| x.node_name.contains("SteelSeries_Arctis"))
+                .unwrap()
+                .id,
+            10,
+            "headset sink id must come from the pw-dump object id"
         );
     }
 

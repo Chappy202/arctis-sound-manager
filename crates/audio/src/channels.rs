@@ -236,6 +236,9 @@ id 12\n    node.name = \"Arctis_Media\"\n";
 
     #[test]
     fn set_output_updates_def_and_rebuilds_channel() {
+        // Scrub any stale conf so the diff-before-recreate guard cannot skip
+        // the scripted teardown+respawn.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("arctis_eq.Arctis_Media.conf"));
         // remove() path (sink present) then create() path (absent), as in recreate.
         let present_media = "id 12\n    node.name = \"Arctis_Media\"\n";
         let runner = MockRunner::new()

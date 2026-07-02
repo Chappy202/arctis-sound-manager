@@ -80,6 +80,29 @@ pub fn db_to_volume_pct(db: f32) -> u8 {
     pct.clamp(VOLUME_PCT_MIN as f32, VOLUME_PCT_MAX as f32) as u8
 }
 
+/// Convert a target dB value to a 0–100 percent value on the CUBIC (perceptual)
+/// volume scale used by wpctl/WirePlumber (module-mixer-api): a percent `p`
+/// written through the cubic path applies a raw linear gain of `(p/100)^3`
+/// (= `10^(3·20·log10(p/100) / 20)` dB), so realising a target of `db` needs
+/// `pct = 100 × 10^(db/60)`.
+///
+/// Use this for any percent that is APPLIED through the cubic write path
+/// (`apply_volume_mute_pct`, `wpctl set-volume`). Use [`db_to_volume_pct`]
+/// only where the percent is interpreted as a raw linear amplitude. Feeding a
+/// cubic consumer with the linear conversion triples the intended dB.
+///
+/// Formula: `clamp(round(100 × 10^(db/60)), 0, 100)`.
+///
+/// Representative mappings:
+/// - 0 dB → 100 %
+/// - −6 dB → ~79 % (79.43)
+/// - −40 dB → ~22 % (21.54)
+/// - −60 dB → 10 %
+pub fn db_to_volume_pct_cubic(db: f32) -> u8 {
+    let pct = (100.0_f32 * 10f32.powf(db / 60.0)).round();
+    pct.clamp(VOLUME_PCT_MIN as f32, VOLUME_PCT_MAX as f32) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +128,51 @@ mod tests {
     fn db_to_volume_pct_plus_6_db_clamps_to_100() {
         // 10^(6/20) ≈ 1.9953; 100 × 1.9953 ≈ 199.53; clamp → 100
         assert_eq!(db_to_volume_pct(6.0), 100);
+    }
+
+    // ── db_to_volume_pct_cubic ────────────────────────────────────────────────
+
+    #[test]
+    fn db_to_volume_pct_cubic_zero_db_is_100() {
+        assert_eq!(db_to_volume_pct_cubic(0.0), 100);
+    }
+
+    #[test]
+    fn db_to_volume_pct_cubic_minus_6_db_is_79() {
+        // 10^(−6/60) ≈ 0.7943; 100 × 0.7943 ≈ 79.43; round = 79.
+        // ((79/100)^3 in dB = 60·log10(0.79) ≈ −6.1 dB — the intended −6, not −18.)
+        assert_eq!(db_to_volume_pct_cubic(-6.0), 79);
+    }
+
+    #[test]
+    fn db_to_volume_pct_cubic_minus_40_db_is_22() {
+        // 10^(−40/60) ≈ 0.2154; round(21.54) = 22 (full ChatMix attenuation).
+        assert_eq!(db_to_volume_pct_cubic(-40.0), 22);
+    }
+
+    #[test]
+    fn db_to_volume_pct_cubic_minus_60_db_is_10() {
+        // 10^(−60/60) = 0.1 → 10 %.
+        assert_eq!(db_to_volume_pct_cubic(-60.0), 10);
+    }
+
+    #[test]
+    fn db_to_volume_pct_cubic_positive_db_clamps_to_100() {
+        assert_eq!(db_to_volume_pct_cubic(6.0), 100);
+    }
+
+    /// The whole point of the cubic variant: pushing its percent through the
+    /// cubic write path ((pct/100)^3) recovers ≈ the intended dB, whereas the
+    /// linear variant's percent lands at ≈ 3× the intended attenuation.
+    #[test]
+    fn db_to_volume_pct_cubic_round_trips_through_cubic_write() {
+        for db in [-3.0f32, -6.0, -12.0, -20.0, -40.0] {
+            let frac = db_to_volume_pct_cubic(db) as f32 / 100.0;
+            let applied_db = 20.0 * (frac * frac * frac).log10();
+            assert!(
+                (applied_db - db).abs() < 0.6,
+                "target {db} dB applied as {applied_db} dB"
+            );
+        }
     }
 }

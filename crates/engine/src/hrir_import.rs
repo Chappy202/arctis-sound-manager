@@ -8,6 +8,9 @@ use std::path::Path;
 pub struct WavInfo {
     pub channels: u16,
     pub sample_rate: u32,
+    /// Sample frames per channel in the data chunk (data bytes / block align).
+    /// 0 when the data chunk is empty or missing.
+    pub frames: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +18,11 @@ pub enum ImportVerdict {
     Ready,
     NeedsResample,
     RejectChannels(u16),
+    /// Empty (or missing) data chunk — nothing to convolve with.
+    RejectEmpty,
+    /// Longer than ~1 s per channel (48 000 frames): HRIRs are short impulse
+    /// responses; anything longer is almost certainly not an HRIR.
+    RejectTooLong(u64),
 }
 
 pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
@@ -27,6 +35,8 @@ pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
         )));
     }
     let mut i = 12;
+    let mut fmt: Option<(u16, u32, u16)> = None; // (channels, rate, block_align)
+    let mut data_bytes: u64 = 0;
     while i + 8 <= bytes.len() {
         let id = &bytes[i..i + 4];
         let sz =
@@ -35,17 +45,143 @@ pub fn read_wav_info(path: &Path) -> Result<WavInfo, EngineError> {
             let channels = u16::from_le_bytes([bytes[i + 10], bytes[i + 11]]);
             let sample_rate =
                 u32::from_le_bytes([bytes[i + 12], bytes[i + 13], bytes[i + 14], bytes[i + 15]]);
-            return Ok(WavInfo {
-                channels,
-                sample_rate,
-            });
+            let block_align = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]);
+            fmt = Some((channels, sample_rate, block_align));
+        }
+        if id == b"data" {
+            // Cap at what the file actually contains (truncated files).
+            data_bytes = sz.min(bytes.len().saturating_sub(i + 8)) as u64;
         }
         i += 8 + sz + (sz & 1); // chunks are word-aligned
     }
-    Err(EngineError::BadRequest(format!(
-        "no fmt chunk in {}",
-        path.display()
-    )))
+    match fmt {
+        Some((channels, sample_rate, block_align)) => {
+            let frames = if block_align > 0 { data_bytes / block_align as u64 } else { 0 };
+            Ok(WavInfo {
+                channels,
+                sample_rate,
+                frames,
+            })
+        }
+        None => Err(EngineError::BadRequest(format!(
+            "no fmt chunk in {}",
+            path.display()
+        ))),
+    }
+}
+
+// ─── HRIR insertion-gain measurement ─────────────────────────────────────────
+
+/// Target peak for the direct-path (FL_L / FR_R) impulse response after the
+/// convolver `gain` option is applied. Normalizing every HRIR's direct-path
+/// peak to this common level removes the per-HRIR insertion gain, so switching
+/// HRIRs (or A/B-ing HRIR vs bypass) compares TONE, not loudness.
+pub const HRIR_DIRECT_TARGET_PEAK: f32 = 1.0;
+
+/// Cap the normalization correction at ±12 dB (0.25×..=4×): a wildly quiet or
+/// hot file is more likely mis-mastered than in need of that much correction.
+const HRIR_GAIN_MIN: f32 = 0.25;
+const HRIR_GAIN_MAX: f32 = 4.0;
+
+/// Measure the peak |sample| of the direct-path channels of a HeSuVi 14-channel
+/// HRIR WAV: channel 0 (FL→left ear) and channel 7 (FR→right ear) — the same
+/// channels the renderer wires as `convFL_L` / `convFR_R`. Supports 16-bit PCM
+/// (format 1) and 32-bit float (format 3).
+pub fn measure_direct_peak(path: &Path) -> Result<f32, EngineError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| EngineError::BadRequest(format!("cannot read {}: {e}", path.display())))?;
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(EngineError::BadRequest(format!(
+            "not a RIFF/WAVE file: {}",
+            path.display()
+        )));
+    }
+    /// (format code, channels, bits per sample) from the fmt chunk.
+    type FmtInfo = (u16, u16, u16);
+    let mut fmt: Option<FmtInfo> = None;
+    let mut data: Option<(usize, usize)> = None;
+    let mut i = 12;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let sz =
+            u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
+        if id == b"fmt " && sz >= 16 && i + 8 + sz <= bytes.len() {
+            let format = u16::from_le_bytes([bytes[i + 8], bytes[i + 9]]);
+            let channels = u16::from_le_bytes([bytes[i + 10], bytes[i + 11]]);
+            let bits = u16::from_le_bytes([bytes[i + 22], bytes[i + 23]]);
+            fmt = Some((format, channels, bits));
+        }
+        if id == b"data" {
+            let end = (i + 8 + sz).min(bytes.len());
+            data = Some((i + 8, end));
+        }
+        i += 8 + sz + (sz & 1); // chunks are word-aligned
+    }
+    let (format, channels, bits) = fmt
+        .ok_or_else(|| EngineError::BadRequest(format!("no fmt chunk in {}", path.display())))?;
+    let (start, end) = data
+        .ok_or_else(|| EngineError::BadRequest(format!("no data chunk in {}", path.display())))?;
+    if channels < 8 {
+        return Err(EngineError::BadRequest(format!(
+            "{}-channel WAV has no channel 7 (FR_R direct path)",
+            channels
+        )));
+    }
+    let ch = channels as usize;
+    let mut peak = 0.0f32;
+    match (format, bits) {
+        (1, 16) => {
+            let frame = ch * 2;
+            let mut p = start;
+            while p + frame <= end {
+                for &c in &[0usize, 7usize] {
+                    let o = p + c * 2;
+                    let v = i16::from_le_bytes([bytes[o], bytes[o + 1]]) as f32 / 32768.0;
+                    peak = peak.max(v.abs());
+                }
+                p += frame;
+            }
+        }
+        (3, 32) => {
+            let frame = ch * 4;
+            let mut p = start;
+            while p + frame <= end {
+                for &c in &[0usize, 7usize] {
+                    let o = p + c * 4;
+                    let v = f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+                    peak = peak.max(v.abs());
+                }
+                p += frame;
+            }
+        }
+        (f, b) => {
+            return Err(EngineError::BadRequest(format!(
+                "unsupported WAV sample format {f}/{b}-bit in {}",
+                path.display()
+            )))
+        }
+    }
+    Ok(peak)
+}
+
+/// Best-effort normalization gain for the convolver `gain` config option:
+/// `HRIR_DIRECT_TARGET_PEAK / direct-path peak`, clamped to ±12 dB. `None`
+/// when the file cannot be measured (unreadable, silent, exotic format) — the
+/// convolver then runs at unity, exactly the pre-normalization behaviour.
+pub fn normalization_gain(path: &Path) -> Option<f32> {
+    match measure_direct_peak(path) {
+        Ok(peak) if peak > 0.0 && peak.is_finite() => {
+            Some((HRIR_DIRECT_TARGET_PEAK / peak).clamp(HRIR_GAIN_MIN, HRIR_GAIN_MAX))
+        }
+        Ok(_) => None, // silent direct path — leave at unity
+        Err(e) => {
+            eprintln!(
+                "asm: warning — cannot measure HRIR insertion gain for {} ({e}); using unity",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 // ─── Bundled HRIR install ─────────────────────────────────────────────────────
@@ -88,11 +224,24 @@ pub struct ImportReport {
     pub skipped: Vec<(String, String)>,
 }
 
+/// Longest plausible HRIR: 1 s per channel at 48 kHz. Real HeSuVi impulse
+/// responses run 10–250 ms; a multi-second file is music, not an HRIR.
+pub const HRIR_MAX_FRAMES: u64 = 48_000;
+
 pub fn is_importable(info: &WavInfo) -> ImportVerdict {
-    match (info.channels, info.sample_rate) {
-        (14, 48000) => ImportVerdict::Ready,
-        (14, _) => ImportVerdict::NeedsResample,
-        (c, _) => ImportVerdict::RejectChannels(c),
+    if info.channels != 14 {
+        return ImportVerdict::RejectChannels(info.channels);
+    }
+    if info.frames == 0 {
+        return ImportVerdict::RejectEmpty;
+    }
+    if info.frames > HRIR_MAX_FRAMES {
+        return ImportVerdict::RejectTooLong(info.frames);
+    }
+    if info.sample_rate == 48_000 {
+        ImportVerdict::Ready
+    } else {
+        ImportVerdict::NeedsResample
     }
 }
 
@@ -100,9 +249,9 @@ pub fn is_importable(info: &WavInfo) -> ImportVerdict {
 /// 44.1 kHz files via ffmpeg. Returns an `ImportReport` on success; hard failures
 /// (can't create profiles dir, can't read src dir) return `Err`.
 ///
-/// Per-file problems (wrong channels, unreadable file, ffmpeg failure) are recorded
-/// as `skipped` entries — they are never returned as `Err`. Idempotent: re-importing
-/// the same stem overwrites the previous copy.
+/// Per-file problems (wrong channels, empty/over-long data, unreadable file,
+/// ffmpeg failure) are recorded as `skipped` entries — they are never returned
+/// as `Err`. Idempotent: re-importing the same stem overwrites the previous copy.
 pub fn import_dir<R: arctis_audio::CommandRunner>(
     runner: &mut R,
     src: &Path,
@@ -158,7 +307,22 @@ pub fn import_dir<R: arctis_audio::CommandRunner>(
                         continue;
                     }
                 };
-                let out = runner.run("ffmpeg", &["-y", "-i", &src_str, "-ar", "48000", &dst_str]);
+                // -c:a pcm_f32le keeps float32 HRIRs lossless (the bare default
+                // truncated them to 16-bit); prefer the soxr resampler for
+                // quality, falling back to ffmpeg's default when this build
+                // lacks soxr support.
+                let soxr_args = [
+                    "-y", "-i", &src_str, "-ar", "48000",
+                    "-af", "aresample=resampler=soxr",
+                    "-c:a", "pcm_f32le", &dst_str,
+                ];
+                let plain_args =
+                    ["-y", "-i", &src_str, "-ar", "48000", "-c:a", "pcm_f32le", &dst_str];
+                let out = match runner.run("ffmpeg", &soxr_args) {
+                    Ok(o) if o.status == 0 => Ok(o),
+                    // soxr unavailable (or any failure) → retry without it.
+                    Ok(_) | Err(_) => runner.run("ffmpeg", &plain_args),
+                };
                 match out {
                     Ok(o) if o.status == 0 => report.imported.push(stem),
                     Ok(o) => report.skipped.push((
@@ -175,6 +339,19 @@ pub fn import_dir<R: arctis_audio::CommandRunner>(
                     .skipped
                     .push((stem, format!("{c}-channel WAV is not HeSuVi 14-channel")));
             }
+            ImportVerdict::RejectEmpty => {
+                report
+                    .skipped
+                    .push((stem, "empty data chunk (no impulse response samples)".into()));
+            }
+            ImportVerdict::RejectTooLong(frames) => {
+                report.skipped.push((
+                    stem,
+                    format!(
+                        "{frames} frames per channel exceeds the ~1 s HRIR limit ({HRIR_MAX_FRAMES}) — not an impulse response"
+                    ),
+                ));
+            }
         }
     }
 
@@ -187,10 +364,11 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn write_wav(path: &Path, channels: u16, rate: u32) {
-        // Minimal canonical 16-bit PCM WAV header + zero data frames.
+        // Minimal canonical 16-bit PCM WAV header + 4 silent data frames
+        // (a zero-length data chunk is now rejected by is_importable).
         let byte_rate = rate * channels as u32 * 2;
         let block_align = channels * 2;
-        let data_len: u32 = 0;
+        let data_len: u32 = 4 * block_align as u32;
         let mut b = Vec::new();
         b.extend_from_slice(b"RIFF");
         b.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -205,7 +383,76 @@ pub(crate) mod tests {
         b.extend_from_slice(&16u16.to_le_bytes());
         b.extend_from_slice(b"data");
         b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, data_len as usize));
         std::fs::write(path, b).unwrap();
+    }
+
+    /// PCM16 WAV with explicit interleaved frames (each frame = `channels` samples).
+    pub(crate) fn write_wav_pcm16_frames(path: &Path, channels: u16, rate: u32, frames: &[Vec<i16>]) {
+        let data_len = (frames.len() * channels as usize * 2) as u32;
+        let byte_rate = rate * channels as u32 * 2;
+        let block_align = channels * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&channels.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&byte_rate.to_le_bytes());
+        b.extend_from_slice(&block_align.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        for f in frames {
+            assert_eq!(f.len(), channels as usize);
+            for s in f {
+                b.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn measures_direct_path_peak_on_channels_0_and_7() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("m.wav");
+        // Frame 0: ch0 = 0.5 FS (direct L); frame 1: ch7 = 0.25 FS (direct R);
+        // ch3 carries a HUGE value that must NOT count (not a direct channel).
+        let mut f0 = vec![0i16; 14];
+        f0[0] = 16384; // 0.5
+        f0[3] = 32000; // ignored
+        let mut f1 = vec![0i16; 14];
+        f1[7] = 8192; // 0.25
+        write_wav_pcm16_frames(&p, 14, 48_000, &[f0, f1]);
+        let peak = measure_direct_peak(&p).unwrap();
+        assert!((peak - 0.5).abs() < 1e-3, "direct peak must be 0.5, got {peak}");
+    }
+
+    #[test]
+    fn normalization_gain_hits_target_and_clamps() {
+        let d = tempfile::tempdir().unwrap();
+        // peak 0.5 → gain 2.0 (10^(6/20) toward the 1.0 target)
+        let p = d.path().join("half.wav");
+        let mut f = vec![0i16; 14];
+        f[0] = 16384;
+        write_wav_pcm16_frames(&p, 14, 48_000, &[f]);
+        let g = normalization_gain(&p).unwrap();
+        assert!((g - 2.0).abs() < 1e-3, "0.5 peak → 2.0 gain, got {g}");
+
+        // Tiny peak → clamped at +12 dB (4.0), not a huge boost.
+        let p2 = d.path().join("tiny.wav");
+        let mut f2 = vec![0i16; 14];
+        f2[7] = 300; // ~0.009 FS
+        write_wav_pcm16_frames(&p2, 14, 48_000, &[f2]);
+        assert_eq!(normalization_gain(&p2), Some(4.0), "gain must clamp at 4.0");
+
+        // Silent / empty data → None (unity).
+        let p3 = d.path().join("silent.wav");
+        write_wav(&p3, 14, 48_000);
+        assert_eq!(normalization_gain(&p3), None, "unmeasurable → None (unity)");
     }
 
     #[test]
@@ -266,6 +513,75 @@ pub(crate) mod tests {
         assert!(report.imported.contains(&"04-gsx".to_string()));
         assert!(base.join("profiles/04-gsx.wav").exists());
         assert!(report.skipped.iter().any(|(s, _)| s == "none"));
+    }
+
+    #[test]
+    fn import_resamples_with_soxr_float32_argv() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let base = d.path().join("base");
+        write_wav(&src.join("00-a.wav"), 14, 44_100); // NeedsResample
+        let mut runner = arctis_audio::MockRunner::new(); // status 0 → soxr attempt succeeds
+        let report = import_dir(&mut runner, &src, &base).unwrap();
+        assert!(report.imported.contains(&"00-a".to_string()));
+        assert_eq!(runner.calls.len(), 1, "soxr attempt succeeded → no fallback call");
+        let call = &runner.calls[0];
+        assert_eq!(call[0], "ffmpeg");
+        let joined = call.join(" ");
+        assert!(joined.contains("-ar 48000"), "must resample to 48 kHz: {joined}");
+        assert!(
+            joined.contains("-af aresample=resampler=soxr"),
+            "must prefer the soxr resampler: {joined}"
+        );
+        assert!(
+            joined.contains("-c:a pcm_f32le"),
+            "must keep float32 (no 16-bit truncation): {joined}"
+        );
+    }
+
+    #[test]
+    fn import_resample_falls_back_without_soxr() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let base = d.path().join("base");
+        write_wav(&src.join("00-a.wav"), 14, 44_100);
+        // First (soxr) call fails → retry without -af must run and succeed.
+        let mut runner = arctis_audio::MockRunner::new().with_output(1, "", "Unknown resampler");
+        let report = import_dir(&mut runner, &src, &base).unwrap();
+        assert!(report.imported.contains(&"00-a".to_string()), "fallback path must import");
+        assert_eq!(runner.calls.len(), 2, "failed soxr attempt then plain retry");
+        let retry = runner.calls[1].join(" ");
+        assert!(!retry.contains("soxr"), "retry must drop the soxr filter: {retry}");
+        assert!(retry.contains("-c:a pcm_f32le"), "retry keeps float32: {retry}");
+    }
+
+    #[test]
+    fn is_importable_rejects_empty_and_over_long_files() {
+        let d = tempfile::tempdir().unwrap();
+        // Empty data chunk → RejectEmpty.
+        let empty = WavInfo { channels: 14, sample_rate: 48_000, frames: 0 };
+        assert!(matches!(is_importable(&empty), ImportVerdict::RejectEmpty));
+        // > 1 s per channel → RejectTooLong (music mislabeled as an HRIR).
+        let long = WavInfo { channels: 14, sample_rate: 48_000, frames: 480_000 };
+        assert!(matches!(is_importable(&long), ImportVerdict::RejectTooLong(480_000)));
+        // Boundary: exactly 1 s is still importable.
+        let max = WavInfo { channels: 14, sample_rate: 48_000, frames: HRIR_MAX_FRAMES };
+        assert!(matches!(is_importable(&max), ImportVerdict::Ready));
+        // And via import_dir: an on-disk empty-data 14ch/48k wav is skipped.
+        let src = d.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let p = src.join("empty.wav");
+        write_wav_pcm16_frames(&p, 14, 48_000, &[]);
+        let mut runner = arctis_audio::MockRunner::new();
+        let report = import_dir(&mut runner, &src, &d.path().join("base")).unwrap();
+        assert!(report.imported.is_empty());
+        assert!(
+            report.skipped.iter().any(|(s, why)| s == "empty" && why.contains("empty data")),
+            "empty-data file must be skipped with a reason: {:?}",
+            report.skipped
+        );
     }
 
     #[test]

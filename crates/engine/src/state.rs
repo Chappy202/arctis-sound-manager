@@ -74,6 +74,9 @@ pub enum StageName {
     Compressor,
     Gate,
     MicEq,
+    /// Always-on output limiter (hard_limiter_1413, −1 dBFS ceiling). Not a
+    /// user-toggled stage — reported so a missing plugin is still visible.
+    Limiter,
 }
 
 impl From<StageKind> for StageName {
@@ -169,6 +172,9 @@ pub struct SurroundSnapshot {
     /// Convolver partition size, if pinned by the profile.
     #[serde(default)]
     pub blocksize: Option<u32>,
+    /// Pinned convolver tailsize (samples), or None (PipeWire default).
+    #[serde(default)]
+    pub tailsize: Option<u32>,
 }
 
 /// Lightweight summary of one EQ preset for the state snapshot.

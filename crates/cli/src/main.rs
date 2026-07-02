@@ -577,6 +577,7 @@ fn stage_canonical(kind: &arctis_engine::StageName) -> &'static str {
         StageName::Compressor => "compressor",
         StageName::Gate => "gate",
         StageName::MicEq => "eq",
+        StageName::Limiter => "limiter",
     }
 }
 
@@ -1187,6 +1188,52 @@ fn main() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
+                // G4: when the daemon is running the route must land in the ACTIVE
+                // PROFILE's routes (the single source of truth that reconcile and
+                // the route watcher read) — go through the daemon. The direct path
+                // below writes only routes.json + the conf fragments, which the
+                // next daemon reconcile re-projects from the profile (overwriting
+                // anything set directly). --by-name matching exists only on the
+                // direct path, so it keeps the old behaviour.
+                if !by_name && daemon::socket_path().exists() {
+                    let req = daemon::Request::Route {
+                        app_binary: app.clone(),
+                        target_sink: sink.clone(),
+                    };
+                    return match daemon::send_request(&req) {
+                        Ok(resp) if resp.ok => {
+                            println!("route saved in active profile ({app} → {sink}); running streams moved best-effort");
+                            println!(
+                                "note: the persistent rule applies to apps launched from now on"
+                            );
+                            ExitCode::SUCCESS
+                        }
+                        Ok(resp) => {
+                            eprintln!(
+                                "error: {}",
+                                resp.error.unwrap_or_else(|| "unknown error".to_string())
+                            );
+                            ExitCode::FAILURE
+                        }
+                        Err(e) => {
+                            eprintln!("error communicating with daemon: {e}");
+                            ExitCode::FAILURE
+                        }
+                    };
+                }
+                if by_name && daemon::socket_path().exists() {
+                    eprintln!(
+                        "warning: --by-name routes are saved directly (not via the daemon); \
+                         the active profile will not track this rule and the next daemon \
+                         reconcile may overwrite it"
+                    );
+                } else if !daemon::socket_path().exists() {
+                    eprintln!(
+                        "warning: daemon not running — rule saved to routes.json/fragments \
+                         only, not to the active profile; re-run with the daemon up to make \
+                         it survive reconciles"
+                    );
+                }
                 let matcher = if by_name {
                     AppMatch::Name(app.clone())
                 } else {
@@ -1199,7 +1246,10 @@ fn main() -> ExitCode {
                 }
                 // Live move first (best-effort — warn on failure, continue).
                 match router.apply_live(&matcher, &sink) {
-                    Ok(id) => println!("live: moved stream {id} ({app}) → {sink}"),
+                    Ok(ids) => println!(
+                        "live: moved stream(s) {} ({app}) → {sink}",
+                        ids.join(", ")
+                    ),
                     Err(e) => {
                         eprintln!("warning: live move failed (is the app playing?): {e}");
                         // Still persist the rule so it applies next launch.
@@ -1210,7 +1260,11 @@ fn main() -> ExitCode {
                 match router.save_persistent() {
                     Ok(()) => {
                         println!("persistent: rule saved ({app} → {sink})");
-                        println!("note: run `systemctl --user restart wireplumber` to load it now");
+                        println!(
+                            "note: the rule applies to apps launched from now on \
+                             (native clients read it at startup; pulse clients after \
+                             pipewire-pulse restarts); running apps were moved live above"
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(e) => {
@@ -1220,6 +1274,39 @@ fn main() -> ExitCode {
                 }
             }
             RouteAction::Clear { app } | RouteAction::Remove { app } => {
+                // G4: with the daemon up, clear via the engine so the rule leaves
+                // the active profile too (the direct path can't touch the profile,
+                // and reconcile would re-project the rule right back).
+                if daemon::socket_path().exists() {
+                    let req = daemon::Request::RouteClear {
+                        app_binary: app.clone(),
+                    };
+                    return match daemon::send_request(&req) {
+                        Ok(resp) if resp.ok => {
+                            println!("route cleared for {app}");
+                            if let Some(note) = resp.note {
+                                println!("note: {note}");
+                            }
+                            ExitCode::SUCCESS
+                        }
+                        Ok(resp) => {
+                            eprintln!(
+                                "error: {}",
+                                resp.error.unwrap_or_else(|| "unknown error".to_string())
+                            );
+                            ExitCode::FAILURE
+                        }
+                        Err(e) => {
+                            eprintln!("error communicating with daemon: {e}");
+                            ExitCode::FAILURE
+                        }
+                    };
+                }
+                eprintln!(
+                    "warning: daemon not running — clearing routes.json/fragments only; \
+                     a matching rule in the active profile will be re-projected on the \
+                     next daemon start"
+                );
                 let mut router = Router::new(RealRunner);
                 if let Err(e) = router.load_persistent() {
                     eprintln!("warning: could not load existing routes: {e}");
@@ -1233,6 +1320,11 @@ fn main() -> ExitCode {
                 match router.save_persistent() {
                     Ok(()) => {
                         println!("persistent: rule removed for {app}");
+                        println!(
+                            "note: '{app}' may reappear on its previous sink on next launch \
+                             (WirePlumber restore-stream remembers the last target); move it \
+                             once to re-teach it — see KNOWN_ISSUES.md KI-6"
+                        );
                         ExitCode::SUCCESS
                     }
                     Err(e) => {

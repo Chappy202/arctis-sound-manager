@@ -241,6 +241,8 @@ pub enum Request {
     ListFactoryProfiles,
     /// Pin (or clear) the convolver blocksize on the active profile's surround.
     SurroundSetBlocksize { blocksize: Option<u32> },
+    /// Pin (or clear) the convolver tailsize on the active profile's surround.
+    SurroundSetTailsize { tailsize: Option<u32> },
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -273,6 +275,11 @@ pub struct Response {
     /// may compare it against their own version and warn on mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
+    /// Optional human-readable advisory attached to an OK response (e.g. the
+    /// restore-stream caveat on RouteClear). Absent on the wire when None, so
+    /// older clients/daemons interoperate unchanged.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub note: Option<String>,
 }
 
 impl Response {
@@ -288,6 +295,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -303,6 +311,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -318,6 +327,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -333,6 +343,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -348,6 +359,7 @@ impl Response {
             coexist_result: Some(result),
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -363,6 +375,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -378,6 +391,7 @@ impl Response {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         }
     }
 
@@ -393,7 +407,14 @@ impl Response {
             coexist_result: None,
             factory_profiles: Some(profiles),
             daemon_version: None,
+            note: None,
         }
+    }
+
+    /// Attach a human-readable advisory note to this response (builder-style).
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 }
 
@@ -473,6 +494,7 @@ mod tests {
             coexist_result: None,
             factory_profiles: None,
             daemon_version: None,
+            note: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -495,6 +517,18 @@ mod tests {
         assert!(json.contains("daemon_version"), "{json}");
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(back.daemon_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn response_note_round_trips_and_is_optional_on_the_wire() {
+        // with_note round-trips…
+        let resp = Response::err("x".into()).with_note("advisory");
+        let json = serde_json::to_string(&resp).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.note.as_deref(), Some("advisory"));
+        // …and a response from an older daemon (no `note` key) still parses.
+        let back: Response = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(back.note.is_none());
     }
 
     #[test]

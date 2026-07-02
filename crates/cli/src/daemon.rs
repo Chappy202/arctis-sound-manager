@@ -104,7 +104,14 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
             Err(e) => Response::err(e.to_string()),
         },
         Request::RouteClear { app_binary } => match engine.clear_route(&app_binary) {
-            Ok(()) => Response::ok_with_state(engine.state()),
+            // restore-stream caveat: WirePlumber remembers the app's last manual
+            // target and may put its NEXT stream back on the old sink; there is no
+            // per-app clear without restarting WirePlumber (see KNOWN_ISSUES KI-6).
+            Ok(()) => Response::ok_with_state(engine.state()).with_note(format!(
+                "'{app_binary}' may reappear on its previous sink on next launch \
+                 (WirePlumber restore-stream remembers the last target); move it \
+                 once to the desired sink to re-teach it — see KNOWN_ISSUES.md KI-6"
+            )),
             Err(e) => Response::err(e.to_string()),
         },
         Request::SetChannelOutput { channel, device } => {
@@ -202,6 +209,12 @@ pub fn handle_request<R: CommandRunner>(engine: &mut Engine<R>, req: Request) ->
         }
         Request::SurroundSetBlocksize { blocksize } => {
             match engine.surround_set_blocksize(blocksize) {
+                Ok(()) => Response::ok_with_state(engine.state()),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
+        Request::SurroundSetTailsize { tailsize } => {
+            match engine.surround_set_tailsize(tailsize) {
                 Ok(()) => Response::ok_with_state(engine.state()),
                 Err(e) => Response::err(e.to_string()),
             }
@@ -2071,6 +2084,9 @@ mod tests {
         let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("asm_rc_{}", std::process::id()));
         std::env::set_var("ASM_CONFIG_HOME", &tmp);
+        // clear_route re-projects routes.json + conf fragments under $HOME.
+        let tmp_home = std::env::temp_dir().join(format!("asm_rc_home_{}", std::process::id()));
+        std::env::set_var("HOME", &tmp_home);
 
         // Seed config with a route for "firefox".
         let mut cfg = two_profile_config();
@@ -2105,9 +2121,17 @@ mod tests {
             "firefox route must be absent after clear: {:?}",
             state.routes
         );
+        // Finding 4 (restore-stream): the response must carry the advisory note.
+        let note = resp.note.expect("RouteClear response must carry a note");
+        assert!(
+            note.contains("restore-stream") && note.contains("firefox"),
+            "note must explain the restore-stream caveat: {note}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp_home);
         std::env::remove_var("ASM_CONFIG_HOME");
+        std::env::remove_var("HOME");
     }
 
     // ── F5a: MicSnapshot.hw_mic surfaced in state ────────────────────────────

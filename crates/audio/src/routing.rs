@@ -24,30 +24,47 @@ impl RouteRule {
 
 const HEADER: &str = "\
 # Managed by Arctis Sound Manager — do not edit by hand.
-# Persistent per-application routing (WirePlumber 0.5 SPA-JSON node.rules).
 ";
 
-/// Render the full WirePlumber 0.5 `node.rules` SPA-JSON fragment body.
-/// Emits both `node.target` and `target.object` so the rule is honoured
-/// regardless of which key the running WirePlumber prefers.
-pub fn node_rules_fragment(rules: &[RouteRule]) -> String {
+/// Escape a string for embedding inside a double-quoted SPA-JSON string:
+/// backslashes and double quotes are backslash-escaped so an app name like
+/// `my "app"` cannot break the generated fragment.
+fn escape_spa_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render one `<section> = [ { matches … actions … } … ]` SPA-JSON rules body.
+/// Shared by the client (`stream.rules`) and pulse (`pulse.rules`) renderers —
+/// both mechanisms use the identical match-rule layout (see pipewire(1)).
+fn rules_section(section: &str, comment: &str, rules: &[RouteRule]) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
-    out.push_str("node.rules = [\n");
+    out.push_str(comment);
+    out.push_str(&format!("{section} = [\n"));
     for r in rules {
         out.push_str("  {\n");
         out.push_str("    matches = [\n");
         out.push_str("      {\n");
         out.push_str(&format!(
             "        application.process.binary = \"{}\"\n",
-            r.app_binary
+            escape_spa_string(&r.app_binary)
         ));
         out.push_str("      }\n");
         out.push_str("    ]\n");
         out.push_str("    actions = {\n");
         out.push_str("      update-props = {\n");
-        out.push_str(&format!("        node.target = \"{}\"\n", r.target_sink));
-        out.push_str(&format!("        target.object = \"{}\"\n", r.target_sink));
+        out.push_str(&format!(
+            "        target.object = \"{}\"\n",
+            escape_spa_string(&r.target_sink)
+        ));
         out.push_str("      }\n");
         out.push_str("    }\n");
         out.push_str("  }\n");
@@ -56,19 +73,62 @@ pub fn node_rules_fragment(rules: &[RouteRule]) -> String {
     out
 }
 
-/// Path of the managed fragment: `$HOME/.config/wireplumber/wireplumber.conf.d/90-asm-routing.conf`.
-pub fn wireplumber_fragment_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let mut p = PathBuf::from(home);
-    p.push(".config");
-    p.push("wireplumber");
-    p.push("wireplumber.conf.d");
-    p.push("90-asm-routing.conf");
-    p
+/// Render the `stream.rules` fragment body for `~/.config/pipewire/client.conf.d/`.
+/// Read by NATIVE PipeWire clients when they start up (pipewire-client.conf(5)),
+/// so it applies to apps launched after the file is written — no daemon restart
+/// (G3). Running apps are moved live via `pw-metadata` separately.
+pub fn stream_rules_fragment(rules: &[RouteRule]) -> String {
+    rules_section(
+        "stream.rules",
+        "# Per-app routing for NATIVE PipeWire clients (client.conf stream.rules);\n\
+         # read by each client at ITS startup — applies to newly launched apps.\n",
+        rules,
+    )
 }
 
-/// Compute the WirePlumber fragment path rooted at a given home dir.
-fn wireplumber_fragment_path_in(home: &std::path::Path) -> PathBuf {
+/// Render the `pulse.rules` fragment body for `~/.config/pipewire/pipewire-pulse.conf.d/`.
+/// Applied by the pipewire-pulse server to PulseAudio clients when they connect
+/// (pipewire-pulse.conf(5)); the file itself is read at pipewire-pulse startup.
+pub fn pulse_rules_fragment(rules: &[RouteRule]) -> String {
+    rules_section(
+        "pulse.rules",
+        "# Per-app routing for PulseAudio clients (pipewire-pulse.conf pulse.rules);\n\
+         # applied when a pulse client connects.\n",
+        rules,
+    )
+}
+
+/// Resolve `$HOME` (or `/tmp` as a last resort) for the fragment/state paths.
+fn home_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+}
+
+/// Path of the managed native-client fragment:
+/// `$HOME/.config/pipewire/client.conf.d/90-asm-routing.conf`.
+pub fn client_fragment_path() -> PathBuf {
+    client_fragment_path_in(&home_dir())
+}
+
+/// Compute the client fragment path rooted at a given home dir.
+fn client_fragment_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config/pipewire/client.conf.d/90-asm-routing.conf")
+}
+
+/// Path of the managed pulse-client fragment:
+/// `$HOME/.config/pipewire/pipewire-pulse.conf.d/90-asm-routing.conf`.
+pub fn pulse_fragment_path() -> PathBuf {
+    pulse_fragment_path_in(&home_dir())
+}
+
+/// Compute the pulse fragment path rooted at a given home dir.
+fn pulse_fragment_path_in(home: &std::path::Path) -> PathBuf {
+    home.join(".config/pipewire/pipewire-pulse.conf.d/90-asm-routing.conf")
+}
+
+/// Legacy fragment location written by older releases. The `node.rules` section
+/// it carried is NOT a WirePlumber 0.5 section — nothing ever read it — so
+/// `save_persistent` deletes it (stale-path cleanup).
+fn legacy_wireplumber_fragment_path_in(home: &std::path::Path) -> PathBuf {
     home.join(".config/wireplumber/wireplumber.conf.d/90-asm-routing.conf")
 }
 
@@ -156,6 +216,18 @@ pub fn clear_stream_target_argv(stream_id: &str) -> Result<Vec<String>, AudioErr
 ///   - `AppMatch::Binary(v)` → `props["node.name"] == v` OR
 ///     `props["application.process.binary"] == v`
 pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<String, AudioError> {
+    parse_stream_ids(pw_dump_json, app_match).map(|ids| ids[0].clone())
+}
+
+/// Find ALL stream node ids whose props match `app_match` in `pw-dump` JSON
+/// (same selection rules as [`parse_stream_id`]). Multi-node apps (browsers
+/// hold one output node per tab/stream) must be moved node-by-node; acting on
+/// only the first leaves the siblings on the old sink. Errors when no node
+/// matches, so the returned Vec is never empty.
+pub fn parse_stream_ids(
+    pw_dump_json: &str,
+    app_match: &AppMatch,
+) -> Result<Vec<String>, AudioError> {
     let array: serde_json::Value =
         serde_json::from_str(pw_dump_json).map_err(|e| AudioError::Parse {
             what: "pw-dump JSON".to_string(),
@@ -167,6 +239,7 @@ pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<Strin
         detail: "expected a top-level JSON array".to_string(),
     })?;
 
+    let mut ids = Vec::new();
     for obj in objects {
         // Must be a Node.
         if obj.get("type").and_then(|v| v.as_str()) != Some("PipeWire:Interface:Node") {
@@ -209,18 +282,21 @@ pub fn parse_stream_id(pw_dump_json: &str, app_match: &AppMatch) -> Result<Strin
                     what: "stream id".to_string(),
                     detail: "matched node has no numeric top-level `id`".to_string(),
                 })?;
-            return Ok(id.to_string());
+            ids.push(id.to_string());
         }
     }
 
-    Err(AudioError::Parse {
-        what: "stream id".to_string(),
-        detail: format!(
-            "no Stream/Output/Audio Node matching {} = {}",
-            app_match.key(),
-            app_match.value()
-        ),
-    })
+    if ids.is_empty() {
+        return Err(AudioError::Parse {
+            what: "stream id".to_string(),
+            detail: format!(
+                "no Stream/Output/Audio Node matching {} = {}",
+                app_match.key(),
+                app_match.value()
+            ),
+        });
+    }
+    Ok(ids)
 }
 
 use crate::runner::CommandRunner;
@@ -279,11 +355,26 @@ impl<R: CommandRunner> Router<R> {
         }
     }
 
-    fn effective_fragment_path(&self) -> PathBuf {
+    fn effective_client_fragment_path(&self) -> PathBuf {
         match &self.home_override {
-            Some(h) => wireplumber_fragment_path_in(h),
-            None => wireplumber_fragment_path(),
+            Some(h) => client_fragment_path_in(h),
+            None => client_fragment_path(),
         }
+    }
+
+    fn effective_pulse_fragment_path(&self) -> PathBuf {
+        match &self.home_override {
+            Some(h) => pulse_fragment_path_in(h),
+            None => pulse_fragment_path(),
+        }
+    }
+
+    fn effective_legacy_fragment_path(&self) -> PathBuf {
+        let home = match &self.home_override {
+            Some(h) => h.clone(),
+            None => home_dir(),
+        };
+        legacy_wireplumber_fragment_path_in(&home)
     }
 
     fn check(
@@ -301,16 +392,25 @@ impl<R: CommandRunner> Router<R> {
         }
     }
 
-    /// Move a running app's stream to `target_sink` LIVE. Returns the id moved.
-    pub fn apply_live(&mut self, app: &AppMatch, target_sink: &str) -> Result<String, AudioError> {
+    /// Move a running app's streams to `target_sink` LIVE. Moves EVERY matching
+    /// output node (browsers hold several; moving only the first left siblings
+    /// on the old sink — same rationale as the engine's `move_stream`).
+    /// Returns the ids moved (never empty on Ok).
+    pub fn apply_live(
+        &mut self,
+        app: &AppMatch,
+        target_sink: &str,
+    ) -> Result<Vec<String>, AudioError> {
         let dump = self.runner.run("pw-dump", &[])?;
         let dump = Self::check(dump, "pw-dump")?;
-        let id = parse_stream_id(&dump.stdout, app)?;
-        let argv = move_stream_argv(&id, target_sink)?;
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.runner.run("pw-metadata", &args)?;
-        Self::check(out, "pw-metadata")?;
-        Ok(id)
+        let ids = parse_stream_ids(&dump.stdout, app)?;
+        for id in &ids {
+            let argv = move_stream_argv(id, target_sink)?;
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.runner.run("pw-metadata", &args)?;
+            Self::check(out, "pw-metadata")?;
+        }
+        Ok(ids)
     }
 
     /// Upsert a persistent rule by app binary (no duplicates).
@@ -332,17 +432,19 @@ impl<R: CommandRunner> Router<R> {
         self.rules.retain(|r| r.app_binary != app_binary);
     }
 
-    /// Best-effort live clear: move the stream for `app` back to the default sink
-    /// by deleting its `target.object` metadata key.  Errors are silently ignored
-    /// at the call site (same pattern as `apply_live` for route-set).
+    /// Best-effort live clear: move the app's streams back to the default sink
+    /// by deleting the `target.object` metadata key on EVERY matching node
+    /// (multi-node symmetry with `apply_live`). Errors are silently ignored at
+    /// the call site (same pattern as `apply_live` for route-set).
     pub fn clear_live(&mut self, app: &AppMatch) -> Result<(), AudioError> {
         let dump = self.runner.run("pw-dump", &[])?;
         let dump = Self::check(dump, "pw-dump")?;
-        let id = parse_stream_id(&dump.stdout, app)?;
-        let argv = clear_stream_target_argv(&id)?;
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.runner.run("pw-metadata", &args)?;
-        Self::check(out, "pw-metadata")?;
+        for id in parse_stream_ids(&dump.stdout, app)? {
+            let argv = clear_stream_target_argv(&id)?;
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.runner.run("pw-metadata", &args)?;
+            Self::check(out, "pw-metadata")?;
+        }
         Ok(())
     }
 
@@ -370,69 +472,54 @@ impl<R: CommandRunner> Router<R> {
         Ok(())
     }
 
-    /// Save persistent routes to `routes.json` (atomic write), then regenerate
-    /// and atomically write the WirePlumber fragment from current rules.
-    pub fn save_persistent(&self) -> Result<(), AudioError> {
-        // --- Write routes.json atomically ---
-        let state_path = self.effective_state_path();
-        if let Some(dir) = state_path.parent() {
+    /// Create parent dirs and atomically write `body` to `path` (tmp + rename
+    /// in the same directory, so the rename never crosses filesystems).
+    fn atomic_write(path: &std::path::Path, body: &str) -> Result<(), AudioError> {
+        if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
                 program: format!("mkdir {}", dir.display()),
                 source_msg: e.to_string(),
             })?;
         }
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "asm".to_string());
+        let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+        fs::write(&tmp, body).map_err(|e| AudioError::Spawn {
+            program: format!("write {}", tmp.display()),
+            source_msg: e.to_string(),
+        })?;
+        fs::rename(&tmp, path).map_err(|e| AudioError::Spawn {
+            program: format!("rename {} -> {}", tmp.display(), path.display()),
+            source_msg: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Save persistent routes to `routes.json` (atomic write), then regenerate
+    /// and atomically write the client (`stream.rules`) and pulse (`pulse.rules`)
+    /// fragments from the current rules. Also removes the legacy
+    /// `wireplumber.conf.d/90-asm-routing.conf` (a dead `node.rules` file that
+    /// WirePlumber 0.5 never read). `routes.json` is a pure PROJECTION of the
+    /// rules the caller passed in — callers own the source of truth (G4).
+    pub fn save_persistent(&self) -> Result<(), AudioError> {
         let json = serde_json::to_string_pretty(&self.rules).map_err(|e| AudioError::Parse {
             what: "routes.json serialization".to_string(),
             detail: e.to_string(),
         })?;
-        // Derive tmp path in same directory (same fs → rename is atomic).
-        let state_tmp = state_path.with_file_name(".routes.json.tmp");
-        fs::write(&state_tmp, &json).map_err(|e| AudioError::Spawn {
-            program: format!("write {}", state_tmp.display()),
-            source_msg: e.to_string(),
-        })?;
-        fs::rename(&state_tmp, &state_path).map_err(|e| AudioError::Spawn {
-            program: format!("rename {} -> {}", state_tmp.display(), state_path.display()),
-            source_msg: e.to_string(),
-        })?;
-
-        // --- Write WirePlumber fragment atomically ---
-        let frag_path = self.effective_fragment_path();
-        if let Some(dir) = frag_path.parent() {
-            fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
-                program: format!("mkdir {}", dir.display()),
-                source_msg: e.to_string(),
-            })?;
-        }
-        let body = node_rules_fragment(&self.rules);
-        let frag_tmp = frag_path.with_file_name(".90-asm-routing.conf.tmp");
-        fs::write(&frag_tmp, &body).map_err(|e| AudioError::Spawn {
-            program: format!("write {}", frag_tmp.display()),
-            source_msg: e.to_string(),
-        })?;
-        fs::rename(&frag_tmp, &frag_path).map_err(|e| AudioError::Spawn {
-            program: format!("rename {} -> {}", frag_tmp.display(), frag_path.display()),
-            source_msg: e.to_string(),
-        })?;
-
+        Self::atomic_write(&self.effective_state_path(), &json)?;
+        Self::atomic_write(
+            &self.effective_client_fragment_path(),
+            &stream_rules_fragment(&self.rules),
+        )?;
+        Self::atomic_write(
+            &self.effective_pulse_fragment_path(),
+            &pulse_rules_fragment(&self.rules),
+        )?;
+        // Best-effort cleanup of the stale legacy fragment (absence is fine).
+        let _ = fs::remove_file(self.effective_legacy_fragment_path());
         Ok(())
-    }
-
-    /// Write the persistent WirePlumber fragment to disk (creates dirs).
-    pub fn write_persistent(&mut self) -> Result<PathBuf, AudioError> {
-        let path = wireplumber_fragment_path();
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).map_err(|e| AudioError::Spawn {
-                program: "mkdir wireplumber.conf.d".to_string(),
-                source_msg: e.to_string(),
-            })?;
-        }
-        let body = node_rules_fragment(&self.rules);
-        fs::write(&path, body).map_err(|e| AudioError::Spawn {
-            program: "write wireplumber fragment".to_string(),
-            source_msg: e.to_string(),
-        })?;
-        Ok(path)
     }
 }
 
@@ -440,14 +527,27 @@ impl<R: CommandRunner> Router<R> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn renders_exact_two_rule_fixture() {
-        let rules = vec![
+    fn two_rules() -> Vec<RouteRule> {
+        vec![
             RouteRule::new("firefox", "Arctis_Media"),
             RouteRule::new("Discord", "Arctis_Chat"),
-        ];
-        let got = node_rules_fragment(&rules);
-        let want = include_str!("../tests/fixtures/wp_node_rules.conf");
+        ]
+    }
+
+    #[test]
+    fn stream_rules_renders_exact_two_rule_fixture() {
+        let got = stream_rules_fragment(&two_rules());
+        let want = include_str!("../tests/fixtures/pw_stream_rules.conf");
+        if got != want {
+            eprintln!("=== GOT ===\n{got}\n=== WANT ===\n{want}");
+        }
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn pulse_rules_renders_exact_two_rule_fixture() {
+        let got = pulse_rules_fragment(&two_rules());
+        let want = include_str!("../tests/fixtures/pw_pulse_rules.conf");
         if got != want {
             eprintln!("=== GOT ===\n{got}\n=== WANT ===\n{want}");
         }
@@ -456,16 +556,31 @@ mod tests {
 
     #[test]
     fn empty_rules_emit_empty_array() {
-        let got = node_rules_fragment(&[]);
-        assert!(got.contains("node.rules = [\n]\n"));
+        let got = stream_rules_fragment(&[]);
+        assert!(got.contains("stream.rules = [\n]\n"));
         assert!(got.starts_with("# Managed by Arctis Sound Manager"));
+        let got = pulse_rules_fragment(&[]);
+        assert!(got.contains("pulse.rules = [\n]\n"));
     }
 
     #[test]
-    fn fragment_path_is_under_wireplumber_conf_d() {
-        let p = wireplumber_fragment_path();
-        let s = p.to_string_lossy();
-        assert!(s.ends_with("wireplumber/wireplumber.conf.d/90-asm-routing.conf"));
+    fn fragment_values_are_spa_escaped() {
+        // A quote or backslash in an app name must not break the SPA-JSON string.
+        let rules = vec![RouteRule::new(r#"my "app"\bin"#, "Arctis_Media")];
+        for got in [stream_rules_fragment(&rules), pulse_rules_fragment(&rules)] {
+            assert!(
+                got.contains(r#"application.process.binary = "my \"app\"\\bin""#),
+                "unescaped fragment: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragment_paths_are_under_pipewire_conf_d() {
+        let s = client_fragment_path().to_string_lossy().into_owned();
+        assert!(s.ends_with("pipewire/client.conf.d/90-asm-routing.conf"));
+        let s = pulse_fragment_path().to_string_lossy().into_owned();
+        assert!(s.ends_with("pipewire/pipewire-pulse.conf.d/90-asm-routing.conf"));
     }
 
     #[test]
@@ -557,10 +672,10 @@ mod tests {
             .with_output(0, dump, "") // pw-dump
             .with_output(0, "", ""); // pw-metadata move
         let mut router = Router::new(runner);
-        let id = router
+        let ids = router
             .apply_live(&AppMatch::Binary("firefox".into()), "Arctis_Media")
             .unwrap();
-        assert_eq!(id, "73");
+        assert_eq!(ids, vec!["73"]);
         let calls = &router.runner().calls;
         assert_eq!(calls[0], vec!["pw-dump"]);
         assert_eq!(
@@ -574,6 +689,42 @@ mod tests {
                 "Arctis_Media"
             ]
         );
+    }
+
+    /// A multi-node app (browsers) must have EVERY output node moved/cleared,
+    /// not just the first — matching the engine's move_stream behaviour.
+    #[test]
+    fn apply_live_and_clear_live_act_on_every_node_of_a_binary() {
+        let dump = r#"[
+          {"id":73,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.process.binary":"vivaldi"}}},
+          {"id":91,"type":"PipeWire:Interface:Node","info":{"props":{
+            "media.class":"Stream/Output/Audio","application.process.binary":"vivaldi"}}}
+        ]"#;
+        let runner = MockRunner::new()
+            .with_output(0, dump, "") // pw-dump
+            .with_output(0, "", "") // move node 73
+            .with_output(0, "", ""); // move node 91
+        let mut router = Router::new(runner);
+        let ids = router
+            .apply_live(&AppMatch::Binary("vivaldi".into()), "Arctis_Media")
+            .unwrap();
+        assert_eq!(ids, vec!["73", "91"]);
+        let calls = &router.runner().calls;
+        assert_eq!(calls.len(), 3, "pw-dump + one move per node");
+        assert_eq!(calls[1][3], "73");
+        assert_eq!(calls[2][3], "91");
+
+        let runner = MockRunner::new()
+            .with_output(0, dump, "")
+            .with_output(0, "", "")
+            .with_output(0, "", "");
+        let mut router = Router::new(runner);
+        router.clear_live(&AppMatch::Binary("vivaldi".into())).unwrap();
+        let calls = &router.runner().calls;
+        assert_eq!(calls.len(), 3, "pw-dump + one clear per node");
+        assert_eq!(calls[1], vec!["pw-metadata", "-d", "73", "target.object"]);
+        assert_eq!(calls[2], vec!["pw-metadata", "-d", "91", "target.object"]);
     }
 
     #[test]
@@ -600,20 +751,27 @@ mod tests {
     }
 
     #[test]
-    fn write_persistent_writes_fragment_to_temp_home() {
-        // Point HOME at a temp dir so the test writes nowhere real.
-        let tmp = std::env::temp_dir().join(format!("asm_wp_test_{}", std::process::id()));
-        std::env::set_var("HOME", &tmp);
-        let mut router = Router::with_rules(
-            MockRunner::new(),
-            vec![RouteRule::new("firefox", "Arctis_Media")],
-        );
-        let path = router.write_persistent().unwrap();
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("application.process.binary = \"firefox\""));
-        assert!(body.contains("target.object = \"Arctis_Media\""));
-        assert!(path.to_string_lossy().ends_with("90-asm-routing.conf"));
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn save_persistent_writes_both_fragments_and_removes_legacy() {
+        let home = unique_tmp("frag_pair");
+        // Seed a stale legacy fragment that save_persistent must clean up.
+        let legacy = legacy_wireplumber_fragment_path_in(&home);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "node.rules = []\n").unwrap();
+
+        let mut router = Router::with_home(MockRunner::new(), home.clone());
+        router.set_rule(RouteRule::new("firefox", "Arctis_Media"));
+        router.save_persistent().unwrap();
+
+        let client = std::fs::read_to_string(client_fragment_path_in(&home)).unwrap();
+        assert!(client.contains("stream.rules = [\n"));
+        assert!(client.contains("application.process.binary = \"firefox\""));
+        assert!(client.contains("target.object = \"Arctis_Media\""));
+        let pulse = std::fs::read_to_string(pulse_fragment_path_in(&home)).unwrap();
+        assert!(pulse.contains("pulse.rules = [\n"));
+        assert!(pulse.contains("target.object = \"Arctis_Media\""));
+        assert!(!legacy.exists(), "stale wireplumber node.rules fragment must be removed");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Helper to create a unique temp dir for a test without touching HOME.
@@ -681,7 +839,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// After setting two rules and save_persistent, the WirePlumber fragment contains both app names.
+    /// After setting two rules and save_persistent, both fragments contain both app names.
     #[test]
     fn test_fragment_contains_both_apps() {
         let home = unique_tmp("frag");
@@ -691,16 +849,17 @@ mod tests {
         router.set_rule(RouteRule::new("discord", "Arctis_Chat"));
         router.save_persistent().unwrap();
 
-        let frag_path = wireplumber_fragment_path_in(&home);
-        let body = std::fs::read_to_string(&frag_path).unwrap();
-        assert!(
-            body.contains("firefox"),
-            "fragment missing 'firefox': {body}"
-        );
-        assert!(
-            body.contains("discord"),
-            "fragment missing 'discord': {body}"
-        );
+        for path in [client_fragment_path_in(&home), pulse_fragment_path_in(&home)] {
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                body.contains("firefox"),
+                "fragment missing 'firefox': {body}"
+            );
+            assert!(
+                body.contains("discord"),
+                "fragment missing 'discord': {body}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&home);
     }
