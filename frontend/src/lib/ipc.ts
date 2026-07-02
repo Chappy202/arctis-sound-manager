@@ -645,6 +645,13 @@ export const meterSubscribe = (): Promise<void> => invoke("meter_subscribe");
 export const meterUnsubscribe = (): Promise<void> => invoke("meter_unsubscribe");
 
 /**
+ * Re-exec the app after a successful update. Required on Linux: the updater
+ * replaces the AppImage in place but does NOT restart the running process
+ * (only Windows restarts automatically). Never resolves on success.
+ */
+export const relaunchApp = (): Promise<void> => invoke("relaunch_app");
+
+/**
  * Subscribe to live AppStream list updates pushed by the daemon.
  * Emitted whenever PipeWire app streams change (appear/disappear/move).
  * Returns an unlisten function to clean up the subscription.

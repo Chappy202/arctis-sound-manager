@@ -35,15 +35,18 @@ export interface UpdateInfo {
   date: string | null;
   body: string | null;
   /**
-   * Download and install the update, then relaunch.  `onEvent` receives the
-   * raw plugin download events (feed them to `reduceProgress` for a % state).
+   * Download and install the update.  `onEvent` receives the raw plugin
+   * download events (feed them to `reduceProgress` for a % state).
    * Rejects on failure (including timeout) so callers can reset their UI.
+   * NOTE: resolving does NOT mean the app restarted — on Linux the AppImage
+   * is replaced in place and the caller must invoke `relaunchApp()` itself
+   * (only Windows exits into the installer automatically).
    */
   downloadAndInstall: (onEvent?: (e: DownloadEvent) => void) => Promise<void>;
 }
 
 /** Phase of an in-flight update install. */
-export type DownloadPhase = "idle" | "downloading" | "installing";
+export type DownloadPhase = "idle" | "downloading" | "installing" | "restarting";
 
 /** Reactive state driving the progress bar + button label. */
 export interface DownloadProgress {
@@ -97,6 +100,8 @@ export function progressLabel(p: DownloadProgress): string {
       return p.percent === null ? "Downloading…" : `Downloading… ${p.percent}%`;
     case "installing":
       return "Installing…";
+    case "restarting":
+      return "Restarting…";
     default:
       return "Install & Relaunch";
   }

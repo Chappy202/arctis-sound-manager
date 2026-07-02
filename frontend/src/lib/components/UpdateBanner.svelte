@@ -7,6 +7,7 @@
     type UpdateInfo,
     type DownloadProgress,
   } from "../updater.js";
+  import { relaunchApp } from "../ipc.js";
 
   /** The available update, or null when up to date / offline. */
   let pendingUpdate = $state<UpdateInfo | null>(null);
@@ -40,9 +41,14 @@
       await pendingUpdate.downloadAndInstall((e) => {
         progress = reduceProgress(progress, e);
       });
-      // On success the app relaunches automatically — nothing more to do.
+      // Install succeeded, but on Linux the running process is still the old
+      // binary — the plugin only auto-restarts on Windows. Re-exec explicitly;
+      // relaunchApp never resolves on success (the process is replaced).
+      progress = { ...progress, phase: "restarting" };
+      await relaunchApp();
     } catch (err) {
-      // Timeout / network / signature failure — surface it and let the user retry.
+      // Timeout / network / signature failure — or a failed relaunch (the
+      // update itself may have installed; a manual restart picks it up).
       console.error("[updater] install failed:", err);
       errorMsg = err instanceof Error ? err.message : String(err);
       installing = false;

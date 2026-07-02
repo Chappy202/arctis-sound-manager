@@ -85,6 +85,11 @@ describe("progressLabel", () => {
       "Installing…",
     );
   });
+  it("restarting (post-install re-exec — Linux does not auto-relaunch)", () => {
+    expect(progressLabel({ phase: "restarting", received: 100, total: 100, percent: 100 })).toBe(
+      "Restarting…",
+    );
+  });
   it("idle falls back to the install prompt", () => {
     expect(progressLabel(initialProgress)).toBe("Install & Relaunch");
   });
