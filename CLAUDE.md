@@ -9,10 +9,13 @@ Nova Pro Wireless**) with a SteelSeries Sonar-style experience: per-app audio ro
 parametric EQ, per-profile HRIR surround, and headset hardware control. It replaces a community Python
 app the owner found unmaintainable.
 
-**Status:** functional (v0.2.1). Engine/daemon, the `asm-cli` CLI, and the Tauri v2 GUI all work —
-per-app routing, per-channel EQ, mic DSP chain, virtual surround/HRIR, and device reads are live.
-Device **writes** remain gated until each control is validated on real hardware. Build order is still
-engine-first (headless): build/test the Rust core + `asm-cli` before the UI.
+**Status:** functional (v0.2.7 + the 2026-07-02 deep-review hardening on master). Engine/daemon, the
+`asm-cli` CLI, and the Tauri v2 GUI all work — per-app routing (persisted as PipeWire
+`stream.rules`/`pulse.rules` fragments), per-channel EQ with auto-preamp, mic DSP chain with always-on
+limiter, virtual surround/HRIR (input-adaptive Auto mode), hardened daemon IPC (timeouts, line caps,
+`daemon_version` handshake), and device reads are live. Device **writes** remain gated until each
+control is validated on real hardware. Build order is still engine-first (headless): build/test the
+Rust core + `asm-cli` before the UI.
 
 ## Authoritative documents (read these first)
 
@@ -28,7 +31,8 @@ engine-first (headless): build/test the Rust core + `asm-cli` before the UI.
   the `hidapi` **C backend** (`linux-static-hidraw`); the pure-Rust `linux-native` backend does NOT
   enumerate the Nova Pro Wireless. Build deps: `libudev` (`systemd-devel`) + a C toolchain (`gcc`); the
   optional `pw-watcher` feature (live route re-apply) additionally needs `pipewire-devel` + `clang`. The system tray additionally needs `libayatana-appindicator3-dev` (`libayatana-appindicator-gtk3-devel` on Fedora/Nobara).
-- Crates: `domain`, `device`, `audio`, `config`, `engine`, `cli`, (future `daemon`); `src-tauri` + `ui`.
+- Crates: `domain`, `device`, `audio`, `config`, `engine`, `client` (daemon IPC), `cli` (hosts the
+  resident daemon: `asm-cli daemon`); `src-tauri` + `frontend`.
 - Dependency rule: `tauri` only in `src-tauri`; `engine` and below are UI-agnostic. See ARCHITECTURE §2.
 
 ## Non-negotiable safety rules (from ARCHITECTURE G2)
@@ -57,6 +61,8 @@ engine-first (headless): build/test the Rust core + `asm-cli` before the UI.
 - Live-PipeWire/real-hardware tests are out of the default CI gate. CI runs clippy `-D warnings` +
   `cargo test`; **rustfmt is advisory/non-blocking** (the codebase uses a deliberately compact style —
   no rustfmt.toml preserves it, so it is not enforced).
+- Releases: bump `crates/cli/Cargo.toml` **as well as** `src-tauri/tauri.conf.json` — the IPC
+  `daemon_version` handshake reports the cli crate version (still `0.1.0` as of v0.2.7).
 
 ## Working conventions
 

@@ -4,6 +4,12 @@
 **Status:** Approved (brainstorming phase)
 **Author:** JJ (with Claude as orchestrator)
 
+> **Superseded in part (2026-07-02):** this is a historical design record. Two mechanisms in §6
+> changed in implementation: persistent per-app routing is written as PipeWire `stream.rules` /
+> `pulse.rules` fragments (WirePlumber 0.5 has no `node.rules` section), and `restore-stream`
+> cannot be managed per-app without a WirePlumber restart — a cleared route carries an advisory
+> note instead. See `ARCHITECTURE.md` §3/§5 and `KNOWN_ISSUES.md` KI-6 for the current behaviour.
+
 A from-scratch Linux replacement for the SteelSeries Arctis / Sonar sound manager, focused on
 the Sonar-style submix/EQ experience and managing a SteelSeries Arctis Nova Pro Wireless — built
 with strong engineering practices, multi-device support, and OTA updates.

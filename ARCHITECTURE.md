@@ -11,7 +11,7 @@ UI/visual rules live in `DESIGN.md`.
 
 ```mermaid
 flowchart TB
-    subgraph UI["UI shell (src-tauri + ui/)"]
+    subgraph UI["UI shell (src-tauri + frontend/)"]
         FE["Web frontend (Sonar-like)"]
         TAURI["Tauri v2 bridge\ncommands · events · channels"]
         UPD["OTA updater (minisign)"]
@@ -39,12 +39,12 @@ flowchart TB
 
     CFG["config crate\n(single source of truth, versioned)"]
     DOM["domain crate (pure types)"]
-    CLI["cli crate (asm-cli)"]
-    DAEMON["daemon crate (future)"]
+    CLI["cli crate (asm-cli;\nhosts the resident daemon)"]
+    CLIENT["client crate (daemon IPC:\nJSON lines over unix socket)"]
 
-    FE <--> TAURI <--> API
-    CLI --> API
-    DAEMON --> API
+    FE <--> TAURI <--> CLIENT
+    CLI --> CLIENT
+    CLIENT --> API
     API --> ORCH
     ORCH --> AUDIO
     ORCH --> DEVICE
@@ -67,9 +67,11 @@ flowchart LR
     device --> engine
     audio --> engine
     config --> engine
+    engine --> client
     engine --> cli
-    engine --> daemon
     engine --> srctauri["src-tauri"]
+    client --> cli
+    client --> srctauri
 ```
 
 - Arrows point **toward dependents**. `domain` depends on nothing app-specific.
@@ -86,7 +88,7 @@ flowchart LR
         M["Media (browser/Spotify)"]
     end
 
-    G -->|node.rules / target.object| GS["Game sink\nfilter-chain + live bq_* EQ"]
+    G -->|stream.rules + pulse.rules / target.object| GS["Game sink\nfilter-chain + live bq_* EQ"]
     C -->|routing| CS["Chat sink\nEQ"]
     M -->|routing| MS["Media sink\nEQ"]
 
@@ -96,7 +98,7 @@ flowchart LR
     SURR --> MASTER["Master mix"]
     MASTER --> HW["Hardware sink\n(Arctis, 1 stereo dev, 48 kHz)"]
 
-    MIC["HW mic source"] --> MICCHAIN["Mic chain (opt-in stages)\ngain→HPF→DeepFilterNet→gate→EQ→comp"]
+    MIC["HW mic source"] --> MICCHAIN["Mic chain (opt-in stages + always-on limiter)\ngain→HPF→suppression→gate→comp→EQ→limiter"]
     MICCHAIN --> APPSOUT["apps select 'Clean Mic' source"]
 
     DIAL["Game/Chat dial"] -.->|read over HID, sets sw volume| GS
@@ -105,6 +107,32 @@ flowchart LR
 
 Per-channel **output-device override** retargets a channel's tail from the Arctis Master to another
 physical device (e.g. Media → speakers) — first-class and enforced.
+
+**Routing persistence:** `profile.routes` is the single source of truth; `routes.json` and the conf
+fragments are pure projections rebuilt from it on every persist/clear. Persistent rules are written
+where PipeWire actually reads them: `stream.rules` in
+`~/.config/pipewire/client.conf.d/90-asm-routing.conf` (native clients, picked up by newly launched
+apps with no daemon restart) and `pulse.rules` in
+`~/.config/pipewire/pipewire-pulse.conf.d/90-asm-routing.conf` (pulse clients). Live moves still go
+through `pw-metadata target.object`. A stale legacy WirePlumber `node.rules` fragment (never read by
+WirePlumber 0.5) is auto-removed.
+
+**EQ:** every channel filter-chain carries an always-present `eq_preamp` linear head node
+(Mult = 10^(−max boost/20), the AutoEq convention; 1.0 when nothing boosts) so boosted presets don't
+clip at the float→S16 device boundary — topology stays fixed, the value updates live via Props.
+Default Q: peaking 1.41 (constant-Q octave spacing), shelves 0.707 (Butterworth).
+
+**Surround:** `Auto` follows the negotiated input layout, probed read-only from the streams feeding
+the surround-routed channel sinks (stereo → bypass, 5.1/7.1 → HRIR; unprobed → optimistic HRIR 7.1).
+HRIR, stereo-bypass and crossfeed graphs are level-matched: all share the same −6 dB mixer headroom
+pad, and each HRIR gets a convolver `gain` normalizing its direct-path peak to 1.0 (±12 dB clamp).
+Recreation is diffed first: when the rendered conf is byte-identical to disk and the node is live,
+the teardown+respawn is skipped (no audible dropout). The convolver supports an optional `tailsize`
+alongside `blocksize` (both validated: power of two in 64..=8192, tailsize ≥ blocksize).
+
+**Mic chain** (fixed order): gain → highpass → suppression → gate → compressor → EQ → limiter. The
+gate sits before the compressor so it keys on the true noise floor; the final stage is an always-on
+−1 dBFS output limiter (`hard_limiter_1413`). DSP stages remain opt-in per G5.
 
 ## 4. Device layer
 
@@ -135,6 +163,36 @@ the pure-Rust `linux-native` backend does not enumerate the Nova Pro Wireless. B
 - The PipeWire main loop runs on its **own dedicated thread** (pipewire-rs types are `!Send`); it
   communicates with the engine via `pipewire::channel` (into the loop) and `mpsc` (out of the loop).
 
+### Daemon IPC protocol
+
+- Newline-delimited JSON `Request`/`Response` over `$XDG_RUNTIME_DIR/arctis-sound-manager.sock`
+  (`client` crate on the caller side; the daemon lives in `cli` as `asm-cli daemon`).
+- **Version handshake:** every daemon `Response` carries `daemon_version` (the cli crate's
+  `CARGO_PKG_VERSION`; serde-default, so old/new peers interoperate). Responses may also carry an
+  advisory `note` (e.g. the restore-stream caveat on `RouteClear`) — the CLI prints it.
+- **Timeout discipline (no call path may wedge the daemon):** 10 s read timeouts and 1 MiB line
+  caps on *both* sides of the socket (the client allows 25 s for the slow `ChatmixValidate`);
+  subprocess helpers (`pw-cli`/`pw-dump`/`wpctl`…) are bounded at 5 s with a typed
+  `AudioError::Timeout`; the device worker NAKs queued commands ("device not connected") when no
+  headset is open, and the engine bounds every device reply wait (10 s; 20 s for ChatMix
+  validation) with typed errors.
+- Spawned filter-chain children are tracked in a process-global registry and reaped
+  (SIGTERM → bounded wait → SIGKILL escalation) — no zombies.
+- A config that fails to load is **quarantined** to `config.toml.corrupt-<ts>` (never overwritten
+  by defaults) and surfaced as `EngineState.config_degraded`.
+- systemd user unit: `TimeoutStopSec=15` + `KillMode=mixed`; the packaged file mirrors
+  `render_unit` in `src-tauri/src/daemon_control.rs` (test-enforced). No `RuntimeDirectory` — the
+  socket lives directly in `$XDG_RUNTIME_DIR`.
+
+### GUI polling & meters
+
+- The window is shown only after first paint (`show_when_ready`); `--hidden` tray launches stay
+  hidden. Polls are visibility-gated: state 250 ms → 3 s and streams 1.5 s → 10 s while hidden;
+  events (`state-changed`, `streams-changed`) emit only on change, plus an edge-triggered
+  `daemon-down`. EQ/volume drag ticks use ack-only commands (no state round-trip until release).
+- Meter `pw-record` workers start on the first subscriber and stop on the last (or on window
+  hide), respawning with bounded backoff when a child exits.
+
 ---
 
 ## Guardrails (binding)
@@ -160,8 +218,10 @@ the pure-Rust `linux-native` backend does not enumerate the Nova Pro Wireless. B
 - 48 kHz end-to-end; no resampling on the device path.
 - Operations are **idempotent**: reconcile against existing PipeWire objects (stable `node.name`) rather
   than blindly recreating them.
-- Respect streams the user has manually pinned (`target.object`); manage `restore-stream` so it doesn't
-  fight our rules.
+- Respect streams the user has manually pinned (`target.object`). WirePlumber's `restore-stream`
+  state cannot be cleared per-app without a WirePlumber restart (which this guardrail forbids), so a
+  cleared route instead carries an advisory `Response.note` telling the user how to re-teach the
+  stored target — see `KNOWN_ISSUES.md` KI-6.
 
 ### G4 — Single source of truth
 - One authoritative, **schema-versioned** config store with migrations. No scattered dotfiles.

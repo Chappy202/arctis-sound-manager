@@ -11,17 +11,20 @@ PipeWire + hidraw.
 
 What works today:
 
-- Engine/daemon, `asm-cli` CLI, Sonar-style Tauri v2 GUI scaffold
+- Engine/daemon, `asm-cli` CLI, Sonar-style Tauri v2 GUI
 - Multi-channel software routing: Game/Chat/Media virtual PipeWire sinks
-- Per-channel parametric EQ (10 bands, live, no restart)
+- Per-channel parametric EQ (10 bands, live, no restart) with an automatic clip-preventing preamp
 - Channel volume (dB) and mute; per-channel output device pinning
-- Channel add/remove; route set/clear/list with live WirePlumber rules. Routes re-apply
-  automatically when an app's stream reappears (idle → resume) with the optional `pw-watcher`
-  build feature (see Build, step 7)
+- Channel add/remove; route set/clear/list — live moves via `pw-metadata`, persistent rules as
+  PipeWire `stream.rules`/`pulse.rules` conf fragments projected from the active profile. Routes
+  re-apply automatically when an app's stream reappears (idle → resume) with the optional
+  `pw-watcher` build feature (see Build, step 7)
 - Profiles: list/show/switch/new/save/rename/delete/export/import; EQ presets
-- Mic DSP chain (Clean Mic virtual source): gain, highpass, suppression, compressor, gate, EQ
-  — DeepFilterNet default suppressor; RNNoise fallback; all stages opt-in
-- Virtual surround/HRIR via PipeWire convolver with HeSuVi .wav profiles
+- Mic DSP chain (Clean Mic virtual source): gain, highpass, suppression, gate, compressor, EQ
+  — DeepFilterNet default suppressor; RNNoise fallback; all stages opt-in — plus an always-on
+  −1 dBFS output limiter
+- Virtual surround/HRIR via PipeWire convolver with HeSuVi .wav profiles; Auto mode follows the
+  input layout (stereo → bypass, 5.1/7.1 → HRIR) and all graphs are level-matched
 - Device live reads: battery, ANC state, ChatMix dial, mic-mute flag
 - Dial-to-balance mapping; real signal peak meters in the GUI
 - Coexistence teardown of the legacy arctis-sound-manager RPM stack
@@ -329,6 +332,9 @@ asm-cli route list                          # print all persistent rules
 asm-cli route clear firefox                 # remove rule and move stream back to default
 ```
 
+Note: WirePlumber's own `restore-stream` state can put a *cleared* app back on its old sink at the
+app's next launch; the clear response prints an advisory — see `KNOWN_ISSUES.md` KI-6.
+
 ### EQ
 
 ```sh
@@ -369,8 +375,8 @@ asm-cli mic off                             # master switch off
 asm-cli mic status                          # show full chain state
 
 # Enable / disable stages
-asm-cli mic enable  <gain|highpass|suppression|compressor|gate|eq>
-asm-cli mic disable <gain|highpass|suppression|compressor|gate|eq>
+asm-cli mic enable  <gain|highpass|suppression|gate|compressor|eq>
+asm-cli mic disable <gain|highpass|suppression|gate|compressor|eq>
 
 # Select suppression backend
 asm-cli mic backend deep_filter             # DeepFilterNet (default)
@@ -396,11 +402,12 @@ asm-cli mic hw-mic alsa_input.usb-SteelSeries_Arctis_Nova_Pro_Wireless-00.mono-f
 asm-cli mic hw-mic                          # clear the pin (follow WirePlumber default)
 ```
 
-Chain order (when enabled): gain → highpass → suppression → compressor → gate → EQ.
+Chain order (when enabled): gain → highpass → suppression → gate → compressor → EQ → limiter.
+The limiter is always on (−1 dBFS output ceiling, `hard_limiter_1413`); the other stages are opt-in.
 
-DeepFilterNet's `attenuation_limit_db` caps how much it may suppress. Setting it to ~40 dB
-instead of the 100 dB maximum reduces the over-suppressed "tinny" effect that aggressive
-noise reduction can cause. RNNoise has no such cap.
+DeepFilterNet's `attenuation_limit_db` caps how much it may suppress (default 70 dB). Lowering it
+(e.g. ~40 dB) further reduces the over-suppressed "tinny" effect that aggressive noise reduction
+can cause. RNNoise has no such cap.
 
 ### Virtual surround / HRIR
 

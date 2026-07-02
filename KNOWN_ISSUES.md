@@ -52,6 +52,11 @@ stable rename. Also: the conf filename doubles the name (`arctis_eq.arctis_eq.co
 the literal prefix — cosmetic. And `AudioError::Spawn{program:"write-conf"}` is reused for file-I/O
 errors; add a dedicated `AudioError::Io` variant in a later pass. Revisit in the engine-orchestrator plan.
 
+**Update 2026-07-02:** still open — the mic chain and surround graphs write their confs under the same
+`std::env::temp_dir()` scheme (`/tmp/arctis_<base>.conf`), and the new diff-before-recreate guard
+byte-compares against these same paths. The move to `$XDG_RUNTIME_DIR` (or a tempfile+rename) remains
+deferred.
+
 ## KI-3 — Route re-apply on stream resume requires the `pw-watcher` build feature (OPEN, by design)
 
 Remembered routes are applied to an app's current stream on an explicit move. When the app goes idle
@@ -91,3 +96,19 @@ desired sink to re-teach the stored target. To disable the behaviour globally (a
 preference): `wpctl settings node.stream.restore-target false` (runtime), or persist
 `wireplumber.settings = { node.stream.restore-target = false }` in
 `~/.config/wireplumber/wireplumber.conf.d/`.
+
+## KI-7 — Surround `Auto` re-resolves the input layout only on reconcile / surround setters (OPEN, documented TODO)
+
+`Auto` mode probes the richest negotiated input layout (read-only, TTL-cached `pw-dump`) only when
+`apply_surround` runs — i.e. on reconcile and on the surround setters. If the feeding app *changes*
+its negotiated layout while playing (stereo ↔ 5.1/7.1), the rendered graph is not re-applied live: a
+live re-apply would need an engine hook from a stream watcher, and `crates/cli/src/route_watcher.rs`
+only rewrites route metadata (it has no engine handle). Tracked as a `TODO(pw-watcher)` in the engine
+crate's surround apply path. Workaround: toggle surround or run `asm-cli apply` after the format change.
+
+## KI-8 — GUI does not yet render `Response.note` advisories (OPEN)
+
+Daemon responses can carry an advisory `note` (currently the KI-6 restore-stream caveat on
+`RouteClear`). The CLI prints it; the GUI's IPC layer ignores the field, so GUI users never see the
+advisory (the GUI also does not yet compare the `daemon_version` handshake against its own version).
+Frontend wiring is a follow-up.
