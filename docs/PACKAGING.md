@@ -292,7 +292,7 @@ No PulseAudio required.  The system runs PipeWire 1.4.x only (48 kHz).
 
 Flatpak is explicitly excluded (ARCHITECTURE G9).  The Flatpak sandbox blocks:
 - Direct `hidraw` access to SteelSeries HID devices.
-- PipeWire routing rules (`node.rules` / WirePlumber scripts in
-  `~/.local/share/wireplumber/main.lua.d/`).
+- Writing the persistent PipeWire routing fragments (`stream.rules` / `pulse.rules` under
+  `~/.config/pipewire/`).
 
 AppImage is the primary portable artifact.
