@@ -6,29 +6,32 @@
 # After the AppImage or .deb/.rpm is installed the daemon binary is at
 # /usr/bin/asm-cli (system-wide install) or
 # ~/.local/bin/asm-cli (per-user AppImage install).
-# Adjust ExecStart below to match the installed location.
+# OWNER-FILL: adjust ExecStart below to match the installed location, e.g.
+#   ExecStart=%h/.local/bin/asm-cli daemon
+#
+# NOTE (G1): the body below is generated from `render_unit` in
+# src-tauri/src/daemon_control.rs — the authoritative source. A test asserts
+# this file stays in sync; edit render_unit first, then mirror the change here.
 
 [Unit]
 Description=Arctis Sound Manager daemon
-Documentation=https://github.com/oxibux/arctis-sound-manager
 After=pipewire.service wireplumber.service
 Wants=pipewire.service wireplumber.service
 
 [Service]
 Type=simple
-# OWNER-FILL: adjust the path if the binary is installed elsewhere.
-# For AppImage-extracted installs, this is typically:
-#   ExecStart=%h/.local/bin/asm-cli daemon
-# For system-wide .deb/.rpm installs:
-#   ExecStart=/usr/bin/asm-cli daemon
 ExecStart=/usr/bin/asm-cli daemon
 Restart=on-failure
 RestartSec=3s
-# Inherit the user's DBUS/PipeWire environment so asm-cli can reach PipeWire.
 Environment=XDG_RUNTIME_DIR=%t
-# Runtime dir for the Unix socket (default: $XDG_RUNTIME_DIR/arctis-sound-manager.sock)
-RuntimeDirectory=arctis-sound-manager
-RuntimeDirectoryMode=0700
+# The socket lives at $XDG_RUNTIME_DIR/arctis-sound-manager.sock — directly in
+# the runtime dir, NOT in a RuntimeDirectory subdir. Do not add that directive:
+# it created an unused directory and implied the wrong socket location.
+# Bounded stop: the daemon reaps its pipewire children on SIGTERM; after
+# TimeoutStopSec systemd SIGKILLs any survivor in the cgroup (KillMode=mixed
+# sends SIGTERM to the main process only, keeping child teardown orderly).
+TimeoutStopSec=15
+KillMode=mixed
 
 [Install]
 WantedBy=default.target

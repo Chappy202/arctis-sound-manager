@@ -75,6 +75,33 @@ pub fn plan_reconcile(cfg: &Config) -> Result<Vec<ReconcileStep>, EngineError> {
 /// Full attenuation applied to the losing side of the ChatMix dial (dB).
 const CHATMIX_FULL_ATTEN_DB: f32 = -40.0;
 
+/// How long `device_set` waits for the DeviceWorker's reply before failing with a
+/// typed error. Bounded so a wedged/absent worker can never block the caller (and
+/// with it the daemon-wide engine mutex) forever.
+const DEVICE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Reply timeout for ChatMix validation: the validation itself takes ~6 s of reads
+/// and may additionally queue behind a status-read cycle.
+const CHATMIX_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Bounded wait for a device-worker reply. Timeout and a disconnected worker both
+/// surface as typed `EngineError`s (G7) instead of blocking indefinitely.
+fn recv_device_reply<T>(
+    rx: &std::sync::mpsc::Receiver<Result<T, String>>,
+    timeout: std::time::Duration,
+) -> Result<Result<T, String>, EngineError> {
+    use std::sync::mpsc::RecvTimeoutError;
+    match rx.recv_timeout(timeout) {
+        Ok(r) => Ok(r),
+        Err(RecvTimeoutError::Timeout) => Err(EngineError::Device(format!(
+            "no reply from device worker within {}s (worker busy or wedged)",
+            timeout.as_secs()
+        ))),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(EngineError::BadRequest("no reply from device worker".into()))
+        }
+    }
+}
+
 /// How long a `pw-dump` snapshot taken for the live volume read in `state()`
 /// stays reusable. Bounds the subprocess rate to at most one per window even
 /// when the GUI commits volume at its ~80 ms drag throttle. Kept under the
@@ -203,6 +230,9 @@ pub struct Engine<R: CommandRunner> {
     /// Set by `apply_surround` when a pinned HRIR stem was missing and a fallback was
     /// substituted; surfaced in `state().surround.hrir_missing` so the UI can prompt to import.
     surround_hrir_missing: Option<String>,
+    /// True when the persisted config could not be read at startup and the engine is
+    /// running on defaults. Surfaced via `state().config_degraded` so clients can warn.
+    config_degraded: bool,
 }
 
 impl<R: CommandRunner> Engine<R> {
@@ -225,6 +255,7 @@ impl<R: CommandRunner> Engine<R> {
             volume_dump_cache: None,
             last_volume_write: None,
             surround_hrir_missing: None,
+            config_degraded: false,
         }
     }
 
@@ -249,6 +280,7 @@ impl<R: CommandRunner> Engine<R> {
             volume_dump_cache: None,
             last_volume_write: None,
             surround_hrir_missing: None,
+            config_degraded: false,
         }
     }
 
@@ -288,6 +320,12 @@ impl<R: CommandRunner> Engine<R> {
         self.device_tx = Some(tx);
     }
 
+    /// Mark the engine as running on a default config because the persisted one
+    /// was unreadable at startup (see the daemon's load path). Surfaced in state().
+    pub fn set_config_degraded(&mut self, degraded: bool) {
+        self.config_degraded = degraded;
+    }
+
     /// Send a validated device write through the worker thread.
     ///
     /// Returns `Err` if:
@@ -296,7 +334,21 @@ impl<R: CommandRunner> Engine<R> {
     /// - the write is rejected by the `enabled_writes` gate (control not yet owner-validated).
     ///
     /// Surfaces all failures — never swallows errors.
+    ///
+    /// Waits at most [`DEVICE_REPLY_TIMEOUT`] for the worker's reply: if the worker
+    /// is wedged (or the device detached mid-flight) the caller gets a typed error
+    /// instead of blocking forever while holding the daemon-wide engine mutex.
     pub fn device_set(&self, name: &str, value: i64) -> Result<(), EngineError> {
+        self.device_set_with_timeout(name, value, DEVICE_REPLY_TIMEOUT)
+    }
+
+    /// `device_set` with an explicit reply timeout (tests inject a short one).
+    fn device_set_with_timeout(
+        &self,
+        name: &str,
+        value: i64,
+        timeout: std::time::Duration,
+    ) -> Result<(), EngineError> {
         let tx = self
             .device_tx
             .as_ref()
@@ -308,10 +360,7 @@ impl<R: CommandRunner> Engine<R> {
             reply: reply_tx,
         })
         .map_err(|_| EngineError::BadRequest("device worker gone".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| EngineError::BadRequest("no reply from device worker".into()))?
-            .map_err(EngineError::Device)
+        recv_device_reply(&reply_rx, timeout)?.map_err(EngineError::Device)
     }
 
     /// OWNER-RUN ChatMix validation: sends `[0x06,0x49,0x01]` once via the device
@@ -331,10 +380,9 @@ impl<R: CommandRunner> Engine<R> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         tx.send(crate::device::DeviceCommand::ValidateChatmix { reply: reply_tx })
             .map_err(|_| EngineError::BadRequest("device worker gone".into()))?;
-        reply_rx
-            .recv()
-            .map_err(|_| EngineError::BadRequest("no reply from device worker".into()))?
-            .map_err(EngineError::Device)
+        // Validation legitimately runs ~6 s of reads and may queue behind a read
+        // cycle — allow generous headroom, but never wait forever.
+        recv_device_reply(&reply_rx, CHATMIX_REPLY_TIMEOUT)?.map_err(EngineError::Device)
     }
 
     pub fn config(&self) -> &Config {
@@ -687,6 +735,7 @@ impl<R: CommandRunner> Engine<R> {
             default_sink_channel: active.as_ref().and_then(|p| p.default_sink_channel.clone()),
             dial_controls_balance: self.config.dial_controls_balance,
             knob_controls_master: self.config.knob_controls_master,
+            config_degraded: self.config_degraded,
         }
     }
 
@@ -5411,6 +5460,34 @@ mod tests {
         // Drop engine (which drops the cmd_tx) to let the worker finish.
         drop(engine);
         worker.join().expect("fake worker must not panic");
+    }
+
+    #[test]
+    fn device_set_times_out_with_typed_error_when_worker_never_replies() {
+        // Wire a command channel whose receiver stays alive but NEVER replies —
+        // models a wedged worker (or a command queued while the reader is stuck).
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<crate::device::DeviceCommand>();
+        let cfg = make_config_no_eq_no_routes();
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_device_tx(cmd_tx);
+
+        let start = std::time::Instant::now();
+        let result = engine.device_set_with_timeout(
+            "sidetone",
+            2,
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "device_set must return promptly, not hang"
+        );
+        match result {
+            Err(EngineError::Device(msg)) => assert!(
+                msg.contains("no reply"),
+                "timeout error must mention the missing reply: {msg}"
+            ),
+            other => panic!("expected typed Device timeout error, got: {other:?}"),
+        }
     }
 
     #[test]

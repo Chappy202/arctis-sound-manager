@@ -388,12 +388,37 @@ fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
     "<non-string panic>".to_string()
 }
 
+/// Stamp the daemon's build version onto every outgoing response (IPC version
+/// handshake): clients can compare it against their own version and warn on
+/// mismatch. Old clients simply ignore the extra field.
+fn stamp_version(mut resp: Response) -> Response {
+    resp.daemon_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    resp
+}
+
+/// Maximum accepted request-line length (bytes). Without a cap, one endless
+/// line (no newline) would grow the read buffer unboundedly → OOM.
+const MAX_REQUEST_LINE: u64 = 1 << 20; // 1 MiB
+
+/// Per-connection read timeout on accepted daemon sockets. A silent client
+/// (connected but never sending) would otherwise pin `serve_connection` — and
+/// with it the accept loop and graceful shutdown — forever.
+const CONN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Apply the per-connection read timeout to an accepted stream (best-effort).
+fn configure_stream(stream: &std::os::unix::net::UnixStream, timeout: std::time::Duration) {
+    if let Err(e) = stream.set_read_timeout(Some(timeout)) {
+        eprintln!("daemon: set_read_timeout failed (continuing): {e}");
+    }
+}
+
 /// Serve a single accepted connection.
 ///
 /// Returns `Ok(true)` when the client sends the `shutdown` command,
-/// `Ok(false)` on normal EOF, or `Err(_)` on an I/O error.  The
-/// caller is responsible for logging `Err` and continuing to the next
-/// `accept()` rather than letting the error propagate out of the daemon.
+/// `Ok(false)` on normal EOF, a read timeout (silent client), or an oversized
+/// request line, or `Err(_)` on an I/O error.  The caller is responsible for
+/// logging `Err` and continuing to the next `accept()` rather than letting the
+/// error propagate out of the daemon.
 fn serve_connection<R, Re, W>(
     reader: &mut std::io::BufReader<Re>,
     writer: &mut W,
@@ -404,14 +429,37 @@ where
     Re: std::io::Read,
     W: std::io::Write,
 {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
 
     let mut line = String::new();
     loop {
         line.clear();
-        let n = reader.read_line(&mut line)?;
+        // Bounded read: cap the line length; a socket read timeout surfaces as
+        // WouldBlock/TimedOut and is treated as end-of-connection.
+        let n = match reader.by_ref().take(MAX_REQUEST_LINE + 1).read_line(&mut line) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(false); // silent client — drop the connection
+            }
+            Err(e) => return Err(e),
+        };
         if n == 0 {
             return Ok(false); // EOF — client closed connection
+        }
+        if n as u64 > MAX_REQUEST_LINE {
+            // Oversized request line — refuse (best-effort write) and close.
+            let resp = stamp_version(Response::err(format!(
+                "request line too long (> {MAX_REQUEST_LINE} bytes)"
+            )));
+            let resp_str = serde_json::to_string(&resp)
+                .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
+            let _ = writeln!(writer, "{resp_str}");
+            return Ok(false);
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -420,7 +468,7 @@ where
         let req: Request = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response::err(format!("parse error: {e}"));
+                let resp = stamp_version(Response::err(format!("parse error: {e}")));
                 let resp_str = serde_json::to_string(&resp)
                     .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
                 writeln!(writer, "{resp_str}")?;
@@ -439,6 +487,7 @@ where
             Ok(r) => r,
             Err(payload) => Response::err(format!("internal error: {}", panic_msg(&*payload))),
         };
+        let resp = stamp_version(resp);
         let resp_str = serde_json::to_string(&resp)
             .unwrap_or_else(|_| r#"{"ok":false,"error":"serialize error"}"#.to_string());
         let write_res = writeln!(writer, "{resp_str}");
@@ -467,6 +516,17 @@ pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
     engine: &mut Engine<R>,
     path: &std::path::Path,
 ) -> Result<(), EngineError> {
+    run_daemon_with_engine_timeout(engine, path, CONN_READ_TIMEOUT)
+}
+
+/// [`run_daemon_with_engine`] with an explicit per-connection read timeout
+/// (tests inject a short one to exercise the silent-client path quickly).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_daemon_with_engine_timeout<R: arctis_audio::CommandRunner>(
+    engine: &mut Engine<R>,
+    path: &std::path::Path,
+    read_timeout: std::time::Duration,
+) -> Result<(), EngineError> {
     use std::io::BufReader;
 
     let listener = std::os::unix::net::UnixListener::bind(path)
@@ -481,6 +541,7 @@ pub fn run_daemon_with_engine<R: arctis_audio::CommandRunner>(
                 continue;
             }
         };
+        configure_stream(&stream, read_timeout);
         let writer_stream = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -538,6 +599,7 @@ fn run_daemon_accept_loop(
                 continue;
             }
         };
+        configure_stream(&stream, CONN_READ_TIMEOUT);
         let writer_stream = match stream.try_clone() {
             Ok(s) => s,
             Err(e) => {
@@ -656,6 +718,39 @@ unsafe fn install_signal_pipe(write_fd: libc::c_int) {
 /// Global write-end fd for the signal self-pipe. -1 = not installed.
 static SIGNAL_PIPE_WFD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Load the persisted config, degrading gracefully when it is unreadable:
+/// log the ConfigError, move the corrupt file aside (so a later save cannot
+/// silently overwrite the user's data with defaults), and return
+/// `(defaults, degraded=true)`. The `degraded` flag is surfaced via
+/// `EngineState.config_degraded` so clients can warn.
+fn load_config_or_default() -> (Config, bool) {
+    match arctis_config::store::load() {
+        Ok(cfg) => (cfg, false),
+        Err(e) => {
+            eprintln!("daemon: failed to load config: {e}; starting with defaults");
+            let path = arctis_config::store::config_path();
+            if path.exists() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let backup = path.with_file_name(format!("config.toml.corrupt-{ts}"));
+                match std::fs::rename(&path, &backup) {
+                    Ok(()) => eprintln!(
+                        "daemon: unreadable config preserved at {}",
+                        backup.display()
+                    ),
+                    Err(re) => eprintln!(
+                        "daemon: could not move unreadable config aside ({}): {re}",
+                        path.display()
+                    ),
+                }
+            }
+            (Config::default_config(), true)
+        }
+    }
+}
+
 /// Check if a unix socket file has a live listener.
 ///
 /// Attempts to connect to the socket. If the connection succeeds, something is listening
@@ -695,10 +790,11 @@ pub fn run_daemon() -> Result<(), EngineError> {
         let _ = std::fs::remove_file(&path);
     }
 
-    let cfg = arctis_config::store::load().unwrap_or_else(|_| Config::default_config());
+    let (cfg, config_degraded) = load_config_or_default();
     let dial_controls_balance = cfg.dial_controls_balance;
     let knob_controls_master = cfg.knob_controls_master;
     let mut engine = Engine::new(RealRunner, cfg);
+    engine.set_config_degraded(config_degraded);
     if let Err(e) = engine.reconcile() {
         eprintln!("warning: reconcile on start failed: {e}");
     }
@@ -1204,6 +1300,192 @@ mod tests {
             matches!(result, Ok(true)),
             "shutdown must be honored even when the response write fails (EPIPE): got {result:?}"
         );
+    }
+
+    /// IPC version handshake: every daemon response carries daemon_version so
+    /// the GUI can compare it against its own version.
+    #[test]
+    fn serve_connection_stamps_daemon_version() {
+        let input = b"{\"cmd\":\"get-state\"}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(input.as_ref()));
+        let mut output = Vec::<u8>::new();
+        let mut engine = make_engine();
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+        assert!(matches!(result, Ok(false)));
+        let response: Response = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert_eq!(
+            response.daemon_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "every response must carry the daemon's version"
+        );
+    }
+
+    // ── Corrupt-config handling (load_config_or_default) ─────────────────────
+
+    /// A corrupt config must NOT be silently replaced: the error is logged, the
+    /// unreadable file is preserved as config.toml.corrupt-<ts>, defaults are
+    /// used, and the degraded flag is reported (surfaced in EngineState).
+    #[test]
+    fn corrupt_config_is_preserved_and_flagged_degraded() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_corrupt_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let cfg_path = tmp.join("config.toml");
+        std::fs::write(&cfg_path, "this is [ not valid toml = = =").unwrap();
+
+        let (cfg, degraded) = load_config_or_default();
+        assert!(degraded, "unreadable config must set the degraded flag");
+        assert_eq!(cfg.active_profile, Config::default_config().active_profile);
+        assert!(
+            !cfg_path.exists(),
+            "the corrupt config must be moved aside, not left to be overwritten"
+        );
+        let preserved = std::fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.toml.corrupt-")
+            });
+        assert!(preserved, "a config.toml.corrupt-<ts> backup must exist");
+
+        // The degraded flag flows through EngineState.
+        let mut engine = Engine::new(MockRunner::new(), cfg);
+        engine.set_config_degraded(degraded);
+        assert!(engine.state().config_degraded, "state must expose config_degraded");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// A valid (or absent) config loads normally with degraded=false.
+    #[test]
+    fn absent_config_loads_defaults_not_degraded() {
+        let _env_lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = std::env::temp_dir().join(format!("asm_absent_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("ASM_CONFIG_HOME", &tmp);
+
+        let (_cfg, degraded) = load_config_or_default();
+        assert!(!degraded, "an absent config is first-run, not degraded");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ASM_CONFIG_HOME");
+    }
+
+    /// A read timeout (WouldBlock/TimedOut from SO_RCVTIMEO) must be treated as
+    /// end-of-connection (Ok(false)) — NOT as a transient error and NOT a hang.
+    #[test]
+    fn serve_connection_read_timeout_treated_as_eof() {
+        struct TimeoutReader;
+        impl std::io::Read for TimeoutReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "read timed out",
+                ))
+            }
+        }
+        let mut reader = std::io::BufReader::new(TimeoutReader);
+        let mut output = Vec::<u8>::new();
+        let mut engine = make_engine();
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+        assert!(
+            matches!(result, Ok(false)),
+            "read timeout must close the connection cleanly, got: {result:?}"
+        );
+    }
+
+    /// One endless request line must be refused at MAX_REQUEST_LINE, not
+    /// buffered without bound (OOM guard). The connection is closed after an
+    /// error response.
+    #[test]
+    fn serve_connection_rejects_oversized_request_line() {
+        // 2 MiB of 'a' with no newline — over the 1 MiB cap.
+        let big = vec![b'a'; 2 * 1024 * 1024];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(big));
+        let mut output = Vec::<u8>::new();
+        let mut engine = make_engine();
+
+        let result = serve_connection(&mut reader, &mut output, &mut engine);
+        assert!(
+            matches!(result, Ok(false)),
+            "oversized line must close the connection, got: {result:?}"
+        );
+        let resp: Response = serde_json::from_slice(output.trim_ascii()).unwrap();
+        assert!(!resp.ok);
+        assert!(
+            resp.error.as_deref().unwrap_or("").contains("too long"),
+            "error must mention the length cap: {:?}",
+            resp.error
+        );
+    }
+
+    /// Integration: a silent client (connects, never writes) must NOT wedge the
+    /// accept loop — after the read timeout the daemon serves the next client
+    /// and still honors shutdown.
+    #[test]
+    fn daemon_drops_silent_client_after_read_timeout() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("asm_silent_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("daemon.sock");
+        let _ = std::fs::remove_file(&sock);
+
+        let sock_daemon = sock.clone();
+        let daemon = std::thread::spawn(move || {
+            let mut engine = make_engine();
+            run_daemon_with_engine_timeout(
+                &mut engine,
+                &sock_daemon,
+                std::time::Duration::from_millis(100),
+            )
+        });
+
+        // Wait (bounded) for the socket to be bound.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !sock.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(sock.exists(), "daemon must bind the socket within 3s");
+
+        // Client 1: silent — holds the connection open without sending anything.
+        let _silent = UnixStream::connect(&sock).expect("silent client connects");
+
+        // Client 2: sends get-state, must be served once the silent client times out.
+        let stream = UnixStream::connect(&sock).expect("second client connects");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        writeln!(writer, r#"{{"cmd":"get-state"}}"#).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("second client must get a response despite the silent client");
+        let resp: Response = serde_json::from_str(line.trim()).unwrap();
+        assert!(resp.ok, "get-state must succeed after silent client dropped");
+
+        // Shutdown via the same connection; the daemon loop must exit.
+        writeln!(writer, r#"{{"cmd":"shutdown"}}"#).unwrap();
+        line.clear();
+        let _ = reader.read_line(&mut line);
+        daemon
+            .join()
+            .expect("daemon thread must not panic")
+            .expect("daemon loop must exit cleanly");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── New verb dispatch tests (TDD) ────────────────────────────────────────

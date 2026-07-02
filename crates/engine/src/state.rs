@@ -225,6 +225,11 @@ pub struct EngineState {
     /// (read-only hardware mirror; knob_controls_master=true in config).
     #[serde(default)]
     pub knob_controls_master: bool,
+    /// True when the daemon could not read the persisted config at startup and is
+    /// running on defaults (the unreadable file was moved aside). Clients should
+    /// warn: the first mutation persists the defaults as the new config.
+    #[serde(default)]
+    pub config_degraded: bool,
 }
 
 /// Full snapshot of a single EQ band — carries all four parameters so the UI

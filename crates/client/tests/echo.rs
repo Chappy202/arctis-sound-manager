@@ -1,6 +1,41 @@
-use arctis_client::{send_request_to, Request};
+use arctis_client::{send_request_to, send_request_to_with_timeout, Request};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
+
+/// A daemon that accepts but never replies must NOT hang the client forever:
+/// the read timeout surfaces as an Err within a bounded time.
+#[test]
+fn send_request_times_out_when_daemon_never_replies() {
+    let dir = std::env::temp_dir().join(format!("asm_client_timeout_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("mute.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).unwrap();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        // Keep the connection open without replying, longer than the client timeout.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+    });
+
+    let start = std::time::Instant::now();
+    let result = send_request_to_with_timeout(
+        &sock,
+        &Request::GetState,
+        std::time::Duration::from_millis(200),
+    );
+    assert!(result.is_err(), "silent daemon must yield an error, got: {result:?}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(3),
+        "client must give up promptly (read timeout), not hang"
+    );
+
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn send_request_to_round_trips() {

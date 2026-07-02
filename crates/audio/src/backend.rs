@@ -175,7 +175,10 @@ impl<R: CommandRunner> AudioBackend<R> {
         // Best-effort: stop the dedicated `pipewire -c <conf>` instance.
         // pkill exits non-zero when nothing matches; ignore that — it's harmless.
         let conf_path_str = self.conf_path().to_string_lossy().into_owned();
-        let _ = self.runner.run("pkill", &["-f", &conf_path_str]);
+        if let Err(e) = self.runner.run("pkill", &["-f", &conf_path_str]) {
+            // Surface spawn failures (a non-zero pkill exit just means "no match").
+            eprintln!("audio: pkill for {conf_path_str} failed: {e}");
+        }
         let _ = std::fs::remove_file(self.conf_path());
         Ok(())
     }

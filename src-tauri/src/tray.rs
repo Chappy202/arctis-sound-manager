@@ -210,7 +210,7 @@ pub fn apply_view(app: &AppHandle, view: &TrayView) {
     let _ = handles.tray.set_tooltip(Some(&view.tooltip));
 
     // Rebuild the profile submenu items only when the set of names changed.
-    let mut last = handles.last_profiles.lock().unwrap();
+    let mut last = handles.last_profiles.lock().unwrap_or_else(|e| e.into_inner());
     if *last != view.profiles {
         // Remove existing items; only append new items and update the cache
         // when removal succeeded, so a transient error leaves last_profiles

@@ -20,6 +20,9 @@ pub enum AudioError {
     /// Expected output (e.g. a node id) could not be parsed.
     #[error("could not parse `{what}` from output: {detail}")]
     Parse { what: String, detail: String },
+    /// A subprocess exceeded its execution time bound and was killed.
+    #[error("command `{program}` timed out after {millis} ms and was killed")]
+    Timeout { program: String, millis: u128 },
 }
 
 #[cfg(test)]
